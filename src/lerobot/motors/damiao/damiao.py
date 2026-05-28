@@ -45,15 +45,20 @@ from .tables import (
     AVAILABLE_BAUDRATES,
     CAN_CMD_DISABLE,
     CAN_CMD_ENABLE,
+    CAN_CMD_QUERY_PARAM,
     CAN_CMD_REFRESH,
+    CAN_CMD_SAVE_PARAM,
     CAN_CMD_SET_ZERO,
+    CAN_CMD_WRITE_PARAM,
     CAN_PARAM_ID,
     DEFAULT_BAUDRATE,
     DEFAULT_TIMEOUT_MS,
     MIT_KD_RANGE,
     MIT_KP_RANGE,
     MOTOR_LIMIT_PARAMS,
+    ControlMode,
     MotorType,
+    MotorVariable,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +68,24 @@ LONG_TIMEOUT_SEC = 0.1
 MEDIUM_TIMEOUT_SEC = 0.01
 SHORT_TIMEOUT_SEC = 0.001
 PRECISE_TIMEOUT_SEC = 0.0001
+
+# Handshake tuning. The original 2-attempt / 100ms-wait scheme was too tight
+# for real-world conditions:
+#   - a motor that just had SAVE_PARAMETERS sent to it (e.g. via the
+#     scripts/set_motors_to_mit_mode.py one-time fix) takes ~100-200ms
+#     to complete the flash write before it'll respond to control frames;
+#   - motors idle for long periods (1-2 min of policy weight loading
+#     between bus.connect() and the first user-action) sometimes need an
+#     extra DISABLE pulse to clear their internal idle state;
+#   - other motors on the same bus emit state frames mid-handshake;
+#     the recv loop filters them but each filtered frame eats budget.
+# The retry cost is bounded (only failing motors pay it) so we err on
+# the generous side. 5 attempts x ~400ms each = ~2s worst case per
+# stubborn motor; healthy motors respond on attempt 1 and pay only ~50ms.
+_HANDSHAKE_MAX_ATTEMPTS = 5
+_HANDSHAKE_DRAIN_S = 0.05    # post-DISABLE bus-drain window
+_HANDSHAKE_WAIT_S = 0.25     # ENABLE-reply wait window
+_HANDSHAKE_RETRY_GAP_S = 0.1 # pause between failed attempts
 
 
 class MotorState(TypedDict):
@@ -219,30 +242,103 @@ class DamiaoMotorsBus(MotorsBusBase):
             motor_id = self._get_motor_id(motor_name)
             recv_id = self._get_motor_recv_id(motor_name)
 
-            # Send enable command
-            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, CAN_CMD_ENABLE]
-            msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
-            self.canbus.send(msg)
-
-            # Wait for response with longer timeout
+            # DM-series motors latch into a fault state on over-current /
+            # over-temp / stall (very easy to hit on a gripper that gets
+            # commanded slightly past its mechanical stop). A latched motor
+            # IGNORES CAN_CMD_ENABLE alone, which is what made the handshake
+            # fail with "did not respond" even though the motor was on the
+            # bus and reachable. The Damiao recovery protocol is
+            # DISABLE-then-ENABLE: the disable clears the latch, the enable
+            # re-arms MIT mode. Both are safe no-ops on a healthy motor (a
+            # healthy motor processes the disable -> reports state,
+            # processes the enable -> reports state again).
+            #
+            # We retry generously (5x) because in practice some motors
+            # need more than one attempt to wake up:
+            #   * a freshly-flashed motor (just had CTRL_MODE saved to
+            #     flash via SAVE_PARAMETERS) needs ~100-200ms to finish
+            #     the flash write before it'll respond to control frames;
+            #   * a motor that was idle for a long time (e.g. while the
+            #     lerobot policy weights were loading, 1-2 min) may need
+            #     an extra DISABLE pulse to clear its internal idle state;
+            #   * other motors on the same bus are emitting late state
+            #     responses, and the recv() loop below filters them out
+            #     but each filtered frame eats some of the wait budget.
+            # The cost of extra retries is bounded (~2s per failing
+            # motor, zero overhead for motors that respond first try),
+            # and the alternative — a failed startup — is much worse.
             response = None
-            start_time = time.time()
-            while time.time() - start_time < 0.1:
-                response = self.canbus.recv(timeout=0.1)
-                if response and response.arbitration_id == recv_id:
+            for attempt in range(_HANDSHAKE_MAX_ATTEMPTS):
+                # First DISABLE: clears any latched fault state. We drain
+                # the bus instead of trying to match a specific reply,
+                # because a fault-latched motor might send a different
+                # reply on disable. The drain also clears any stale frames
+                # from prior motors' handshakes so they don't pollute the
+                # response-matching loop below.
+                disable_msg = can.Message(
+                    arbitration_id=motor_id,
+                    data=[0xFF] * 7 + [CAN_CMD_DISABLE],
+                    is_extended_id=False,
+                    is_fd=self.use_can_fd,
+                )
+                self.canbus.send(disable_msg)
+                drain_end = time.time() + _HANDSHAKE_DRAIN_S
+                while time.time() < drain_end:
+                    if self.canbus.recv(timeout=0.01) is None:
+                        break
+
+                # Then ENABLE. Look ONLY for this motor's reply ID; any
+                # other frames in the wait window are stale state-emits
+                # from earlier motors' handshakes and we keep reading
+                # past them until we either find the right one or run
+                # out of time.
+                enable_msg = can.Message(
+                    arbitration_id=motor_id,
+                    data=[0xFF] * 7 + [CAN_CMD_ENABLE],
+                    is_extended_id=False,
+                    is_fd=self.use_can_fd,
+                )
+                self.canbus.send(enable_msg)
+                deadline = time.time() + _HANDSHAKE_WAIT_S
+                while time.time() < deadline:
+                    # short per-recv timeout so a stale frame doesn't
+                    # consume the entire wait budget; we cycle through
+                    # frames quickly and check arbitration_id against
+                    # the motor we actually want to hear from.
+                    remaining = deadline - time.time()
+                    msg = self.canbus.recv(timeout=min(0.02, remaining))
+                    if msg is None:
+                        continue
+                    if msg.arbitration_id == recv_id:
+                        response = msg
+                        break
+                    # stale frame from another motor — keep looking
+                if response is not None:
+                    if attempt > 0:
+                        logger.info(
+                            "Handshake: %s recovered after DISABLE+ENABLE retry %d "
+                            "(was likely fault-latched, mid-flash-write, or "
+                            "auto-disabled from prolonged idle).",
+                            motor_name, attempt,
+                        )
                     break
-                response = None
+                # brief inter-attempt pause to let the motor's MCU settle
+                # between repeated DISABLE+ENABLE cycles
+                time.sleep(_HANDSHAKE_RETRY_GAP_S)
 
             if response is None:
                 missing_motors.append(motor_name)
             else:
-                self._process_response(motor_name, msg)
+                self._process_response(motor_name, response)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:
             raise ConnectionError(
                 f"Handshake failed. The following motors did not respond: {missing_motors}. "
-                "Check power (24V) and CAN wiring."
+                "Check power (24V) and CAN wiring. (Note: the handshake already attempts "
+                "a DISABLE+ENABLE recovery cycle for fault-latched motors; if you're still "
+                "seeing this, the motor is most likely powered off, has a loose CAN cable, "
+                "or is in a hard fault that requires a 24V power cycle.)"
             )
         logger.info("Handshake successful. All motors ready.")
 
@@ -268,12 +364,203 @@ class DamiaoMotorsBus(MotorsBusBase):
         logger.debug(f"{self.__class__.__name__} disconnected.")
 
     def configure_motors(self) -> None:
-        """Configure all motors with default settings."""
-        # Damiao motors don't require much configuration in MIT mode
-        # Just ensure they're enabled
+        """Configure all motors with default settings.
+
+        Forces every motor's CTRL_MODE register to MIT mode before enabling.
+
+        Why this is necessary:
+            Damiao DM motors have a CTRL_MODE register (address 10) that
+            selects the CAN-frame format the firmware accepts as a control
+            command (1=MIT, 2=POS_VEL, 3=VEL, 4=TORQUE_POS). The OpenArm
+            setup tools (``python -m openarm.damiao ...``) configure motors
+            in POS_VEL by default. lerobot's DamiaoMotorsBus ONLY speaks
+            MIT — :meth:`_mit_control_batch` sends frames on ID=slave_id
+            with the MIT payload. A motor that is currently in any other
+            mode silently ignores those frames: the handshake succeeds,
+            the encoder reads work, ENABLE is acknowledged
+            (``fault=0x1 ENABLED``), but no torque is ever produced no
+            matter how long we stream commands. This is a brutal failure
+            mode because EVERYTHING reads as healthy except the motor
+            doesn't move. Re-asserting MIT mode here on every connect
+            makes lerobot self-heal after any external tool that left the
+            motors in another mode, and the cost is just 1-2 CAN frames
+            per motor at startup.
+        """
+        # Re-assert MIT mode on every motor before enabling. We intentionally
+        # do NOT save to flash here (would slow startup and wear flash);
+        # the user can run scripts/set_motors_to_mit_mode.py once to make
+        # it persistent across power cycles.
+        self._ensure_mit_mode(save_to_flash=False)
+
         for motor in self.motors:
             self._send_simple_command(motor, CAN_CMD_ENABLE)
             time.sleep(MEDIUM_TIMEOUT_SEC)
+
+    def _ensure_mit_mode(self, *, save_to_flash: bool = False) -> None:
+        """Read every motor's CTRL_MODE register and force it to MIT if needed.
+
+        Args:
+            save_to_flash: If True, also send the SAVE_PARAMETERS (0xAA)
+                command so the CTRL_MODE change persists across 24V power
+                cycles. Default False (per-session only) because flash
+                writes have a finite endurance and a small (~100ms) delay.
+        """
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+
+        for motor_name in self.motors:
+            motor_id = self._get_motor_id(motor_name)
+            try:
+                current = self._read_register_int(motor_id, MotorVariable.CTRL_MODE)
+            except Exception as e:
+                logger.warning(
+                    "configure_motors: could not read CTRL_MODE for %s (id=0x%02X): %s "
+                    "— skipping mode enforcement for this motor.",
+                    motor_name, motor_id, e,
+                )
+                continue
+
+            if current == int(ControlMode.MIT):
+                logger.debug(
+                    "configure_motors: %s already in MIT mode (CTRL_MODE=%d).",
+                    motor_name, current,
+                )
+                continue
+
+            current_name = ControlMode(current).name if current in (1, 2, 3, 4) else f"unknown({current})"
+            logger.warning(
+                "configure_motors: %s is in CTRL_MODE=%d (%s); switching to MIT (=1). "
+                "This usually means an external tool (e.g. `python -m openarm.damiao`) "
+                "left the motor in a non-MIT mode. Switching now so MIT control frames "
+                "are honored.",
+                motor_name, current, current_name,
+            )
+            try:
+                self._write_register_int(motor_id, MotorVariable.CTRL_MODE, int(ControlMode.MIT))
+            except Exception as e:
+                logger.error(
+                    "configure_motors: FAILED to write CTRL_MODE=MIT on %s (id=0x%02X): %s "
+                    "— motor will likely ignore MIT control commands.",
+                    motor_name, motor_id, e,
+                )
+                continue
+
+            if save_to_flash:
+                try:
+                    self._save_param_to_flash(motor_id)
+                except Exception as e:
+                    logger.warning(
+                        "configure_motors: CTRL_MODE write succeeded but flash save "
+                        "failed for %s: %s — change will revert on next 24V power cycle.",
+                        motor_name, e,
+                    )
+
+            # Verify
+            try:
+                verify = self._read_register_int(motor_id, MotorVariable.CTRL_MODE)
+            except Exception:
+                verify = None
+            if verify != int(ControlMode.MIT):
+                logger.error(
+                    "configure_motors: %s CTRL_MODE write verification failed "
+                    "(read back %r, wanted %d).",
+                    motor_name, verify, int(ControlMode.MIT),
+                )
+
+    def _read_register_int(self, motor_id: int, reg: int,
+                            timeout_s: float = 0.2) -> int:
+        """Read an integer register from a Damiao motor via the param protocol.
+
+        Returns the register value as a Python int. Raises ConnectionError
+        if the motor does not reply within ``timeout_s``.
+        """
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+
+        # Request: slave_id (uint16 LE) + 0x33 (read cmd) + reg + 4 padding bytes
+        data = bytes([
+            motor_id & 0xFF, (motor_id >> 8) & 0xFF,
+            CAN_CMD_QUERY_PARAM, int(reg),
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        msg = can.Message(arbitration_id=CAN_PARAM_ID, data=list(data),
+                           is_extended_id=False, is_fd=self.use_can_fd)
+        self.canbus.send(msg)
+
+        master_id = motor_id + 0x10
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            reply = self.canbus.recv(timeout=0.02)
+            if reply is None:
+                continue
+            if reply.arbitration_id != master_id:
+                continue
+            payload = bytes(reply.data)
+            if len(payload) < 8:
+                continue
+            # Format: <H B B I> = slave_id(uint16 LE) + cmd(B) + reg(B) + value(uint32 LE)
+            value = int.from_bytes(payload[4:8], byteorder="little", signed=False)
+            return value
+        raise ConnectionError(
+            f"No param reply from motor id=0x{motor_id:02X} (reg={int(reg)}) within {timeout_s:.2f}s"
+        )
+
+    def _write_register_int(self, motor_id: int, reg: int, value: int,
+                             timeout_s: float = 0.2) -> None:
+        """Write an integer register on a Damiao motor and wait for the ack reply.
+
+        Raises ConnectionError if no acknowledgement arrives.
+        """
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+
+        # Request: slave_id (uint16 LE) + 0x55 (write cmd) + reg + value (uint32 LE)
+        value_bytes = int(value).to_bytes(4, byteorder="little", signed=False)
+        data = bytes([
+            motor_id & 0xFF, (motor_id >> 8) & 0xFF,
+            CAN_CMD_WRITE_PARAM, int(reg),
+        ]) + value_bytes
+        msg = can.Message(arbitration_id=CAN_PARAM_ID, data=list(data),
+                           is_extended_id=False, is_fd=self.use_can_fd)
+        self.canbus.send(msg)
+
+        master_id = motor_id + 0x10
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            reply = self.canbus.recv(timeout=0.02)
+            if reply is not None and reply.arbitration_id == master_id:
+                return
+        raise ConnectionError(
+            f"No write-param ack from motor id=0x{motor_id:02X} (reg={int(reg)}) within {timeout_s:.2f}s"
+        )
+
+    def _save_param_to_flash(self, motor_id: int, timeout_s: float = 0.5) -> None:
+        """Persist register changes by sending SAVE_PARAMETERS (0xAA) to the motor.
+
+        Flash writes take ~50-200ms on DM-series MCUs, hence the longer
+        default timeout. Raises ConnectionError if no ack arrives.
+        """
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+
+        data = bytes([
+            motor_id & 0xFF, (motor_id >> 8) & 0xFF,
+            CAN_CMD_SAVE_PARAM, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        msg = can.Message(arbitration_id=CAN_PARAM_ID, data=list(data),
+                           is_extended_id=False, is_fd=self.use_can_fd)
+        self.canbus.send(msg)
+
+        master_id = motor_id + 0x10
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            reply = self.canbus.recv(timeout=0.02)
+            if reply is not None and reply.arbitration_id == master_id:
+                return
+        raise ConnectionError(
+            f"No save-param ack from motor id=0x{motor_id:02X} within {timeout_s:.2f}s"
+        )
 
     def _send_simple_command(self, motor: NameOrID, command_byte: int) -> None:
         """Helper to send simple 8-byte commands (Enable, Disable, Zero)."""

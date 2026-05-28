@@ -70,6 +70,19 @@ class OpenArmFollowerConfigBase:
     # Set to a positive scalar for all motors, or a dict mapping motor names to limits
     max_relative_target: float | dict[str, float] | None = None
 
+    # Whether to expose per-motor velocity and torque alongside position in
+    # `observation_features` / `action_features`. The original lerobot
+    # convention (and what every released pi0.5 / pi0 / smolvla checkpoint was
+    # trained against) is "position only" — `observation.state` is shape (16,)
+    # for the bimanual setup. The 3-features-per-motor variant
+    # (`{motor}.{pos,vel,torque}`) is useful for teleop datasets that want to
+    # log velocity/torque telemetry for analysis, but it breaks any
+    # pretrained-checkpoint inference because the normalizer's `q01`/`q99`
+    # have shape (16,), not (48,). Default False to stay policy-compatible;
+    # set True only when collecting fresh datasets that intentionally include
+    # velocity/torque in the state.
+    include_motor_telemetry_in_features: bool = False
+
     # Camera configurations
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 

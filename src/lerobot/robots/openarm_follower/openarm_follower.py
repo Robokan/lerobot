@@ -89,12 +89,20 @@ class OpenArmFollower(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
-        """Motor features for observation and action spaces."""
+        """Motor features for observation and action spaces.
+
+        Position is always included; velocity and torque are gated by
+        ``config.include_motor_telemetry_in_features`` so the default 16-DOF
+        state vector stays compatible with pretrained policies. See
+        :attr:`OpenArmFollowerConfigBase.include_motor_telemetry_in_features`
+        for the rationale.
+        """
         features: dict[str, type] = {}
         for motor in self.bus.motors:
             features[f"{motor}.pos"] = float
-            features[f"{motor}.vel"] = float  # Add this
-            features[f"{motor}.torque"] = float  # Add this
+            if self.config.include_motor_telemetry_in_features:
+                features[f"{motor}.vel"] = float
+                features[f"{motor}.torque"] = float
         return features
 
     @property
@@ -144,9 +152,29 @@ class OpenArmFollower(Robot):
 
         self.configure()
 
-        if self.is_calibrated:
-            self.bus.set_zero_position()
-
+        # IMPORTANT: We intentionally do NOT call self.bus.set_zero_position()
+        # here, even when calibration is valid.
+        #
+        # Damiao motors (DM4310/DM4340/DM8009) are absolute encoders whose
+        # zero reference is saved to motor flash via CAN_CMD_SET_ZERO (0xFE).
+        # That flash zero persists across power cycles, so once `calibrate()`
+        # has run with the arms physically positioned in the default pose
+        # (arms hanging straight, grippers closed) the motors REMEMBER that
+        # pose as encoder zero forever.
+        #
+        # The previous behavior of re-zeroing on every connect destroyed the
+        # calibration: it overwrote the flash-saved "hanging straight" zero
+        # with whatever pose the arms happened to be in when the operator
+        # started the script (typically wherever gravity left them after the
+        # last run). That made "command 0" mean "hold current drooped pose"
+        # instead of "go to the calibrated default", which is why the
+        # lift_arms phase-0 ramp was effectively a no-op no matter what we
+        # set the default_start_pose_deg to.
+        #
+        # If you ever need to recapture the zero (e.g. the motor's flash was
+        # cleared, or the mechanical mounting changed), run the explicit
+        # calibration flow which DOES call set_zero_position; that's the only
+        # supported path to mutate the flash zero now.
         self.bus.enable_torque()
 
         logger.info(f"{self} connected.")

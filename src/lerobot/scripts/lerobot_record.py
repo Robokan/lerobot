@@ -118,6 +118,11 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
+from lerobot.robots.bi_openarm_follower import (
+    ActionSafetyChecker,
+    ActionSafetyConfig,
+    ActionSafetyViolation,
+)
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -232,6 +237,82 @@ class RecordConfig:
     # Action interpolation multiplier for smoother policy control (1=off, 2=2x, 3=3x)
     # Only applies when using a policy (not teleop)
     interpolation_multiplier: int = 1
+    # Before the very first policy episode, smoothly raise both arms along the
+    # SparkJAX "lift spine" so the policy starts from the "arms up, table-cleared"
+    # ready pose instead of from the rest pose the user happened to leave them in.
+    # Only applies when (a) a policy is loaded AND (b) the robot is a
+    # BiOpenArmFollower; ignored otherwise. See
+    # `lerobot.robots.bi_openarm_follower.lift_arms.lift_arms_to_ready` for the
+    # full motion description.
+    lift_arms_before_policy: bool = False
+    # Phase 0 ("go to zero pose"): slow soft-gain ramp from the current pose
+    # to the LeRobot-canonical OpenArm zero pose (arms hanging straight,
+    # grippers closed; all joints = 0 deg by construction of the
+    # ``OpenArmFollower.calibrate`` procedure). Always runs FIRST so the
+    # arms anchor at a known posture regardless of where they were left
+    # after the previous session. Set to 0 only if you have manually
+    # positioned the arms at the zero pose already.
+    lift_arms_pre_zero_s: float = 3.0
+    # Phase 1 ("pre-ramp"): soft-gain ramp from the default-hanging pose to
+    # the start of the lift spine (LIFT_SPINE[0]). Mirrors SparkJAX's C++
+    # ``Control::AdjustPosition`` smooth-move (~2.2s + buffer).
+    lift_arms_pre_ramp_s: float = 3.0
+    # Spine sweep duration (s). Bumped from SparkJAX's 1.5s to 1.7s after we
+    # appended READY_POSE_RAD as the spine's 10th waypoint (1.7s / 9 segments
+    # ~= SparkJAX's original 188 ms/segment pacing).
+    lift_arms_spine_s: float = 1.7
+    # Command rate (Hz) used during the raise (must match the follower's PD update budget).
+    lift_arms_hz: float = 50.0
+    # Hold time (s) at the final spine waypoint before handing control to the policy.
+    lift_arms_hold_s: float = 0.5
+    # Hard-abort safety gate for policy actions: rejects NaN/Inf, values outside
+    # a wide sanity envelope, and per-step deltas larger than the configured
+    # thresholds. Mirrors SparkJAX's ``_check_action_safety``. Only applies when
+    # a policy is loaded (teleop is trusted). On violation: log error, send the
+    # last good action as a hold frame, raise ``ActionSafetyViolation`` which
+    # propagates up to the ``try/finally`` that disconnects the robot (and
+    # disables torque by default). Defaults below match SparkJAX, converted to
+    # degrees.
+    action_safety_enabled: bool = False
+    # 0.5 rad / step at 50 Hz, in degrees. Anything larger than this between
+    # consecutive policy outputs is treated as a fault (chunk-swap glitch, bad
+    # diffusion sample, RTC splice landing wrong, ...).
+    action_safety_max_joint_delta_deg: float = 28.647889756541159
+    # 1.0 rad / step for grippers, in degrees.
+    action_safety_max_gripper_delta_deg: float = 57.29577951308232
+    # Absolute-envelope sanity gate (|value| <= limit). Intentionally wider than
+    # the follower's kinematic joint limits — those are enforced by send_action;
+    # this catches unit confusions and NaN-survived integrators.
+    action_safety_abs_joint_limit_deg: float = 200.0
+    action_safety_abs_gripper_limit_deg: float = 300.0
+
+    # Lightweight per-iteration profiling for the record_loop. When True, the
+    # loop measures get_observation, predict_action, and send_action latencies
+    # and logs a rolling summary every ``profile_log_period_s`` seconds (median
+    # / p95 per phase + inference vs queue-pop classification). Adds ~3 timer
+    # calls per iteration — overhead is negligible. Use this to figure out
+    # whether a sub-target loop rate is caused by camera reads, policy
+    # inference, or CAN write latency. Default off so production logs stay
+    # clean.
+    profile_loop: bool = False
+    profile_log_period_s: float = 1.0
+    # Dump per-joint observation/action/delta for the first N iterations of
+    # every policy episode. Use to verify that the policy is commanding
+    # reasonable positions immediately after lift_arms hands over control
+    # (e.g. if arms "drop" right after lift, this tells you whether the
+    # policy is commanding a downward move or whether it's a hardware issue).
+    # 0 = disabled.
+    debug_first_actions: int = 0
+    # Complementary to ``debug_first_actions``: dump per-joint state/action
+    # on every iteration where fresh policy inference just ran (detected via
+    # predict time > 100 ms, the standard heuristic the profile_loop uses).
+    # For chunk-based policies (pi0/pi05/ACT/...) this gives you one log
+    # line per chunk - useful for spotting whether the model's *intent*
+    # drifts over time (e.g. arms slowly moving down means each new chunk
+    # commands a slightly lower target, even if individual chunks look
+    # like "hold position"). Capped at N inferences so the log doesn't
+    # explode. 0 = disabled.
+    debug_log_each_inference: int = 0
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -306,6 +387,11 @@ def record_loop(
     display_data: bool = False,
     interpolator: ActionInterpolator | None = None,
     display_compressed_images: bool = False,
+    action_safety: ActionSafetyChecker | None = None,
+    profile_loop: bool = False,
+    profile_log_period_s: float = 1.0,
+    debug_first_actions: int = 0,
+    debug_log_each_inference: int = 0,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -345,6 +431,12 @@ def record_loop(
     if interpolator is not None:
         interpolator.reset()
 
+    # Re-arm the action-safety guard so the per-step delta baseline is seeded
+    # from the current robot state at the start of each episode rather than
+    # from a stale last-action from a prior episode.
+    if action_safety is not None and policy is not None:
+        action_safety.reset()
+
     # Calculate control interval based on interpolation
     use_interpolation = interpolator is not None and interpolator.enabled and policy is not None
     control_interval = interpolator.get_control_interval(fps) if interpolator else 1 / fps
@@ -354,6 +446,69 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
+
+    # Rolling-window state for the "loop running slower than target FPS"
+    # warning. See the warn block below; we suppress per-iteration blips
+    # (every n_action_steps frames a chunk-renewal inference takes 200-1000
+    # ms, which is fine if the average throughput keeps up) and only warn
+    # when the average over the last ``_warn_window`` iters drops below
+    # target. ``_last_slow_warn_t`` is a 1-element list so we can mutate
+    # it from inside the loop without ``nonlocal``.
+    _warn_window: int = max(2 * fps, 30)
+    _slow_iter_history: list[float] = []
+    _last_slow_warn_t: list[float] = [0.0]
+
+    # Debug-print the first N policy iterations: dumps observation.state,
+    # commanded action, and per-joint delta so we can see exactly what the
+    # policy is doing when the arms appear to move unexpectedly (e.g.
+    # "dropped right after lift_arms"). Counter resets each episode.
+    debug_actions_remaining = int(debug_first_actions) if policy is not None else 0
+    # Counter for "log on each fresh inference" mode; lets us see one log
+    # line per chunk, which reveals long-horizon drift of the model's
+    # intent (something debug_first_actions misses if N < chunk_size).
+    debug_inference_remaining = int(debug_log_each_inference) if policy is not None else 0
+    debug_inference_idx = 0
+    debug_joint_order = (
+        "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4",
+        "left_joint_5", "left_joint_6", "left_joint_7", "left_gripper",
+        "right_joint_1", "right_joint_2", "right_joint_3", "right_joint_4",
+        "right_joint_5", "right_joint_6", "right_joint_7", "right_gripper",
+    )
+
+    # Profiling state (only used when profile_loop=True). We track per-phase
+    # latencies plus an "inference vs queue-pop" classifier (heuristic: any
+    # predict_action call > 100 ms must have actually run the chunk
+    # inference; anything under that is amortised queue pop / preproc).
+    prof_phase: dict[str, list[float]] = {"obs": [], "predict": [], "send": [], "total": []}
+    prof_inference_ms: list[float] = []
+    prof_queue_pop_ms: list[float] = []
+    prof_iter_count = 0
+    prof_last_log_t = time.perf_counter()
+    if profile_loop and policy is not None:
+        try:
+            param_device = next(policy.parameters()).device
+            param_dtype = next(policy.parameters()).dtype
+        except StopIteration:
+            param_device = "unknown"
+            param_dtype = "unknown"
+        logging.info(
+            "[profile_loop] policy device=%s dtype=%s | torch.cuda.is_available()=%s | "
+            "configured device=%s | use_amp=%s",
+            param_device,
+            param_dtype,
+            torch.cuda.is_available(),
+            getattr(policy.config, "device", "?"),
+            getattr(policy.config, "use_amp", "?"),
+        )
+        n_action_steps = getattr(policy.config, "n_action_steps", None)
+        chunk_size = getattr(policy.config, "chunk_size", None)
+        logging.info(
+            "[profile_loop] policy chunk_size=%s n_action_steps=%s "
+            "(predict_action runs full inference once every n_action_steps calls)",
+            chunk_size,
+            n_action_steps,
+        )
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -362,7 +517,9 @@ def record_loop(
             break
 
         # Get robot observation
+        t_obs_start = time.perf_counter()
         obs = robot.get_observation()
+        t_obs_end = time.perf_counter()
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -376,12 +533,14 @@ def record_loop(
         is_record_frame = True
 
         # Get action from either policy or teleop
+        t_predict_ms = 0.0
         if policy is not None and preprocessor is not None and postprocessor is not None:
             # With interpolation: only call policy when interpolator needs new action
             if use_interpolation:
                 ran_inference = False
 
                 if interpolator.needs_new_action():
+                    t_predict_start = time.perf_counter()
                     action_values = predict_action(
                         observation=observation_frame,
                         policy=policy,
@@ -392,6 +551,7 @@ def record_loop(
                         task=single_task,
                         robot_type=robot.robot_type,
                     )
+                    t_predict_ms = (time.perf_counter() - t_predict_start) * 1000.0
                     act_processed_policy = make_robot_action(action_values, dataset.features)
                     robot_action_to_send = robot_action_processor((act_processed_policy, obs))
 
@@ -408,6 +568,7 @@ def record_loop(
 
                 is_record_frame = ran_inference
             else:
+                t_predict_start = time.perf_counter()
                 action_values = predict_action(
                     observation=observation_frame,
                     policy=policy,
@@ -418,6 +579,7 @@ def record_loop(
                     task=single_task,
                     robot_type=robot.robot_type,
                 )
+                t_predict_ms = (time.perf_counter() - t_predict_start) * 1000.0
                 act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
                 # Applies a pipeline to the action, default is IdentityProcessor
                 robot_action_to_send = robot_action_processor((act_processed_policy, obs))
@@ -452,11 +614,88 @@ def record_loop(
                 )
             continue
 
+        # Hard-abort safety gate. Only runs when a policy is producing the
+        # action (teleop is trusted to be human-driven). Three gates: NaN/Inf,
+        # absolute envelope, per-step delta. On violation: send the last good
+        # action as an explicit hold frame, then raise — the outer try/finally
+        # disconnects the robot and (by default) disables torque.
+        if action_safety is not None and policy is not None:
+            safety_err = action_safety.check(robot_action_to_send, obs)
+            if safety_err is not None:
+                logging.error("[POLICY-ABORT] %s", safety_err)
+                if action_safety.last_action is not None:
+                    try:
+                        robot.send_action(action_safety.last_action)
+                    except Exception:
+                        logging.exception("Failed to send hold-pose frame after safety abort")
+                raise ActionSafetyViolation(safety_err)
+
+        # Debug: dump first N policy iterations so we can see what the model
+        # actually commands relative to the current observation. Helps
+        # diagnose "arms behave oddly right after lift_arms" failures.
+        if debug_actions_remaining > 0 and policy is not None:
+            try:
+                def _fmt(name: str) -> str:
+                    key = f"{name}.pos"
+                    s = obs.get(key)
+                    a = robot_action_to_send.get(key)
+                    if s is None or a is None:
+                        return f"{name}=<missing>"
+                    return f"{name}: s={s:+7.2f} a={a:+7.2f} d={a - s:+6.2f}"
+                left = "  ".join(_fmt(n) for n in debug_joint_order[:8])
+                right = "  ".join(_fmt(n) for n in debug_joint_order[8:])
+                logging.info(
+                    "[debug_first_actions] iter=%d (deg, s=state a=action d=delta)\n"
+                    "  L: %s\n  R: %s",
+                    int(debug_first_actions) - debug_actions_remaining + 1,
+                    left, right,
+                )
+            except Exception:
+                logging.exception("[debug_first_actions] dump failed")
+            debug_actions_remaining -= 1
+
+        # Per-chunk debug: log the model's "first action of the chunk" on
+        # every iteration where fresh inference actually ran (heuristic:
+        # predict time > 100 ms, same threshold profile_loop uses). For
+        # chunk-based policies this gives you one line per chunk, ~every
+        # 1.6 s at chunk_size=50, fps=30. Useful for spotting long-horizon
+        # drift in the model's intent (e.g. arms slowly moving down means
+        # each new chunk targets a lower pose, even if individual chunks
+        # look like "hold").
+        if (
+            debug_inference_remaining > 0
+            and policy is not None
+            and t_predict_ms > 100.0
+        ):
+            try:
+                def _fmt_inf(name: str) -> str:
+                    key = f"{name}.pos"
+                    s = obs.get(key)
+                    a = robot_action_to_send.get(key)
+                    if s is None or a is None:
+                        return f"{name}=<missing>"
+                    return f"{name}: s={s:+7.2f} a={a:+7.2f} d={a - s:+6.2f}"
+                left = "  ".join(_fmt_inf(n) for n in debug_joint_order[:8])
+                right = "  ".join(_fmt_inf(n) for n in debug_joint_order[8:])
+                debug_inference_idx += 1
+                logging.info(
+                    "[debug_log_each_inference] inf=%d (t_predict=%.0fms, deg, s=state a=action[0_of_chunk] d=delta)\n"
+                    "  L: %s\n  R: %s",
+                    debug_inference_idx,
+                    t_predict_ms,
+                    left, right,
+                )
+            except Exception:
+                logging.exception("[debug_log_each_inference] dump failed")
+            debug_inference_remaining -= 1
+
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+        t_send_start = time.perf_counter()
         _sent_action = robot.send_action(robot_action_to_send)
+        t_send_ms = (time.perf_counter() - t_send_start) * 1000.0
 
         # Write to dataset (only on real policy frames, not interpolated-only iterations)
         if dataset is not None and is_record_frame:
@@ -471,11 +710,82 @@ def record_loop(
 
         dt_s = time.perf_counter() - start_loop_t
 
+        if profile_loop:
+            obs_ms = (t_obs_end - t_obs_start) * 1000.0
+            total_ms = dt_s * 1000.0
+            prof_phase["obs"].append(obs_ms)
+            prof_phase["predict"].append(t_predict_ms)
+            prof_phase["send"].append(t_send_ms)
+            prof_phase["total"].append(total_ms)
+            if t_predict_ms > 100.0:
+                prof_inference_ms.append(t_predict_ms)
+            elif t_predict_ms > 0.0:
+                prof_queue_pop_ms.append(t_predict_ms)
+            prof_iter_count += 1
+
+            if time.perf_counter() - prof_last_log_t >= profile_log_period_s:
+                def _pct(xs: list[float], q: float) -> float:
+                    if not xs:
+                        return 0.0
+                    s = sorted(xs)
+                    idx = min(len(s) - 1, max(0, int(round(q * (len(s) - 1)))))
+                    return s[idx]
+
+                n_inf = len(prof_inference_ms)
+                n_pop = len(prof_queue_pop_ms)
+                logging.info(
+                    "[profile_loop] iters=%d  loop_hz=%.1f  "
+                    "obs(med=%.1f p95=%.1f) ms  "
+                    "predict(med=%.1f p95=%.1f) ms  "
+                    "send(med=%.1f p95=%.1f) ms  "
+                    "inference(n=%d med=%.0f max=%.0f) ms  "
+                    "queue_pop(n=%d med=%.1f) ms",
+                    prof_iter_count,
+                    1000.0 / max(_pct(prof_phase["total"], 0.5), 1e-3),
+                    _pct(prof_phase["obs"], 0.5), _pct(prof_phase["obs"], 0.95),
+                    _pct(prof_phase["predict"], 0.5), _pct(prof_phase["predict"], 0.95),
+                    _pct(prof_phase["send"], 0.5), _pct(prof_phase["send"], 0.95),
+                    n_inf, _pct(prof_inference_ms, 0.5),
+                    (max(prof_inference_ms) if prof_inference_ms else 0.0),
+                    n_pop, _pct(prof_queue_pop_ms, 0.5),
+                )
+                for k in prof_phase:
+                    prof_phase[k].clear()
+                prof_inference_ms.clear()
+                prof_queue_pop_ms.clear()
+                prof_iter_count = 0
+                prof_last_log_t = time.perf_counter()
+
         sleep_time_s: float = control_interval - dt_s
         if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
+            # A single slow iteration is expected every ``n_action_steps``
+            # frames when the chunk runner has to call full inference (200-
+            # 1000 ms for pi05 on consumer GPUs). What we actually care
+            # about is whether the AVERAGE throughput is below the target -
+            # if so, frames will be dropped and the robot will lag the
+            # policy. Track the most recent ``warn_window`` iterations and
+            # warn only when their summed elapsed time exceeds the budget
+            # for that many iterations. This suppresses the per-inference
+            # blip and only catches real sustained slowdown.
+            _slow_iter_history.append(dt_s)
+            if len(_slow_iter_history) > _warn_window:
+                _slow_iter_history.pop(0)
+            if len(_slow_iter_history) == _warn_window:
+                window_dt = sum(_slow_iter_history)
+                budget = control_interval * _warn_window
+                if window_dt > budget * 1.05:  # 5 % slack
+                    avg_hz = _warn_window / window_dt
+                    now = time.perf_counter()
+                    if now - _last_slow_warn_t[0] >= 5.0:
+                        logging.warning(
+                            "Record loop sustained avg %.1f Hz over last %d iters "
+                            "(target FPS %d). Dataset frames will be dropped and "
+                            "robot control may be unstable. Common causes: "
+                            "1) camera FPS not keeping up 2) policy inference "
+                            "too slow 3) CPU starvation.",
+                            avg_hz, _warn_window, fps,
+                        )
+                        _last_slow_warn_t[0] = now
 
         precise_sleep(max(sleep_time_s, 0.0))
 
@@ -577,6 +887,101 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if teleop is not None:
             teleop.connect()
 
+        # Install an aggressive Ctrl-C handler that disables motor torque
+        # IMMEDIATELY on first SIGINT, then re-raises KeyboardInterrupt so the
+        # normal try/finally in this function still runs (dataset.finalize,
+        # robot.disconnect, etc.). Without this, a Ctrl-C that lands during
+        # a long policy.predict_action CUDA call sits queued until the call
+        # returns (Python defers signal delivery to interpreter ticks, which
+        # don't run inside extension code), so the arms stay torqued for up
+        # to ~9 s before any cleanup runs. We also IGNORE subsequent SIGINTs
+        # while shutting down so an impatient double-Ctrl-C can't abort the
+        # cleanup path itself.
+        import signal as _signal
+
+        _sigint_state = {"fired": False, "prev": _signal.getsignal(_signal.SIGINT)}
+
+        def _emergency_disable_torque(*_args: object) -> None:
+            if _sigint_state["fired"]:
+                # second Ctrl-C: ignore so cleanup runs to completion
+                return
+            _sigint_state["fired"] = True
+            logging.warning("SIGINT received - disabling motor torque NOW.")
+            # Try bimanual first (BiOpenArmFollower exposes left_arm/right_arm),
+            # fall back to a flat single-arm follower.
+            try:
+                for arm_attr in ("left_arm", "right_arm"):
+                    arm = getattr(robot, arm_attr, None)
+                    if arm is not None and getattr(arm, "is_connected", False):
+                        try:
+                            arm.bus.disable_torque()
+                            logging.warning(f"  {arm_attr}: torque disabled")
+                        except Exception as e:
+                            logging.error(f"  {arm_attr}: failed to disable torque: {e}")
+                if not any(getattr(robot, a, None) for a in ("left_arm", "right_arm")):
+                    bus = getattr(robot, "bus", None)
+                    if bus is not None:
+                        try:
+                            bus.disable_torque()
+                            logging.warning("  bus: torque disabled")
+                        except Exception as e:
+                            logging.error(f"  bus: failed to disable torque: {e}")
+            except Exception as e:
+                logging.error(f"SIGINT torque-disable handler error: {e}")
+            # ignore further SIGINTs until cleanup completes
+            _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+            # raise KeyboardInterrupt synchronously so the outer try/finally runs
+            raise KeyboardInterrupt
+
+        _signal.signal(_signal.SIGINT, _emergency_disable_torque)
+
+        # Build the policy-action safety guard. Always None when no policy is
+        # loaded; otherwise None if the user opts out via --action_safety_enabled=false.
+        # Construct once (outside the per-episode loop) so an abort stays sticky
+        # across the rest of the session.
+        action_safety: ActionSafetyChecker | None = None
+        if policy is not None and cfg.action_safety_enabled:
+            action_safety = ActionSafetyChecker(
+                ActionSafetyConfig(
+                    enabled=True,
+                    max_joint_delta_deg=cfg.action_safety_max_joint_delta_deg,
+                    max_gripper_delta_deg=cfg.action_safety_max_gripper_delta_deg,
+                    abs_joint_limit_deg=cfg.action_safety_abs_joint_limit_deg,
+                    abs_gripper_limit_deg=cfg.action_safety_abs_gripper_limit_deg,
+                )
+            )
+            logging.info(
+                "Action safety enabled: max_joint_delta=%.2f deg/step, "
+                "max_gripper_delta=%.2f deg/step, abs_joint=±%.1f deg, abs_gripper=±%.1f deg",
+                cfg.action_safety_max_joint_delta_deg,
+                cfg.action_safety_max_gripper_delta_deg,
+                cfg.action_safety_abs_joint_limit_deg,
+                cfg.action_safety_abs_gripper_limit_deg,
+            )
+
+        if cfg.lift_arms_before_policy and policy is not None:
+            from lerobot.robots.bi_openarm_follower import (
+                BiOpenArmFollower,
+                lift_arms_to_ready,
+            )
+
+            if isinstance(robot, BiOpenArmFollower):
+                log_say("Raising arms to ready pose", cfg.play_sounds)
+                lift_arms_to_ready(
+                    robot,
+                    pre_zero_s=cfg.lift_arms_pre_zero_s,
+                    pre_ramp_s=cfg.lift_arms_pre_ramp_s,
+                    spine_duration_s=cfg.lift_arms_spine_s,
+                    hz=cfg.lift_arms_hz,
+                    hold_s=cfg.lift_arms_hold_s,
+                    log_fn=logging.info,
+                )
+            else:
+                logging.warning(
+                    "lift_arms_before_policy=True but robot is %s, not BiOpenArmFollower; skipping.",
+                    type(robot).__name__,
+                )
+
         listener, events = init_keyboard_listener()
 
         if not cfg.dataset.streaming_encoding:
@@ -605,6 +1010,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     interpolator=interpolator,
                     display_compressed_images=display_compressed_images,
+                    action_safety=action_safety,
+                    profile_loop=cfg.profile_loop,
+                    profile_log_period_s=cfg.profile_log_period_s,
+                    debug_first_actions=cfg.debug_first_actions,
+                    debug_log_each_inference=cfg.debug_log_each_inference,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -625,6 +1035,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        profile_loop=cfg.profile_loop,
+                        profile_log_period_s=cfg.profile_log_period_s,
                     )
 
                 if events["rerecord_episode"]:
@@ -646,6 +1058,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()
+
+        # Restore the original SIGINT handler so subsequent commands in the
+        # same process see normal Ctrl-C behavior again. Wrapped in try/except
+        # because the emergency handler is only installed AFTER robot.connect();
+        # if we faulted before that, _sigint_state never got bound.
+        try:
+            import signal as _signal
+            if "_sigint_state" in locals():
+                _signal.signal(_signal.SIGINT, _sigint_state["prev"])  # type: ignore[arg-type]
+        except Exception:
+            pass
 
         if not is_headless() and listener:
             listener.stop()

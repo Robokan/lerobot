@@ -96,12 +96,33 @@ class RelativeActionsProcessorStep(ProcessorStep):
         exclude_joints: Joint names to keep absolute (not converted to relative).
         action_names: Action dimension names from dataset metadata, used to build
             the mask from exclude_joints. If None, all dims are converted.
+
+    Two cached states:
+        _last_state:
+            Always updated from each observation that flows through the
+            preprocessor. Used at training time (where preprocessor runs
+            once per (obs, action) pair).
+        _chunk_anchor_state:
+            Snapshot of ``_last_state`` taken at the moment a chunk-based
+            policy is about to run a fresh inference. The model's chunk of
+            relative actions is computed against the state at THAT moment,
+            so every action in the chunk must be reconstructed by adding
+            THAT same state - not the per-frame current state. Without
+            this, AbsoluteActionsProcessorStep would add the (changing)
+            current state to each cached chunk action and the arms would
+            cumulatively drift in whatever direction the chunk deltas
+            point. ``predict_action`` is responsible for calling
+            :meth:`latch_chunk_anchor` right before inference; the
+            postprocessor's AbsoluteActionsProcessorStep then prefers
+            ``_chunk_anchor_state`` over ``_last_state`` when present.
+            Cleared on :meth:`reset`.
     """
 
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _chunk_anchor_state: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -141,6 +162,28 @@ class RelativeActionsProcessorStep(ProcessorStep):
         mask = self._build_mask(action.shape[-1])
         new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
         return new_transition
+
+    def latch_chunk_anchor(self) -> None:
+        """Snapshot ``_last_state`` as the anchor for the next chunk.
+
+        Call this RIGHT BEFORE a chunk-based policy runs a fresh inference,
+        so the inference-time state is preserved for the postprocessor to
+        use when decoding every cached action in the resulting chunk. Without
+        this, the postprocessor would add the per-frame ``_last_state`` (which
+        changes as the arms move) to each cached delta, causing cumulative
+        drift over the chunk. See class docstring for the full rationale.
+        """
+        if self._last_state is None:
+            return
+        if isinstance(self._last_state, torch.Tensor):
+            self._chunk_anchor_state = self._last_state.clone().detach()
+        else:
+            self._chunk_anchor_state = self._last_state
+
+    def reset(self) -> None:
+        """Clear cached state on episode boundary."""
+        self._last_state = None
+        self._chunk_anchor_state = None
 
     def get_config(self) -> dict[str, Any]:
         return {
@@ -182,7 +225,21 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
                 "but relative_step is None. Ensure relative_step is set when constructing the postprocessor."
             )
 
-        if self.relative_step._last_state is None:
+        # Prefer the chunk-anchor state (snapshot at inference time) over the
+        # ever-updating ``_last_state``. For chunk-based policies the model's
+        # delta predictions are RELATIVE TO THE STATE AT INFERENCE TIME -
+        # adding the per-frame current state instead would compound errors
+        # over the chunk and the arms would drift cumulatively. See
+        # RelativeActionsProcessorStep's class docstring for the full story.
+        # Fallback to ``_last_state`` for non-chunked / training scenarios
+        # where the anchor was never latched.
+        anchor_state = (
+            self.relative_step._chunk_anchor_state
+            if self.relative_step._chunk_anchor_state is not None
+            else self.relative_step._last_state
+        )
+
+        if anchor_state is None:
             raise RuntimeError(
                 "AbsoluteActionsProcessorStep requires state from RelativeActionsProcessorStep "
                 "but no state has been cached. Ensure the preprocessor runs before the postprocessor."
@@ -195,7 +252,7 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
 
         mask = self.relative_step._build_mask(action.shape[-1])
         new_transition[TransitionKey.ACTION] = to_absolute_actions(
-            action, self.relative_step._last_state, mask
+            action, anchor_state, mask
         )
         return new_transition
 

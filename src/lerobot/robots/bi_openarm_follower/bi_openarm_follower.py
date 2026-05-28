@@ -65,6 +65,7 @@ class BiOpenArmFollower(Robot):
             position_kd=config.left_arm_config.position_kd,
             position_kp=config.left_arm_config.position_kp,
             joint_limits=config.left_arm_config.joint_limits,
+            include_motor_telemetry_in_features=config.left_arm_config.include_motor_telemetry_in_features,
         )
 
         right_arm_config = OpenArmFollowerConfig(
@@ -83,6 +84,7 @@ class BiOpenArmFollower(Robot):
             position_kd=config.right_arm_config.position_kd,
             position_kp=config.right_arm_config.position_kp,
             joint_limits=config.right_arm_config.joint_limits,
+            include_motor_telemetry_in_features=config.right_arm_config.include_motor_telemetry_in_features,
         )
 
         self.left_arm = OpenArmFollower(left_arm_config)

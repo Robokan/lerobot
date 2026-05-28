@@ -1049,6 +1049,35 @@ class PI05Policy(PreTrainedPolicy):
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
 
+        # If the checkpoint directory was produced by `scripts/openpi_pt_to_lerobot.py`
+        # with a separate `lora.safetensors` + `lora_runtime_marker.json`, install the
+        # runtime LoRA patches now. This MUST happen on the freshly-loaded base model
+        # before any `.to(device, dtype)` cast — pre-merging the LoRA into the bf16
+        # base introduces a systematic ~8% magnitude bias (see openpi's
+        # JAX_TO_PYTORCH_LORA_CONVERSION.md). Keeping `lora_a`/`lora_b` separate and
+        # adding the LoRA contribution at every forward pass matches JAX numerics.
+        try:
+            ckpt_dir = Path(pretrained_name_or_path)
+            if ckpt_dir.is_dir():
+                marker = ckpt_dir / "lora_runtime_marker.json"
+                lora_file = ckpt_dir / "lora.safetensors"
+                if marker.exists() and lora_file.exists():
+                    import json as _json
+
+                    info = _json.loads(marker.read_text())
+                    if info.get("runtime_lora"):
+                        from .lora_runtime import (
+                            install_runtime_lora,
+                            load_lora_from_safetensors,
+                        )
+
+                        print(f"Installing runtime LoRA from {lora_file.name}")
+                        lora_sd = load_lora_from_safetensors(str(lora_file))
+                        n_patched = install_runtime_lora(model, lora_sd, base_path="model")
+                        print(f"  patched {n_patched} projection modules with runtime LoRA")
+        except Exception as e:
+            print(f"Warning: failed to install runtime LoRA: {e}")
+
         return model
 
     def _fix_pytorch_state_dict_keys(

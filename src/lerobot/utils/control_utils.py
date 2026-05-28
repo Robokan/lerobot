@@ -107,6 +107,23 @@ def predict_action(
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
         observation = preprocessor(observation)
 
+        # Chunk-based policies (pi0/pi05, ACT, diffusion, ...) cache a chunk
+        # of N actions internally and pop one per call. When the chunk
+        # contains DELTA actions (RelativeActionsProcessorStep enabled), every
+        # action in the chunk was computed by the model relative to the state
+        # at the moment inference RAN - so the decoder must add THAT same
+        # state to every cached action, not the per-frame state from the
+        # current observation (which has drifted as the arms move through the
+        # chunk). We detect "this call will run fresh inference" by checking
+        # whether the policy's internal action queue is empty, and if so,
+        # latch the current ``_last_state`` of the RelativeActionsProcessorStep
+        # in the preprocessor pipeline as the anchor state for the new chunk.
+        # See RelativeActionsProcessorStep's class docstring for the full
+        # rationale. No-op for policies that don't use delta actions or don't
+        # use the chunk-queue pattern.
+        if _chunk_inference_about_to_run(policy):
+            _latch_chunk_anchor_state(preprocessor)
+
         # Compute the next action with the policy
         # based on the current observation
         action = policy.select_action(observation)
@@ -114,6 +131,38 @@ def predict_action(
         action = postprocessor(action)
 
     return action
+
+
+def _chunk_inference_about_to_run(policy) -> bool:
+    """True iff ``policy.select_action`` will run a fresh inference on the
+    next call (rather than popping from its internal action queue).
+
+    Detected via the convention used by ACT / Diffusion / pi0 / pi05: an
+    ``_action_queue`` deque drained to length 0 between inference passes.
+    Returns False for any policy that doesn't follow this convention -
+    those policies run inference every call and so don't need the chunk-
+    anchor mechanism.
+    """
+    q = getattr(policy, "_action_queue", None)
+    return q is not None and len(q) == 0
+
+
+def _latch_chunk_anchor_state(preprocessor) -> None:
+    """Find the RelativeActionsProcessorStep in ``preprocessor`` (if any)
+    and snapshot its current cached state as the chunk anchor.
+
+    Lazy import + name string match so this module doesn't take a hard
+    dependency on lerobot.processor (which would create a cycle).
+    """
+    steps = getattr(preprocessor, "steps", None)
+    if not steps:
+        return
+    for step in steps:
+        if type(step).__name__ == "RelativeActionsProcessorStep":
+            latch = getattr(step, "latch_chunk_anchor", None)
+            if callable(latch):
+                latch()
+            return
 
 
 def init_keyboard_listener():
