@@ -195,6 +195,7 @@ fi
   --dataset.encoder_threads=2 \
   --lift_arms_before_policy=true \
   --action_safety_enabled=true \
+  --action_safety_max_joint_delta_deg="${ACTION_SAFETY_MAX_JOINT_DELTA_DEG:-28.647889756541159}" \
   --profile_loop=true \
   --profile_log_period_s=1.0 \
   --debug_first_actions=10 \

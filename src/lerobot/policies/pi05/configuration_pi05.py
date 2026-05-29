@@ -57,6 +57,45 @@ class PI05Config(PreTrainedConfig):
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
 
+    # Angular unit of the joint state/action the model was TRAINED on. There is
+    # no physical-unit concept anywhere else in the model — units are implicit
+    # in the normalization stats — so this flag records what the checkpoint's
+    # norm stats assume so the runtime can match it.
+    #
+    #   "radians": the dataset (and hence norm stats) is radian-scale. Used by
+    #       openpi-native checkpoints (e.g. SparkJAX-recorded OpenArm data).
+    #   "degrees": the dataset is degree-scale. Used by datasets recorded with
+    #       native LeRobot leader-follower teleop, where the motors / teleop
+    #       report ``MotorNormMode.DEGREES``.
+    #
+    # The OpenArm follower hardware always reads / writes DEGREES on the wire,
+    # so when this is "radians" the processor pipeline inserts a deg->rad
+    # conversion on the incoming state and a rad->deg conversion on the
+    # outgoing action (around normalization). When "degrees" the conversion is
+    # a no-op (the wire unit already matches the training unit). This keeps the
+    # robot and teleop in their native degrees while letting radian-trained
+    # checkpoints run unmodified. Only joint dims are converted; gripper dims
+    # are listed in ``angle_unit_exclude_joints`` and left untouched (the
+    # gripper is not an angle — it's a normalized open/close command).
+    input_angle_unit: str = "degrees"
+    # Substrings of action/state feature names that are NOT angles and so must
+    # be skipped by the deg<->rad conversion. Defaults to ["gripper"] for the
+    # generic case, but openpi OpenArm checkpoints set this to [] because the
+    # gripper IS a Damiao motor read in degrees on the wire while the training
+    # data stores it in radians (so it needs the same deg<->rad conversion as
+    # the joints). When input_angle_unit == "degrees" this is irrelevant (the
+    # whole conversion is a no-op).
+    angle_unit_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+
+    # Swap the two arm halves of the 16-D state/action vector at the policy
+    # boundary. The lerobot BiOpenArmFollower streams state RIGHT-arm-first
+    # while openpi/SparkJAX checkpoints are trained LEFT-arm-first, so an
+    # openpi-converted checkpoint must swap halves on the incoming observation
+    # and the outgoing action. Defaults to False (no-op): a checkpoint recorded
+    # AND trained in lerobot already matches the robot's wire layout, so it must
+    # NOT swap. Only the openpi->lerobot conversion stamps this True.
+    swap_arm_halves: bool = False
+
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
@@ -111,6 +150,12 @@ class PI05Config(PreTrainedConfig):
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
+            )
+
+        if self.input_angle_unit not in ["radians", "degrees"]:
+            raise ValueError(
+                f"Invalid input_angle_unit: {self.input_angle_unit!r} "
+                "(expected 'radians' or 'degrees')"
             )
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:

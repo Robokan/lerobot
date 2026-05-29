@@ -160,6 +160,27 @@ def main() -> None:
                    help="where to write the lerobot-compatible policy directory")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float32"])
+    p.add_argument("--input-angle-unit", default="radians",
+                   choices=["radians", "degrees"],
+                   help="Angular unit the openpi checkpoint was trained on. "
+                        "openpi/SparkJAX OpenArm data is radians (the default). "
+                        "The lerobot OpenArm follower speaks degrees on the wire, "
+                        "so this stamps the conversion the processor pipeline "
+                        "applies at runtime (deg<->rad around normalization).")
+    p.add_argument("--swap-arm-halves", action="store_true",
+                   help="Swap the two 8-D arm halves of state/action at the "
+                        "policy boundary. REQUIRED for openpi/SparkJAX OpenArm "
+                        "checkpoints: training data is left-arm-first but the "
+                        "lerobot BiOpenArmFollower streams right-arm-first. "
+                        "Leave OFF for any checkpoint recorded AND trained in "
+                        "lerobot (layout already matches the robot).")
+    p.add_argument("--convert-gripper-angle", action="store_true",
+                   help="Include the gripper dims in the deg<->rad conversion "
+                        "(sets angle_unit_exclude_joints=[]). REQUIRED for "
+                        "openpi OpenArm checkpoints: the gripper is a Damiao "
+                        "motor read in degrees on the wire but stored in radians "
+                        "in the training data. Only meaningful with "
+                        "--input-angle-unit=radians.")
     args = p.parse_args()
 
     print(f"[1/6] reading dataset meta from {args.dataset_root}")
@@ -182,7 +203,25 @@ def main() -> None:
     cfg.input_features = input_features
     cfg.output_features = output_features
     cfg.action_feature_names = list(action_names)
+    # openpi checkpoints are trained in radians, but the lerobot OpenArm
+    # follower reads/writes degrees on the wire. Stamp the unit so the
+    # processor pipeline inserts the deg<->rad conversion (no-op for "degrees").
+    cfg.input_angle_unit = args.input_angle_unit
+    # Gripper: openpi OpenArm stores it in radians while the lerobot wire is
+    # degrees, so it needs the same deg<->rad conversion as the joints. Empty
+    # exclude list => convert the gripper too. Otherwise keep the default skip.
+    if args.convert_gripper_angle:
+        cfg.angle_unit_exclude_joints = []
+    # Arm order: openpi/SparkJAX is left-first, lerobot wire is right-first.
+    cfg.swap_arm_halves = bool(args.swap_arm_halves)
     cfg.empty_cameras = max(0, 3 - sum(1 for k in input_features if "images" in k))
+    print(f"      input_angle_unit: {cfg.input_angle_unit} "
+          f"(wire format is degrees; conversion "
+          f"{'ENABLED' if cfg.input_angle_unit == 'radians' else 'disabled'})")
+    print(f"      angle_unit_exclude_joints: {cfg.angle_unit_exclude_joints} "
+          f"(gripper {'CONVERTED' if not cfg.angle_unit_exclude_joints else 'skipped'})")
+    print(f"      swap_arm_halves: {cfg.swap_arm_halves} "
+          f"(right-first wire <-> left-first model)")
     policy = PI05Policy(cfg)
 
     print(f"[3/6] loading openpi safetensors {args.openpi_ckpt}")

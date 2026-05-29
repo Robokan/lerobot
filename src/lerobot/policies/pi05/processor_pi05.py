@@ -24,8 +24,12 @@ import torch
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.processor import (
+    DEG_TO_RAD,
+    RAD_TO_DEG,
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
+    AngleUnitProcessorStep,
+    ArmSwapProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
@@ -133,10 +137,64 @@ def make_pi05_pre_post_processors(
         action_names=getattr(config, "action_feature_names", None),
     )
 
-    # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
+    # Angular-unit conversion between the robot wire format (the OpenArm
+    # follower speaks degrees) and the model's training unit. There is no unit
+    # concept anywhere else in the model — it's implicit in the norm stats — so
+    # ``config.input_angle_unit`` records what those stats assume and we rescale
+    # the joint dims accordingly. "radians" -> deg2rad on the way in, rad2deg on
+    # the way out; "degrees" -> scale 1.0 (no-op). Gripper dims are excluded
+    # (the gripper command is not an angle). See AngleUnitProcessorStep.
+    angle_unit = getattr(config, "input_angle_unit", "degrees")
+    angle_exclude = getattr(config, "angle_unit_exclude_joints", ["gripper"])
+    angle_names = getattr(config, "action_feature_names", None)
+    to_model_scale = DEG_TO_RAD if angle_unit == "radians" else 1.0
+    from_model_scale = RAD_TO_DEG if angle_unit == "radians" else 1.0
+
+    angle_to_model = AngleUnitProcessorStep(
+        scale=to_model_scale,
+        feature_names=angle_names,
+        exclude_joints=list(angle_exclude),
+        apply_to_observation=True,
+        apply_to_action=True,
+    )
+    # Arm-order correction. openpi/SparkJAX checkpoints are trained left-arm-
+    # first; the lerobot BiOpenArmFollower streams right-arm-first. When
+    # ``config.swap_arm_halves`` is set the two 8-D arm blocks are swapped on
+    # the incoming observation (robot -> model layout) and the outgoing action
+    # (model -> robot layout). Default False = no-op, so a checkpoint recorded
+    # AND trained in lerobot (layout already matches the wire) is untouched.
+    swap_arms = getattr(config, "swap_arm_halves", False)
+    arm_swap_to_model = ArmSwapProcessorStep(
+        enabled=swap_arms, apply_to_observation=True, apply_to_action=True
+    )
+    arm_swap_from_model = ArmSwapProcessorStep(
+        enabled=swap_arms, apply_to_observation=False, apply_to_action=True
+    )
+
+    angle_from_model = AngleUnitProcessorStep(
+        scale=from_model_scale,
+        feature_names=angle_names,
+        exclude_joints=list(angle_exclude),
+        apply_to_observation=False,
+        apply_to_action=True,
+    )
+
+    # OpenPI order: raw → unit→model → relative → normalize → model →
+    # unnormalize → absolute → unit→robot
+    #
+    # The deg→rad step runs BEFORE relative_step (so the cached anchor state and
+    # the relative action deltas are both in radians) and BEFORE the normalizer
+    # (so state/action match the radian-scale norm stats). The rad→deg step runs
+    # AFTER absolute reconstruction so the absolute radian action is converted
+    # to wire degrees as the very last numeric step before device transfer.
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        # Reorder arms to the model's layout BEFORE the angle conversion, the
+        # relative anchor, and normalization, so every downstream slot matches
+        # the training stats. No-op unless swap_arm_halves is set.
+        arm_swap_to_model,
+        angle_to_model,
         relative_step,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
@@ -160,6 +218,11 @@ def make_pi05_pre_post_processors(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
         AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
+        angle_from_model,
+        # Reorder arms back to the robot's wire layout as the final numeric step
+        # (after rad->deg) so the robot receives a wire-correct command. No-op
+        # unless swap_arm_halves is set.
+        arm_swap_from_model,
         DeviceProcessorStep(device="cpu"),
     ]
 

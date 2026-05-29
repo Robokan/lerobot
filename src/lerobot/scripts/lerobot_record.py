@@ -68,12 +68,14 @@ lerobot-record \
 """
 
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.cameras import (  # noqa: F401
@@ -363,6 +365,122 @@ class RecordConfig:
 """
 
 
+def _swap_arms(vec: np.ndarray) -> np.ndarray:
+    """Swap the two 8-D arm blocks of an OpenArm 16-D state/action vector.
+
+    The lerobot BiOpenArmFollower packs the wire vector **right-arm-first**
+    ([right_j1..7, right_grip, left_j1..7, left_grip]) to match its teleoperator,
+    but the openpi checkpoint (SparkJAX-trained) expects **left-arm-first**
+    ([left..., right...]) — confirmed by the mirror-symmetric norm stats. This
+    swaps between the two conventions (it is its own inverse). Works on a 1-D
+    (16,) vector or a 2-D (T, 16) chunk (operates on the last axis).
+    """
+    out = np.asarray(vec).copy()
+    out[..., :8], out[..., 8:] = np.asarray(vec)[..., 8:], np.asarray(vec)[..., :8]
+    return out
+
+
+class OpenPIServerPolicy:
+    """Drive the robot live from an openpi (PyTorch) websocket policy server.
+
+    This bypasses the local lerobot policy entirely: it takes the SAME live
+    observation lerobot built (live camera frames + live joint state), formats
+    it the way the openpi server expects, runs inference over the wire, and
+    returns the next wire-format action for the robot. It is the decisive test
+    for "openpi works on this rig but lerobot doesn't" — if the arms do the task
+    when driven by the server through lerobot's own camera/state/IO path, the
+    bug is isolated to the lerobot policy stack, not the hardware or cameras.
+
+    Units: the OpenArm follower reads/writes JOINT angles in degrees and the
+    gripper in its native unit, but the openpi checkpoint is trained in radians.
+    So we convert joint dims deg->rad on the way in and rad->deg on the way out;
+    grippers pass through untouched.
+
+    Chunking: matches how openpi is meant to run — query the server for a full
+    action chunk (``horizon`` steps), execute it open-loop, then re-query when
+    the queue drains. Set the horizon server-side (the user runs the server with
+    horizon=50).
+    """
+
+    def __init__(self, host: str, port: int, image_key_map: dict[str, str]):
+        import sys as _sys
+        from collections import deque
+
+        _client_src = "/home/evaughan/sparkpack/openpi/packages/openpi-client/src"
+        if _client_src not in _sys.path:
+            _sys.path.insert(0, _client_src)
+        from openpi_client.websocket_client_policy import WebsocketClientPolicy
+
+        self._client = WebsocketClientPolicy(host=host, port=port)
+        self._queue: deque[np.ndarray] = deque()
+        self._image_key_map = image_key_map
+        logging.info(
+            "[openpi-live] connected to %s:%d (image map: %s)",
+            host, port, image_key_map,
+        )
+
+    @staticmethod
+    def _as_hwc_uint8(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr)
+        if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[2] != 3:
+            arr = arr.transpose(1, 2, 0)
+        if arr.dtype != np.uint8:
+            if float(arr.max()) <= 1.0:
+                arr = arr * 255.0
+            arr = arr.clip(0, 255).astype(np.uint8)
+        return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _encode_jpeg_rgb(img_hwc_rgb: np.ndarray) -> bytes:
+        import cv2
+
+        bgr = cv2.cvtColor(img_hwc_rgb, cv2.COLOR_RGB2BGR)
+        ok, jpg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            raise RuntimeError("cv2.imencode failed")
+        return jpg.tobytes()
+
+    def _query_chunk(self, observation_frame: dict, task: str) -> None:
+        # Wire vector is RIGHT-arm-first; the model expects LEFT-arm-first.
+        state_wire = np.asarray(
+            observation_frame["observation.state"], dtype=np.float32
+        ).flatten()
+        state_model = _swap_arms(state_wire)  # -> left-first (model layout)
+        # ALL 16 dims (joints AND gripper) are Damiao motors read in degrees on
+        # the lerobot wire; the openpi checkpoint is trained in radians (the
+        # gripper too — recorded follower position is radians, no 2.58 leader
+        # scale on the recorded values). So convert the whole vector deg->rad.
+        state_rad = np.deg2rad(state_model)
+
+        images = {}
+        for lerobot_cam, server_cam in self._image_key_map.items():
+            img = observation_frame.get(f"observation.images.{lerobot_cam}")
+            if img is None:
+                raise KeyError(f"observation missing camera '{lerobot_cam}'")
+            images[server_cam] = self._encode_jpeg_rgb(self._as_hwc_uint8(img))
+
+        obs = {"state": state_rad, "images": images, "prompt": task or ""}
+        result = self._client.infer(obs)
+        chunk_rad = np.asarray(result["actions"], dtype=np.float32)  # [T, 16] left-first, rad
+
+        chunk_model = np.rad2deg(chunk_rad)  # all dims rad->deg (joints + gripper)
+        chunk_wire = _swap_arms(chunk_model)  # left-first -> right-first (robot layout)
+        self._queue.clear()
+        for row in chunk_wire:
+            self._queue.append(row)
+
+    def predict(self, observation_frame: dict, task: str) -> torch.Tensor:
+        """Return the next wire-format action as a (1, 16) tensor."""
+        if not self._queue:
+            self._query_chunk(observation_frame, task)
+        action = self._queue.popleft()
+        return torch.from_numpy(np.asarray(action, dtype=np.float32)).unsqueeze(0)
+
+    @property
+    def chunk_empty(self) -> bool:
+        return not self._queue
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -468,6 +586,43 @@ def record_loop(
     # intent (something debug_first_actions misses if N < chunk_size).
     debug_inference_remaining = int(debug_log_each_inference) if policy is not None else 0
     debug_inference_idx = 0
+    # Optional: dump the EXACT observation the policy sees (state + camera
+    # images) on the first N fresh inferences, gated by env var so it needs no
+    # CLI plumbing. These .npz files are then replayed offline through BOTH the
+    # openpi server and the lerobot policy (scripts/diag_ab_openpi_vs_lerobot.py
+    # --captured-frame) to prove whether live camera frames are the reason the
+    # arms drift up while openpi works on the same rig.
+    #   LEROBOT_DUMP_OBS_DIR=/path   (enables capture)
+    #   LEROBOT_DUMP_OBS_N=5         (how many fresh-inference frames, default 5)
+    obs_dump_dir = os.environ.get("LEROBOT_DUMP_OBS_DIR") if policy is not None else None
+    obs_dump_remaining = int(os.environ.get("LEROBOT_DUMP_OBS_N", "5")) if obs_dump_dir else 0
+    obs_dump_idx = 0
+    if obs_dump_dir:
+        Path(obs_dump_dir).mkdir(parents=True, exist_ok=True)
+        logging.info("[dump_obs] will save first %d fresh-inference observations to %s",
+                     obs_dump_remaining, obs_dump_dir)
+
+    # Optional: drive the robot live from an openpi websocket policy server
+    # instead of the local lerobot policy. Gated by env var so it needs no CLI
+    # plumbing and is a no-op when unset.
+    #   LEROBOT_OPENPI_SERVER=localhost:8002
+    # Camera name mapping (lerobot stream -> openpi server key) matches the
+    # SparkJAX/openpi training convention.
+    openpi_driver = None
+    _openpi_server = os.environ.get("LEROBOT_OPENPI_SERVER") if policy is not None else None
+    if _openpi_server:
+        _host, _, _port = _openpi_server.partition(":")
+        openpi_driver = OpenPIServerPolicy(
+            host=_host or "localhost",
+            port=int(_port or "8002"),
+            image_key_map={"ego": "cam_high",
+                           "left_wrist": "cam_left_wrist",
+                           "right_wrist": "cam_right_wrist"},
+        )
+        logging.warning(
+            "[openpi-live] DRIVING ROBOT FROM OPENPI SERVER %s (local lerobot "
+            "policy is loaded but its actions are IGNORED).", _openpi_server,
+        )
     debug_joint_order = (
         "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4",
         "left_joint_5", "left_joint_6", "left_joint_7", "left_gripper",
@@ -567,6 +722,13 @@ def record_loop(
                     continue
 
                 is_record_frame = ran_inference
+            elif openpi_driver is not None:
+                t_predict_start = time.perf_counter()
+                action_values = openpi_driver.predict(observation_frame, single_task)
+                t_predict_ms = (time.perf_counter() - t_predict_start) * 1000.0
+                act_processed_openpi = make_robot_action(action_values, dataset.features)
+                robot_action_to_send = robot_action_processor((act_processed_openpi, obs))
+                action_values = robot_action_to_send
             else:
                 t_predict_start = time.perf_counter()
                 action_values = predict_action(
@@ -688,6 +850,36 @@ def record_loop(
             except Exception:
                 logging.exception("[debug_log_each_inference] dump failed")
             debug_inference_remaining -= 1
+
+        # Capture the exact observation fed to the policy on fresh-inference
+        # frames, so it can be replayed offline through openpi + lerobot.
+        if (
+            obs_dump_remaining > 0
+            and policy is not None
+            and t_predict_ms > 100.0
+            and observation_frame is not None
+        ):
+            try:
+                payload: dict[str, np.ndarray] = {}
+                for k, v in observation_frame.items():
+                    arr = v.cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
+                    payload[k] = arr
+                # Also stash the commanded action[0] (degrees, wire format) and
+                # the task string so the offline replay is fully self-contained.
+                act_keys = sorted(robot_action_to_send.keys())
+                payload["_action0_wire"] = np.asarray(
+                    [robot_action_to_send[k] for k in act_keys], dtype=np.float32,
+                )
+                payload["_action0_keys"] = np.array(act_keys)
+                task_str = single_task if isinstance(single_task, str) else ""
+                out_path = Path(obs_dump_dir) / f"frame_{obs_dump_idx:03d}.npz"
+                np.savez_compressed(out_path, task=np.array(task_str), **payload)
+                logging.info("[dump_obs] saved %s (keys=%s)",
+                             out_path.name, list(payload.keys()))
+                obs_dump_idx += 1
+            except Exception:
+                logging.exception("[dump_obs] capture failed")
+            obs_dump_remaining -= 1
 
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,

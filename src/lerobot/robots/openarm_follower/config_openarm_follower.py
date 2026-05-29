@@ -28,7 +28,13 @@ LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_5": (-85.0, 85.0),
     "joint_6": (-40.0, 40.0),
     "joint_7": (-80.0, 80.0),
-    "gripper": (-65.0, 0.0),
+    # Widened from the original conservative (-65, 0) default: the openpi
+    # chocolate checkpoint (and SparkJAX teleop on this same follower) drives
+    # the gripper open to ~-2.89 rad (-165 deg) for a full open, and slightly
+    # past closed (~+8 deg) for a firm grip. (-65, 0) clamped the gripper to
+    # ~40% open so it never opened enough to grasp. Gripper gains are low
+    # (kp=25, kd=0.3) so commanding into a physical stop just holds gently.
+    "gripper": (-170.0, 10.0),
 }
 
 RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
@@ -39,7 +45,13 @@ RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_5": (-85.0, 85.0),
     "joint_6": (-40.0, 40.0),
     "joint_7": (-80.0, 80.0),
-    "gripper": (-65.0, 0.0),
+    # Widened from the original conservative (-65, 0) default: the openpi
+    # chocolate checkpoint (and SparkJAX teleop on this same follower) drives
+    # the gripper open to ~-2.89 rad (-165 deg) for a full open, and slightly
+    # past closed (~+8 deg) for a firm grip. (-65, 0) clamped the gripper to
+    # ~40% open so it never opened enough to grasp. Gripper gains are low
+    # (kp=25, kd=0.3) so commanding into a physical stop just holds gently.
+    "gripper": (-170.0, 10.0),
 }
 
 
