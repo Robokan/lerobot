@@ -32,11 +32,19 @@ Three independent gates, any one fails -> abort the policy session:
      joint limits — the follower's own clamp is the authoritative kinematic
      bound; this is a sanity gate.
   3. **Per-step delta gate.** Rejects steps larger than the configured
-     ``max_joint_delta_deg`` / ``max_gripper_delta_deg``. Defaults match
-     SparkJAX's ``0.5 rad/step`` (≈ 28.6°) for arm joints and ``1.0/step``
-     (≈ 57.3°) for grippers at 50 Hz — already aggressive. The primary
-     protection against chunk-swap discontinuities (e.g. RTC splice landing in
-     the free region) and bad diffusion outputs.
+     ``max_joint_delta_deg`` for arm joints — the primary protection against
+     chunk-swap discontinuities (e.g. an RTC splice whipping a joint) and bad
+     diffusion outputs. **The gripper is exempt by default**
+     (``max_gripper_delta_deg=None``): it is a near-binary, human-teleoperated
+     actuator that legitimately snaps open/closed fast (60–80°/step is normal
+     teleop motion, not a fault), and slamming a gripper open or shut cannot
+     damage the arm. The gripper is still protected by gates 1 and 2, so a
+     garbage / unit-confused gripper value is still rejected. Set
+     ``max_gripper_delta_deg`` to a float to re-enable a gripper delta bound.
+     The same exemption can be extended to **fast distal joints** (e.g. the
+     terminal wrist roll ``joint_7``) via ``fast_joint_name_substrs`` +
+     ``max_fast_joint_delta_deg``: these are low-inertia and cannot whip the
+     arm, so a fast snap at a chunk seam is legitimate. Off by default.
 
 Units: this module works in **degrees** to match the OpenArm follower's
 wire-side interface (``Motor(..., MotorNormMode.DEGREES)`` in
@@ -106,9 +114,23 @@ class ActionSafetyConfig:
     enabled: bool = True
     # Per-step delta thresholds. Any motor whose key contains
     # ``gripper_name_substr`` uses ``max_gripper_delta_deg``; everything else
-    # uses ``max_joint_delta_deg``.
+    # uses ``max_joint_delta_deg``. ``max_gripper_delta_deg=None`` disables the
+    # delta gate for the gripper entirely (the default): the gripper is a fast,
+    # human-teleoperated actuator whose large per-step moves are legitimate, and
+    # it cannot whip the arm, so only gates 1 and 2 apply to it.
     max_joint_delta_deg: float = _SPARKJAX_DEFAULT_MAX_JOINT_DELTA_DEG
-    max_gripper_delta_deg: float = _SPARKJAX_DEFAULT_MAX_GRIP_DELTA_DEG
+    max_gripper_delta_deg: float | None = None
+    # "Fast distal joint" delta gate. A motor whose key matches any substring in
+    # ``fast_joint_name_substrs`` uses ``max_fast_joint_delta_deg`` instead of
+    # ``max_joint_delta_deg`` (and like the gripper, ``None`` disables the
+    # per-step delta gate for it entirely). Motivation: the terminal wrist roll
+    # (``joint_7``) is a fast, low-inertia distal joint that can legitimately
+    # snap quickly at a chunk seam without being able to whip the arm (and the
+    # follower's own ±limit clamp + the absolute-envelope gate still bound it).
+    # Empty ``fast_joint_name_substrs`` (the default) = no fast joints, so
+    # existing callers behave exactly as before; opt in by populating it.
+    max_fast_joint_delta_deg: float | None = None
+    fast_joint_name_substrs: tuple[str, ...] = ()
     # Absolute-envelope thresholds (|value| <= limit).
     abs_joint_limit_deg: float = _DEFAULT_ABS_JOINT_LIMIT_DEG
     abs_gripper_limit_deg: float = _DEFAULT_ABS_GRIPPER_LIMIT_DEG
@@ -152,6 +174,9 @@ class ActionSafetyChecker:
 
     def _is_gripper(self, key: str) -> bool:
         return self.cfg.gripper_name_substr in key
+
+    def _is_fast_joint(self, key: str) -> bool:
+        return any(s in key for s in self.cfg.fast_joint_name_substrs)
 
     def _seed_from_observation(self, action: dict[str, float], obs: dict[str, Any] | None) -> None:
         """Seed ``last_action`` from the observed joint positions for the same keys.
@@ -228,12 +253,18 @@ class ActionSafetyChecker:
             if prev is None:
                 # New key showed up mid-session — just register it without gating.
                 continue
+            if self._is_gripper(k):
+                limit = self.cfg.max_gripper_delta_deg
+            elif self._is_fast_joint(k):
+                limit = self.cfg.max_fast_joint_delta_deg
+            else:
+                limit = self.cfg.max_joint_delta_deg
+            # ``None`` -> delta gate disabled for this motor class (grippers by
+            # default, and any configured fast distal joint): a fast snap is
+            # legitimate, not a fault.
+            if limit is None:
+                continue
             delta = abs(float(v) - float(prev))
-            limit = (
-                self.cfg.max_gripper_delta_deg
-                if self._is_gripper(k)
-                else self.cfg.max_joint_delta_deg
-            )
             if delta > limit:
                 return self._abort(
                     f"SAFETY STOP: {k} jumped {delta:.3f} deg/step "

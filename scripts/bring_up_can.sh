@@ -68,6 +68,13 @@ for i in can0 can1 can2 can3; do
 
   ip link set "$i" down 2>/dev/null || true
   ip link set "$i" type can bitrate "$BITRATE"
+  # Enlarge the kernel TX queue. The SocketCAN default (10) is fine for the
+  # single-threaded synchronous control loop, but the async/RTC path drives the
+  # bus from two threads (actor writes + observation reads), so 8-frame batch
+  # writes can collide with read bursts and overflow the queue -> "No buffer
+  # space available" (ENOBUFS), which drops a motor and makes the arm go wild.
+  # 1000 frames drain in well under a ms at 1 Mbps, so this just absorbs bursts.
+  ip link set "$i" txqueuelen 1000
   ip link set "$i" up
 
   state=$(ip -details link show "$i" | awk '/can state/{print $3; exit}')

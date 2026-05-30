@@ -365,6 +365,17 @@ class RecordConfig:
 """
 
 
+def _openpi_server_addr() -> str | None:
+    """Return the ``host:port`` of the openpi websocket server if the operator
+    asked to drive the robot from it (``LEROBOT_OPENPI_SERVER``), else None.
+
+    When set, the local lerobot policy is never used, so ``record()`` skips
+    loading it entirely (fast startup) and ``record_loop()`` routes every action
+    through the server instead.
+    """
+    return os.environ.get("LEROBOT_OPENPI_SERVER") or None
+
+
 def _swap_arms(vec: np.ndarray) -> np.ndarray:
     """Swap the two 8-D arm blocks of an OpenArm 16-D state/action vector.
 
@@ -539,6 +550,29 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
+    # Optional: drive the robot live from an openpi websocket policy server
+    # instead of the local lerobot policy (LEROBOT_OPENPI_SERVER=host:port).
+    # Built up-front so the reset / action-safety gates below treat it like a
+    # policy. When this is active the local lerobot policy is never loaded (see
+    # record()), so ``policy`` is None and the server supplies every action.
+    # Camera name mapping (lerobot stream -> openpi server key) matches the
+    # SparkJAX/openpi training convention.
+    openpi_driver = None
+    _openpi_server = _openpi_server_addr()
+    if _openpi_server:
+        _host, _, _port = _openpi_server.partition(":")
+        openpi_driver = OpenPIServerPolicy(
+            host=_host or "localhost",
+            port=int(_port or "8002"),
+            image_key_map={"ego": "cam_high",
+                           "left_wrist": "cam_left_wrist",
+                           "right_wrist": "cam_right_wrist"},
+        )
+        logging.warning(
+            "[openpi-live] DRIVING ROBOT FROM OPENPI SERVER %s "
+            "(local lerobot policy NOT loaded).", _openpi_server,
+        )
+
     # Reset policy and processor if they are provided
     if policy is not None and preprocessor is not None and postprocessor is not None:
         policy.reset()
@@ -551,8 +585,9 @@ def record_loop(
 
     # Re-arm the action-safety guard so the per-step delta baseline is seeded
     # from the current robot state at the start of each episode rather than
-    # from a stale last-action from a prior episode.
-    if action_safety is not None and policy is not None:
+    # from a stale last-action from a prior episode. The openpi server driver is
+    # policy-equivalent here, so it gets the same safety arming.
+    if action_safety is not None and (policy is not None or openpi_driver is not None):
         action_safety.reset()
 
     # Calculate control interval based on interpolation
@@ -602,27 +637,6 @@ def record_loop(
         logging.info("[dump_obs] will save first %d fresh-inference observations to %s",
                      obs_dump_remaining, obs_dump_dir)
 
-    # Optional: drive the robot live from an openpi websocket policy server
-    # instead of the local lerobot policy. Gated by env var so it needs no CLI
-    # plumbing and is a no-op when unset.
-    #   LEROBOT_OPENPI_SERVER=localhost:8002
-    # Camera name mapping (lerobot stream -> openpi server key) matches the
-    # SparkJAX/openpi training convention.
-    openpi_driver = None
-    _openpi_server = os.environ.get("LEROBOT_OPENPI_SERVER") if policy is not None else None
-    if _openpi_server:
-        _host, _, _port = _openpi_server.partition(":")
-        openpi_driver = OpenPIServerPolicy(
-            host=_host or "localhost",
-            port=int(_port or "8002"),
-            image_key_map={"ego": "cam_high",
-                           "left_wrist": "cam_left_wrist",
-                           "right_wrist": "cam_right_wrist"},
-        )
-        logging.warning(
-            "[openpi-live] DRIVING ROBOT FROM OPENPI SERVER %s (local lerobot "
-            "policy is loaded but its actions are IGNORED).", _openpi_server,
-        )
     debug_joint_order = (
         "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4",
         "left_joint_5", "left_joint_6", "left_joint_7", "left_gripper",
@@ -679,7 +693,7 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
+        if policy is not None or dataset is not None or openpi_driver is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         # Track whether this iteration should be recorded to the dataset.
@@ -687,9 +701,18 @@ def record_loop(
         # keeping the dataset at the original fps while the robot moves at the higher rate.
         is_record_frame = True
 
-        # Get action from either policy or teleop
+        # Get action from either the openpi server, the local policy, or teleop.
         t_predict_ms = 0.0
-        if policy is not None and preprocessor is not None and postprocessor is not None:
+        if openpi_driver is not None:
+            # Server-driven: the local lerobot policy is not loaded at all; the
+            # openpi server returns the action chunk for the live observation.
+            t_predict_start = time.perf_counter()
+            action_values = openpi_driver.predict(observation_frame, single_task)
+            t_predict_ms = (time.perf_counter() - t_predict_start) * 1000.0
+            act_processed_openpi = make_robot_action(action_values, dataset.features)
+            robot_action_to_send = robot_action_processor((act_processed_openpi, obs))
+            action_values = robot_action_to_send
+        elif policy is not None and preprocessor is not None and postprocessor is not None:
             # With interpolation: only call policy when interpolator needs new action
             if use_interpolation:
                 ran_inference = False
@@ -722,13 +745,6 @@ def record_loop(
                     continue
 
                 is_record_frame = ran_inference
-            elif openpi_driver is not None:
-                t_predict_start = time.perf_counter()
-                action_values = openpi_driver.predict(observation_frame, single_task)
-                t_predict_ms = (time.perf_counter() - t_predict_start) * 1000.0
-                act_processed_openpi = make_robot_action(action_values, dataset.features)
-                robot_action_to_send = robot_action_processor((act_processed_openpi, obs))
-                action_values = robot_action_to_send
             else:
                 t_predict_start = time.perf_counter()
                 action_values = predict_action(
@@ -781,7 +797,7 @@ def record_loop(
         # absolute envelope, per-step delta. On violation: send the last good
         # action as an explicit hold frame, then raise — the outer try/finally
         # disconnects the robot and (by default) disables torque.
-        if action_safety is not None and policy is not None:
+        if action_safety is not None and (policy is not None or openpi_driver is not None):
             safety_err = action_safety.check(robot_action_to_send, obs)
             if safety_err is not None:
                 logging.error("[POLICY-ABORT] %s", safety_err)
@@ -1055,12 +1071,25 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_threads=cfg.dataset.encoder_threads,
             )
 
-        # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        # Load pretrained policy. When driving from an openpi websocket server
+        # (LEROBOT_OPENPI_SERVER set), the local lerobot policy is never used —
+        # the server supplies every action — so skip the expensive make_policy
+        # weight load and processor build entirely. This is the difference
+        # between a ~minute, multi-GB startup and a near-instant one.
+        use_openpi_server = _openpi_server_addr() is not None
+        if cfg.policy is None or use_openpi_server:
+            policy = None
+            if use_openpi_server:
+                logging.warning(
+                    "[openpi-live] LEROBOT_OPENPI_SERVER set -> skipping local "
+                    "policy load for fast startup (robot driven by the server)."
+                )
+        else:
+            policy = make_policy(cfg.policy, ds_meta=dataset.meta)
         preprocessor = None
         postprocessor = None
         interpolator = None
-        if cfg.policy is not None:
+        if cfg.policy is not None and not use_openpi_server:
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
@@ -1132,7 +1161,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # Construct once (outside the per-episode loop) so an abort stays sticky
         # across the rest of the session.
         action_safety: ActionSafetyChecker | None = None
-        if policy is not None and cfg.action_safety_enabled:
+        if (policy is not None or use_openpi_server) and cfg.action_safety_enabled:
             action_safety = ActionSafetyChecker(
                 ActionSafetyConfig(
                     enabled=True,
@@ -1151,7 +1180,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 cfg.action_safety_abs_gripper_limit_deg,
             )
 
-        if cfg.lift_arms_before_policy and policy is not None:
+        # The lift sequence runs before either the local policy OR the openpi
+        # server takes over. In server mode `policy` is None (weights skipped),
+        # so include use_openpi_server here or the arms never raise.
+        if cfg.lift_arms_before_policy and (policy is not None or use_openpi_server):
             from lerobot.robots.bi_openarm_follower import (
                 BiOpenArmFollower,
                 lift_arms_to_ready,

@@ -97,6 +97,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -111,6 +112,8 @@ from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_fe
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc import ActionInterpolator, ActionQueue, LatencyTracker, RTCConfig
 from lerobot.processor import (
+    AngleUnitProcessorStep,
+    ArmSwapProcessorStep,
     NormalizerProcessorStep,
     RelativeActionsProcessorStep,
     TransitionKey,
@@ -131,6 +134,8 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1,
 )
+from lerobot.robots.bi_openarm_follower import BiOpenArmFollower, lift_arms_to_ready
+from lerobot.robots.bi_openarm_follower.action_safety import ActionSafetyChecker, ActionSafetyConfig
 from lerobot.robots.utils import make_robot_from_config
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.hub import HubMixin
@@ -138,6 +143,11 @@ from lerobot.utils.utils import init_logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# SparkJAX-equivalent default thresholds (expressed in degrees, since the
+# OpenArm follower's wire format is degrees). Used as the dataclass field
+# defaults below so the CLI exposes them without duplicating the numbers.
+_DEFAULT_SAFETY = ActionSafetyConfig()
 
 
 class RobotWrapper:
@@ -175,6 +185,7 @@ class RTCDemoConfig(HubMixin):
     # RTC configuration
     rtc: RTCConfig = field(
         default_factory=lambda: RTCConfig(
+            enabled=True,
             execution_horizon=10,
             max_guidance_weight=1.0,
             prefix_attention_schedule=RTCAttentionSchedule.EXP,
@@ -195,6 +206,35 @@ class RTCDemoConfig(HubMixin):
 
     # Task to execute
     task: str = field(default="", metadata={"help": "Task to execute"})
+
+    # Smoothly raise both arms to the training-distribution start pose before
+    # handing control to the policy (BiOpenArmFollower only). Our openpi/SparkJAX
+    # checkpoint was fine-tuned from an "arms up, table cleared" start pose, so
+    # the policy expects to begin there. On by default; it only acts on a
+    # BiOpenArmFollower (other robots log a skip), and you can disable it with
+    # --lift_arms=false if the arms are already positioned.
+    lift_arms: bool = field(
+        default=True,
+        metadata={"help": "Lift BiOpenArm followers to the training-distribution ready pose before policy hand-off"},
+    )
+
+    # ---- Action safety (BiOpenArmFollower only) -----------------------------
+    # Hard-abort 3-gate checker (finite-value / absolute-envelope / per-step
+    # delta) run on every action just before it reaches the motors. On a
+    # violation the actor holds the last good pose and shuts the session down.
+    # Critical for RTC: a bad chunk splice landing in the free region shows up
+    # as a per-step delta spike, which gate 3 catches before the hardware does.
+    # The thresholds are OpenArm/degree-specific, so the checker is only armed
+    # for a BiOpenArmFollower (other robots log a skip).
+    action_safety_enabled: bool = True
+    action_safety_max_joint_delta_deg: float = _DEFAULT_SAFETY.max_joint_delta_deg
+    # None (default) disables the per-step delta gate for the gripper: it is a
+    # fast, human-teleoperated, near-binary actuator whose large per-step moves
+    # are legitimate (60-80 deg/step open/close is normal) and cannot whip the
+    # arm. The gripper is still bounded by the finite + absolute-envelope gates.
+    action_safety_max_gripper_delta_deg: float | None = _DEFAULT_SAFETY.max_gripper_delta_deg
+    action_safety_abs_joint_limit_deg: float = _DEFAULT_SAFETY.abs_joint_limit_deg
+    action_safety_abs_gripper_limit_deg: float = _DEFAULT_SAFETY.abs_gripper_limit_deg
 
     # Torch compile configuration
     use_torch_compile: bool = field(
@@ -250,6 +290,7 @@ def _reanchor_relative_rtc_prefix(
     relative_step: RelativeActionsProcessorStep,
     normalizer_step: NormalizerProcessorStep | None,
     policy_device: torch.device | str,
+    to_model_space_steps: tuple[Any, ...] = (),
 ) -> Tensor:
     """Convert absolute leftovers into model-space for relative-action RTC policies.
 
@@ -257,12 +298,34 @@ def _reanchor_relative_rtc_prefix(
     the previous chunk) is stored in absolute space. Before feeding it back to
     the policy we need to re-express it relative to the *current* robot state
     and then re-normalize.
+
+    The leftover prefix and the anchor state arrive in the **robot wire space**
+    (the arm order and angular unit the hardware speaks). For a checkpoint
+    converted from openpi/SparkJAX the model's action space differs from the
+    wire space (the two arm halves are swapped, and joints are in radians, not
+    degrees). ``to_model_space_steps`` are the stamped preprocessor steps that
+    run *before* the relative step (``ArmSwapProcessorStep``,
+    ``AngleUnitProcessorStep``); re-applying them here lands the prefix in the
+    exact same model action space the freshly predicted chunk lives in *before*
+    we re-express it relative + normalize. These steps are no-ops for a native
+    lerobot checkpoint (arm-swap disabled, angle scale == 1.0), so the original
+    behaviour is unchanged for every other policy.
     """
     state = current_state.detach().cpu()
     if state.dim() == 1:
         state = state.unsqueeze(0)
 
     action_cpu = prev_actions_absolute.detach().cpu()
+
+    # Map wire-space leftover + anchor into the model's action space (arm order
+    # + angular unit) using the SAME stamped steps the preprocessor applies.
+    if to_model_space_steps:
+        transition = create_transition(observation={OBS_STATE: state}, action=action_cpu)
+        for step in to_model_space_steps:
+            transition = step(transition)
+        state = transition[TransitionKey.OBSERVATION][OBS_STATE]
+        action_cpu = transition[TransitionKey.ACTION]
+
     mask = relative_step._build_mask(action_cpu.shape[-1])
     relative_actions = to_relative_actions(action_cpu, state, mask)
 
@@ -332,6 +395,19 @@ def get_actions(
             (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
             None,
         )
+        # Stamped steps that map the robot wire space -> model space (arm order
+        # + angular unit), in the order the preprocessor applies them *before*
+        # the relative step. Used to re-anchor the RTC prefix for openpi-
+        # converted checkpoints; empty/no-op for native lerobot checkpoints.
+        relative_idx = next(
+            (i for i, s in enumerate(preprocessor.steps) if s is relative_step),
+            len(preprocessor.steps),
+        )
+        to_model_space_steps = tuple(
+            s
+            for s in preprocessor.steps[:relative_idx]
+            if isinstance(s, (ArmSwapProcessorStep, AngleUnitProcessorStep))
+        )
         if relative_step is not None:
             if relative_step.action_names is None:
                 cfg_names = getattr(cfg.policy, "action_feature_names", None)
@@ -342,6 +418,38 @@ def get_actions(
                         k for k in robot.robot.action_features if k.endswith(".pos")
                     ]
             logger.info("[GET_ACTIONS] Relative actions enabled: will re-anchor RTC prefix")
+
+        def _prepare_obs(raw_obs):
+            """Robot observation -> policy-ready feature dict (batched, on device)."""
+            obs_processed = robot_observation_processor(raw_obs)
+            feat = build_dataset_frame(dataset_features, obs_processed, prefix="observation")
+            for name in feat:
+                feat[name] = torch.from_numpy(feat[name])
+                if "image" in name:
+                    feat[name] = feat[name].type(torch.float32) / 255
+                    feat[name] = feat[name].permute(2, 0, 1).contiguous()
+                feat[name] = feat[name].unsqueeze(0).to(policy_device)
+            feat["task"] = [cfg.task]  # Task should be a list, not a string!
+            feat["robot_type"] = robot.robot.name if hasattr(robot.robot, "name") else ""
+            return feat
+
+        # Warm up the policy before any chunk is used. The first inference pays a
+        # large cold-start cost (CUDA init / kernel compile, ~1 s here). If that
+        # latency enters the tracker it permanently inflates the inference_delay
+        # estimate (LatencyTracker.max() is an all-time max), so RTC builds every
+        # subsequent chunk for a ~49-step delay while merge only discards the real
+        # ~21 - the mismatch is exactly the violent chunk-seam jump we observed.
+        # Running (and discarding) one inference here keeps the cold cost out of
+        # the estimate so inference_delay reflects steady-state from the start.
+        try:
+            _ = policy.predict_action_chunk(
+                preprocessor(_prepare_obs(robot.get_observation())),
+                inference_delay=0,
+                prev_chunk_left_over=None,
+            )
+            logger.info("[GET_ACTIONS] Warmup inference complete (cold-start cost excluded from latency)")
+        except Exception as warmup_exc:  # noqa: BLE001 - warmup is best-effort
+            logger.warning("[GET_ACTIONS] Warmup inference failed (continuing): %s", warmup_exc)
 
         get_actions_threshold = cfg.action_queue_size_to_get_new_actions
 
@@ -354,34 +462,14 @@ def get_actions(
                 action_index_before_inference = action_queue.get_action_index()
                 prev_actions = action_queue.get_left_over()
 
-                inference_latency = latency_tracker.max()
+                # Use a windowed percentile, NOT latency_tracker.max(): max() is a
+                # monotonic all-time max, so a single cold/slow inference would pin
+                # inference_delay high for the whole run and desync RTC's frozen
+                # prefix from merge's actual discard (-> chunk-seam jumps).
+                inference_latency = latency_tracker.percentile(0.95)
                 inference_delay = math.ceil(inference_latency / time_per_chunk)
 
-                obs = robot.get_observation()
-
-                # Apply robot observation processor
-                obs_processed = robot_observation_processor(obs)
-
-                obs_with_policy_features = build_dataset_frame(
-                    dataset_features, obs_processed, prefix="observation"
-                )
-
-                for name in obs_with_policy_features:
-                    obs_with_policy_features[name] = torch.from_numpy(obs_with_policy_features[name])
-                    if "image" in name:
-                        obs_with_policy_features[name] = (
-                            obs_with_policy_features[name].type(torch.float32) / 255
-                        )
-                        obs_with_policy_features[name] = (
-                            obs_with_policy_features[name].permute(2, 0, 1).contiguous()
-                        )
-                    obs_with_policy_features[name] = obs_with_policy_features[name].unsqueeze(0)
-                    obs_with_policy_features[name] = obs_with_policy_features[name].to(policy_device)
-
-                obs_with_policy_features["task"] = [cfg.task]  # Task should be a list, not a string!
-                obs_with_policy_features["robot_type"] = (
-                    robot.robot.name if hasattr(robot.robot, "name") else ""
-                )
+                obs_with_policy_features = _prepare_obs(robot.get_observation())
 
                 preproceseded_obs = preprocessor(obs_with_policy_features)
 
@@ -405,6 +493,7 @@ def get_actions(
                             relative_step=relative_step,
                             normalizer_step=normalizer_step,
                             policy_device=policy_device,
+                            to_model_space_steps=to_model_space_steps,
                         )
 
                 # Generate actions WITH RTC
@@ -424,6 +513,32 @@ def get_actions(
                 new_latency = time.perf_counter() - current_time
                 new_delay = math.ceil(new_latency / time_per_chunk)
                 latency_tracker.add(new_latency)
+
+                # --- jerk diagnostics (degrees, robot wire space) ----------------
+                # Separates the two possible jerk sources so we stop guessing:
+                #   within_chunk = max |a[t+1]-a[t]| inside ONE freshly predicted
+                #                  chunk  -> model roughness / training wobble.
+                #   seam_gap     = |new_chunk[delay] - action robot is executing|
+                #                  -> RTC/replace discontinuity at the splice.
+                try:
+                    pa = postprocessed_actions
+                    diag = []
+                    if pa.ndim == 2 and pa.shape[0] > 1:
+                        step = (pa[1:] - pa[:-1]).abs()
+                        per_dim = step.reshape(-1, step.shape[-1]).max(dim=0).values
+                        wd = int(per_dim.argmax().item())
+                        diag.append(f"within_chunk_max|d|={per_dim[wd].item():.1f}deg@dim{wd}")
+                    cur_exec = action_queue.get_processed_left_over()
+                    if cur_exec is not None and cur_exec.numel() > 0 and pa.ndim == 2:
+                        d = min(int(new_delay), pa.shape[0] - 1)
+                        seam = (pa[d] - cur_exec[0]).abs()
+                        sd = int(seam.argmax().item())
+                        diag.append(f"seam_gap@d{d}={seam[sd].item():.1f}deg@dim{sd}")
+                    if diag:
+                        logger.info("[GET_ACTIONS][diag] latency=%.0fms delay=%d | %s",
+                                    new_latency * 1000, new_delay, " | ".join(diag))
+                except Exception:  # noqa: BLE001 - diagnostics must never break control
+                    pass
 
                 if cfg.action_queue_size_to_get_new_actions < cfg.rtc.execution_horizon + new_delay:
                     logger.warning(
@@ -464,6 +579,41 @@ def actor_control(
 
         action_keys = [k for k in robot.action_features() if k.endswith(".pos")]
 
+        # Arm the 3-gate action safety checker. The thresholds are OpenArm/
+        # degree-specific, so it only runs for a BiOpenArmFollower. We seed its
+        # delta baseline from one real observation (post-lift) so step 0 is gated
+        # too; that observation is ignored by the checker after the first call.
+        safety_checker = None
+        seed_obs = None
+        if cfg.action_safety_enabled:
+            if isinstance(robot.robot, BiOpenArmFollower):
+                safety_checker = ActionSafetyChecker(
+                    ActionSafetyConfig(
+                        enabled=True,
+                        max_joint_delta_deg=cfg.action_safety_max_joint_delta_deg,
+                        max_gripper_delta_deg=cfg.action_safety_max_gripper_delta_deg,
+                        abs_joint_limit_deg=cfg.action_safety_abs_joint_limit_deg,
+                        abs_gripper_limit_deg=cfg.action_safety_abs_gripper_limit_deg,
+                    )
+                )
+                try:
+                    seed_obs = robot.get_observation()
+                except Exception as exc:  # noqa: BLE001 - seeding is best-effort
+                    logger.warning("[ACTOR] could not seed safety checker from observation: %s", exc)
+                gripper_delta = cfg.action_safety_max_gripper_delta_deg
+                logger.info(
+                    "[ACTOR] action safety armed (3-gate; joint delta %.2f deg/step, gripper delta %s)",
+                    cfg.action_safety_max_joint_delta_deg,
+                    "disabled" if gripper_delta is None
+                    else f"{gripper_delta:.2f} deg/step",
+                )
+            else:
+                logger.warning(
+                    "[ACTOR] action_safety_enabled but robot is %s (not BiOpenArmFollower); "
+                    "skipping (thresholds are OpenArm/degree-specific)",
+                    type(robot.robot).__name__,
+                )
+
         action_count = 0
         interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
         action_interval = interpolator.get_control_interval(cfg.fps)
@@ -474,6 +624,23 @@ def actor_control(
             if interpolator.needs_new_action():
                 new_action = action_queue.get()
                 if new_action is not None:
+                    # Gate the RAW policy action at the base (policy) fps so the
+                    # per-step delta thresholds keep their 50 Hz meaning no matter
+                    # what interpolation_multiplier is. Interpolated sub-steps are
+                    # convex combinations of two consecutive gated actions, so they
+                    # stay inside the same envelope / delta bounds by construction.
+                    if safety_checker is not None:
+                        raw = new_action.cpu()
+                        raw_dict = {key: raw[i].item() for i, key in enumerate(action_keys)}
+                        err = safety_checker.check(raw_dict, seed_obs)
+                        if err is not None:
+                            logger.error("[ACTOR] %s", err)
+                            # Hold the last good pose, then shut the whole session
+                            # down so the main thread disconnects (disables torque).
+                            if safety_checker.last_action is not None:
+                                robot.send_action(robot_action_processor((safety_checker.last_action, None)))
+                            shutdown_event.set()
+                            break
                     interpolator.add(new_action.cpu())
 
             action = interpolator.get()
@@ -605,6 +772,20 @@ def demo_cli(cfg: RTCDemoConfig):
     logger.info(f"Initializing robot: {cfg.robot.type}")
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
+
+    # Optionally raise the arms to the training-distribution start pose before the
+    # policy takes over (see RTCDemoConfig.lift_arms). Done before the control
+    # threads start so the policy's first observation is already at the ready pose.
+    if cfg.lift_arms:
+        if isinstance(robot, BiOpenArmFollower):
+            logger.info("Lifting arms to the training-distribution ready pose before policy hand-off")
+            lift_arms_to_ready(robot, log_fn=logger.info)
+        else:
+            logger.warning(
+                "lift_arms=True but robot is %s (not BiOpenArmFollower); skipping lift",
+                type(robot).__name__,
+            )
+
     robot_wrapper = RobotWrapper(robot)
 
     # Create robot observation processor
