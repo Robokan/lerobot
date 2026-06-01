@@ -256,7 +256,9 @@ def build_runner(policy, args):
         inference delay ``d``, no client seam blend (the seam is removed inside
         the model by the prefix guidance), full 50-step chunk. Sends
         ``_rtc_prev_chunk`` + ``_rtc_inference_delay`` + ``_rtc_execution_horizon``
-        + ``_rtc_schedule`` to the server every inference.
+        + ``_rtc_schedule`` + ``_rtc_ref_state`` to the server every inference.
+        ``_rtc_ref_state`` lets the server re-anchor the delta prefix to the
+        current state (lerobot ``_reanchor_relative_rtc_prefix`` parity).
       * ``sync`` — play the whole 50-step chunk, then block on a fresh
         inference; 5-step client seam blend. Debug/A-B baseline.
     """
@@ -289,6 +291,14 @@ def build_runner(policy, args):
             # window so a spike degrades to a bounded, continuous splice
             # instead of whipping a proximal joint past the safety gate.
             max_splice_d_steps=args.rtc_execution_horizon,
+            # Relative-action re-anchoring: the checkpoint outputs per-step
+            # deltas (OpenArm v4 delta_action_mask), so the cached prefix is
+            # anchored to the state at the inference that produced it. Tell
+            # the runner the obs state key so it forwards that anchor state
+            # (_rtc_ref_state); the server then re-expresses the prefix
+            # relative to the current state before guidance — the missing
+            # piece vs lerobot's _reanchor_relative_rtc_prefix.
+            ref_state_key="state",
         )
     else:  # sync
         cfg = RTCConfig(
@@ -442,14 +452,16 @@ def main() -> None:
                 d_seed,
                 args.rtc_execution_horizon,
             )
-        # Parity note: lerobot's run used max_guidance_weight=5.0, but the FlashRT
-        # server hardcodes _rtc_max_gw=10.0 (pipeline_rtx.py) and the adapter only
-        # forwards execution_horizon + schedule — the client cannot set it. 10.0
-        # guides *more* strongly (stickier to the prev chunk), so it errs toward
-        # smoother, not crazier. For exact parity patch the server pipeline to 5.0.
-        logger.warning(
-            "max_guidance_weight is fixed server-side at 10.0; lerobot's run used 5.0. "
-            "Patch FlashRT pipeline_rtx.py _rtc_max_gw=5.0 if you need exact parity."
+        # Parity note: lerobot's trusted run used max_guidance_weight=5.0.
+        # The FlashRT server now defaults _rtc_max_gw to 5.0 (pipeline_rtx.py),
+        # overridable via the FLASHRT_RTC_MAX_GW env on the server. The client
+        # cannot set it per-call (the adapter only forwards execution_horizon +
+        # schedule). A too-high ceiling over-pulls the chunk toward the prefix
+        # in late denoising steps -> overshoot/oscillation; 5.0 matches the
+        # config that was tuned on the robot.
+        logger.info(
+            "max_guidance_weight is server-side (pipeline default 5.0 = lerobot "
+            "parity). Set FLASHRT_RTC_MAX_GW on the server to change it."
         )
     else:
         logger.info(

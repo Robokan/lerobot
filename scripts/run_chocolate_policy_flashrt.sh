@@ -16,12 +16,16 @@
 #   rtc  (default) — server-side RTC soft-guidance. This is the port of
 #                    lerobot's RTCProcessor (examples/rtc/eval_with_real_robot.py).
 #                    Params below mirror scripts/run_chocolate_policy_rtc.sh, the
-#                    lerobot RTC run that worked: execution_horizon=20,
-#                    schedule=LINEAR, full 50-step chunk, continuous replan.
-#                    That run only jerked because lerobot's in-process inference
-#                    pushed the delay d past execution_horizon; FlashRT's ~246 ms
-#                    keeps d (~13) inside the merge window -> smooth seam.
-#   sync           — full 50-step synchronous replan + 5-step seam blend. Debug/A-B.
+#                    lerobot RTC run: execution_horizon=20, schedule=LINEAR, full
+#                    50-step chunk, continuous replan. Latency is now solved
+#                    (FlashRT ~200 ms, no graph-capture spikes), so d (~10-13)
+#                    stays inside the merge window. The server's guidance-weight
+#                    ceiling is 5.0 (FLASHRT_RTC_MAX_GW), matching lerobot.
+#   sync           — full 50-step synchronous replan + 5-step seam blend, NO RTC
+#                    guidance and NO continuous replan. Use as the A/B isolation:
+#                    if sync is smooth (just slower) the jerk is the RTC layer;
+#                    if sync is also jerky it's the model chunks / obs conversion.
+#                    Run with:  MODE=sync bash scripts/run_chocolate_policy_flashrt.sh
 #
 # Prereqs (each in its own shell):
 #   1. CAN buses up:        sudo bash scripts/bring_up_can.sh
@@ -107,6 +111,7 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/run_chocolate_policy_flashrt_${RUN_TS}.log"
 exec > >(trap '' INT TERM; exec tee -a "${LOG_FILE}") 2>&1
 echo "[run_chocolate_policy_flashrt] mirroring stdout+stderr to: ${LOG_FILE}"
+echo "[run_chocolate_policy_flashrt] MODE=${MODE} (rtc=soft-guidance replan | sync=full-chunk A/B baseline)  exec_horizon=${RTC_EXECUTION_HORIZON} schedule=${RTC_SCHEDULE} fps=${TARGET_HZ}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
