@@ -452,6 +452,29 @@ def main() -> None:
                 d_seed,
                 args.rtc_execution_horizon,
             )
+        # The runner serves the new chunk from index d until the next chunk is
+        # ready, which (continuous replan at the inference rate) is ~d steps
+        # later -> it executes roughly indices [d, 2d]. Guidance covers
+        # [0, execution_horizon]. If 2d > execution_horizon, the tail of the
+        # served window is UNGUIDED -> that is where fast-motion chunk
+        # divergence shows up as jerk. Print the coverage so a horizon sweep is
+        # interpretable at a glance.
+        served_end = 2 * d_seed
+        guided_margin = args.rtc_execution_horizon - d_seed
+        if served_end <= args.rtc_execution_horizon:
+            logger.info(
+                "RTC coverage: served window ~[%d, %d] fully inside guided [0, %d] "
+                "(margin past seam = %d steps). Whole executed region is guided.",
+                d_seed, served_end, args.rtc_execution_horizon, guided_margin,
+            )
+        else:
+            logger.warning(
+                "RTC coverage: served window ~[%d, %d] exceeds guided [0, %d]; "
+                "~%d of the ~%d executed steps are UNGUIDED (fast-motion divergence "
+                "lands here). Raise --rtc-execution-horizon toward %d to cover it.",
+                d_seed, served_end, args.rtc_execution_horizon,
+                served_end - args.rtc_execution_horizon, d_seed, served_end,
+            )
         # Parity note: lerobot's trusted run used max_guidance_weight=5.0.
         # The FlashRT server now defaults _rtc_max_gw to 5.0 (pipeline_rtx.py),
         # overridable via the FLASHRT_RTC_MAX_GW env on the server. The client
