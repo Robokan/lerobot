@@ -115,6 +115,11 @@ robstride = ["lerobot[can-dep]"]
 
 # Robots
 openarms = ["lerobot[damiao]"]
+# OpenArm MuJoCo simulation: VR motion-capture teleop + dataset recording of a
+# simulated bimanual OpenArm. Phase 1 (headless drivers) only needs `mujoco`;
+# the Phase 2 VR path additionally needs pyopenxr/glfw/PyOpenGL (install those
+# manually on the headset machine — they are not pulled in here).
+openarm-sim = ["lerobot[openarms]", "mujoco>=3.2.0,<4.0.0"]
 gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0,<0.15.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
 lekiwi = ["lerobot[feetech]", "pyzmq>=26.2.1,<28.0.0"]
