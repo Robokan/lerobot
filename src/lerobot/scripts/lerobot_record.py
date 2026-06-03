@@ -79,6 +79,7 @@ import torch
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
+from lerobot.cameras.mujoco.configuration_mujoco import MujocoCameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera.configuration_reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
@@ -112,6 +113,7 @@ from lerobot.robots import (  # noqa: F401
     hope_jr,
     koch_follower,
     make_robot_from_config,
+    mujoco_bi_openarm,
     omx_follower,
     openarm_follower,
     reachy2,
@@ -132,6 +134,7 @@ from lerobot.teleoperators import (  # noqa: F401
     reachy2_teleoperator,
     so_leader,
     unitree_g1,
+    vr_mocap,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR

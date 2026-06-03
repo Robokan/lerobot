@@ -99,6 +99,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .openarm_mini import OpenArmMini
 
         return OpenArmMini(config)
+    elif config.type == "vr_mocap":
+        from .vr_mocap import VRMocap
+
+        return VRMocap(config)
     else:
         try:
             return cast("Teleoperator", make_device_from_device_class(config))

@@ -68,6 +68,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .bi_openarm_follower import BiOpenArmFollower
 
         return BiOpenArmFollower(config)
+    elif config.type == "mujoco_bi_openarm":
+        from .mujoco_bi_openarm import MujocoBiOpenArm
+
+        return MujocoBiOpenArm(config)
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 
