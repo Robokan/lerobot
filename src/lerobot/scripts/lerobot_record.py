@@ -95,6 +95,7 @@ from dataclasses import asdict, dataclass
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
+from lerobot.cameras.mujoco import MujocoCameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -125,6 +126,7 @@ from lerobot.robots import (  # noqa: F401
     hope_jr,
     koch_follower,
     make_robot_from_config,
+    mujoco_bi_openarm,
     omx_follower,
     openarm_follower,
     reachy2,
@@ -149,6 +151,7 @@ from lerobot.teleoperators import (  # noqa: F401
     rebot_102_leader,
     so_leader,
     unitree_g1,
+    vr_mocap,
 )
 from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR

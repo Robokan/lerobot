@@ -47,6 +47,14 @@ def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[s
 
             cameras[key] = ZMQCamera(cfg)
 
+        elif cfg.type == "mujoco":
+            # Standalone MuJoCo camera (loads its own static model from
+            # cfg.model_path). When used inside MujocoBiOpenArm the robot builds
+            # MujocoCamera directly so it can share the live sim model/data.
+            from .mujoco.mujoco_camera import MujocoCamera
+
+            cameras[key] = MujocoCamera(cfg)
+
         else:
             try:
                 cameras[key] = cast(Camera, make_device_from_device_class(cfg))
