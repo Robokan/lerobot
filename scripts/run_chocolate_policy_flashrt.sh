@@ -30,13 +30,33 @@
 # Prereqs (each in its own shell):
 #   1. CAN buses up:        sudo bash scripts/bring_up_can.sh
 #   2. lerobot venv active: source .venv/bin/activate
-#   3. FlashRT server up on $SERVER_PORT, e.g. (in the FlashRT repo, BF16 +
-#      prompt-length bucket caching — correctness-verified path):
+#   3. FlashRT server up on $SERVER_PORT. VERIFIED CONFIG — FP8-QAT torch
+#      frontend, ~4.8 deg arm MAE @ p50 173ms / p99 194ms (matches the eager
+#      reference; see notes below). Two non-obvious requirements:
+#        - the merged checkpoint MUST ship assets/openarm/norm_stats.json
+#          (16-DoF). Without it the frontend silently falls back to stale
+#          LIBERO 7-DoF stats in ~/.cache/openpi -> ~13 deg regression. A
+#          dim guard in pi05_rtx._load_norm_stats now hard-fails on this.
+#        - do NOT set FLASHRT_PAD_STATE=1. State-prompt padding corrupts the
+#          conditioning (~13 deg). Use --prewarm-prompt-lens instead to kill
+#          the per-length CUDA-graph rebuild spikes (no accuracy cost).
+#        - FLASHRT_FIXED_NOISE (EXPERIMENTAL, default OFF). The pi0.5 decode is
+#          inherently noise-sensitive (~2 deg BF16 / ~5 deg FP8 chunk shift per
+#          noise draw; eager and this frontend agree chunk-for-chunk given the
+#          SAME noise). Fresh noise every inference is the source of the closed-
+#          loop seam jerk. Pinning to one seed removes the jerk (0.000 deg
+#          run-to-run) but a single sample is not a guaranteed-coherent grasp
+#          trajectory (seed 0 -> robot made no attempt). Left OFF until a good
+#          sample / noise-averaging scheme is found. Set =1 to experiment.
+#        (in the FlashRT repo)
+#        PYTHONPATH=.:$HOME/sparkpack/openpi/src:$HOME/sparkpack/openpi/packages/openpi-client/src \
 #        python scripts/serve_policy_flashrt.py \
-#          --checkpoint <orbax-ckpt> --framework jax --no-fp8 \
+#          --checkpoint runs/openarm_fp8_slow2x/merged_serve --framework torch \
 #          --robot-action-dim 16 --num-views 3 --chunk-size 50 \
-#          --runtime-lora <lora> --prewarm-prompt-lens 74,76,78,80,82 \
-#          --port 8011
+#          --delta-action-mask 7,-1,7,-1 \
+#          --calib-data runs/openarm_fp8_slow2x/calib_openarm_merged_64.npz \
+#          --default-prompt "put the chocolate bars in the container" \
+#          --runtime-lora 0 --prewarm-prompt-lens 60-100 --port 8011
 #
 # Stopping: Ctrl-C once; the bridge's finally-block disconnects the bus and
 # disables torque.
@@ -46,8 +66,8 @@ set -euo pipefail
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 
 # ---------------------------------------------------------------------------
-# Server (FlashRT). Defaults match the BF16 + prompt-bucket-cache server we
-# verified at ~246 ms steady-state latency on this task.
+# Server (FlashRT). Defaults match the FP8-QAT torch + prompt-bucket-prewarm
+# server we verified at ~173 ms steady-state latency (4.8 deg arm) on this task.
 # ---------------------------------------------------------------------------
 SERVER_HOST="${SERVER_HOST:-localhost}"
 SERVER_PORT="${SERVER_PORT:-8011}"
@@ -56,7 +76,7 @@ MODE="${MODE:-rtc}"
 # RTC params — match scripts/run_chocolate_policy_rtc.sh (the lerobot RTC run).
 RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-20}"
 RTC_SCHEDULE="${RTC_SCHEDULE:-linear}"
-EXPECTED_LATENCY_MS="${EXPECTED_LATENCY_MS:-246}"
+EXPECTED_LATENCY_MS="${EXPECTED_LATENCY_MS:-175}"  # FP8 torch p50 ~173ms (was 246 on BF16 JAX)
 
 # ---------------------------------------------------------------------------
 # Camera mapping (same device map as run_chocolate_policy.sh / SparkJAX).
