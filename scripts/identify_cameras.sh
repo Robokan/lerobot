@@ -27,6 +27,18 @@
 #   Plug in all cameras, run `--list`, and paste each camera's by-id name
 #   (preferred, if its serial is non-empty and unique) or by-path name into
 #   EXPECTED_DEVICE below. A unique substring of the symlink name is enough.
+#
+# TODO(portability): unlike the CAN adapters (whose USB serials are burned
+#   into the boards, letting scripts/bring_up_can.sh resolve arms on any
+#   machine with no per-machine setup), these UVC cameras recorded EMPTY
+#   serial strings in the SparkJAX device map. If that holds (verify with
+#   --list next time the cameras are attached), identical cameras are only
+#   distinguishable by physical USB port (by-path), which makes this map
+#   inherently per-machine. We still need a way to make cameras
+#   plug-and-play: cameras that expose real serials, flashing UVC serials
+#   where the vendor tool supports it, or some content-based fingerprint at
+#   startup. Until then: re-run --list and refill the map on every new
+#   machine (and after moving a plug to a different port).
 
 set -euo pipefail
 

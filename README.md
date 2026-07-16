@@ -41,25 +41,29 @@ loudly on any mismatch.
 Run after every reboot, before any calibration, teleop, or policy run:
 
 ```bash
-sudo bash scripts/bring_up_can.sh
+sudo bash scripts/bring_up_can.sh                 # verify + bring up all 4 buses
+bash scripts/bring_up_can.sh --check              # verify only (no root, no changes)
+eval "$(bash scripts/bring_up_can.sh --export)"   # sets UMPA_LEFT_CAN, UMPA_RIGHT_CAN,
+                                                  #      LUMPA_LEFT_CAN, LUMPA_RIGHT_CAN
 ```
 
-What it does:
+The script identifies each arm by its USB-CAN adapter's serial number — which
+is burned into the CANable 2 board and travels with it — rather than by the
+`can0`–`can3` interface name, which the kernel assigns in USB enumeration
+order and can shuffle across machines, hubs, and plug order. It finds each
+expected serial on whatever `canN` it landed on, brings that interface up as
+**classic CAN at 1 Mbps** (the adapters run the non-FD candleLight firmware,
+so pass `--robot.use_can_fd=False` and `--teleop.use_can_fd=False` to every
+lerobot command that touches the arms), and raises the kernel TX queue
+(`txqueuelen 1000`) so multi-threaded async/RTC control doesn't overflow the
+SocketCAN default and drop a motor.
 
-- Brings up all four CANable 2 USB-CAN interfaces (`can0`–`can3`) as **classic
-  CAN at 1 Mbps** — the adapters run the non-FD candleLight firmware, so pass
-  `--robot.use_can_fd=False` (and `--teleop.use_can_fd=False`) to every
-  lerobot command that touches the arms.
-- Verifies each `canN` interface is the physically expected adapter by reading
-  its USB serial (`udevadm` `ID_SERIAL_SHORT`) and comparing it against the
-  hard-coded `canN ↔ serial ↔ arm` map at the top of the script
-  (can0/can1 = Umpa left/right, can2/can3 = Lumpa right/left). A swapped cable
-  exits with an error instead of miscalibrating an arm.
-- Raises the kernel TX queue (`txqueuelen 1000`) so multi-threaded async/RTC
-  control doesn't overflow the SocketCAN default and drop a motor.
-
-If you rewire or replace an adapter, update the `EXPECTED_SERIAL` map in the
-script to match the new wiring.
+Because the identity is on the hardware, plugging the rig into a different
+computer just works — use `--export` in run scripts instead of hard-coding
+`canN` names. Only physically replacing an adapter (new serial) or rewiring
+one to a different arm requires updating the `ROLE_OF_SERIAL` map in the
+script. A missing or unrecognized adapter is a loud failure, never a silent
+wrong-arm mapping.
 
 ### 2. Cameras (`scripts/identify_cameras.sh`)
 
@@ -93,6 +97,13 @@ eval "$(bash scripts/identify_cameras.sh --export)"   # sets EGO_CAM, LEFT_WRIST
 variables the run scripts use, so they always point at the right physical
 camera regardless of enumeration order. A missing, ambiguous, or
 double-assigned camera is a hard failure.
+
+Unlike the CAN adapters, the cameras are **not yet machine-portable**: they
+recorded empty serial strings in the SparkJAX device map, so there may be
+nothing on the camera hardware to identify them by, forcing the per-machine
+by-path mapping above. Finding a plug-and-play camera identity (cameras with
+real serials, flashed UVC serials, or a startup fingerprint) is an open TODO
+tracked in both scripts.
 
 ## Quick Start
 
