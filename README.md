@@ -25,6 +25,75 @@
 
 🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
 
+## OpenArm Hardware Setup (this fork)
+
+This fork adds two setup scripts for the bimanual OpenArm rig, plus VR
+motion-capture teleoperation of a simulated OpenArm in MuJoCo (see
+`scripts/run_vr_sim.sh` and `src/lerobot/teleoperators/vr_mocap/`). The core
+problem both scripts solve is the same: neither CAN interfaces nor
+`/dev/video*` indices are stable identities, so after a reboot or re-plug you
+can silently end up driving the wrong arm or recording through swapped camera
+views. Both scripts check the physical identity of every device and fail
+loudly on any mismatch.
+
+### 1. CAN buses (`scripts/bring_up_can.sh`)
+
+Run after every reboot, before any calibration, teleop, or policy run:
+
+```bash
+sudo bash scripts/bring_up_can.sh
+```
+
+What it does:
+
+- Brings up all four CANable 2 USB-CAN interfaces (`can0`–`can3`) as **classic
+  CAN at 1 Mbps** — the adapters run the non-FD candleLight firmware, so pass
+  `--robot.use_can_fd=False` (and `--teleop.use_can_fd=False`) to every
+  lerobot command that touches the arms.
+- Verifies each `canN` interface is the physically expected adapter by reading
+  its USB serial (`udevadm` `ID_SERIAL_SHORT`) and comparing it against the
+  hard-coded `canN ↔ serial ↔ arm` map at the top of the script
+  (can0/can1 = Umpa left/right, can2/can3 = Lumpa right/left). A swapped cable
+  exits with an error instead of miscalibrating an arm.
+- Raises the kernel TX queue (`txqueuelen 1000`) so multi-threaded async/RTC
+  control doesn't overflow the SocketCAN default and drop a motor.
+
+If you rewire or replace an adapter, update the `EXPECTED_SERIAL` map in the
+script to match the new wiring.
+
+### 2. Cameras (`scripts/identify_cameras.sh`)
+
+`/dev/videoN` indices are assigned in USB enumeration order and shuffle across
+reboots — a policy fed swapped ego/wrist views still runs, it just sees the
+world through the wrong eyes. This script resolves each camera role (`ego`,
+`left_wrist`, `right_wrist`) from a stable identity instead: `/dev/v4l/by-id`
+when the camera reports a serial, or `/dev/v4l/by-path` (the physical USB
+port) for serial-less UVC cameras.
+
+One-time setup — plug all three cameras into their usual ports, then:
+
+```bash
+bash scripts/identify_cameras.sh --list
+```
+
+and paste each camera's symlink name (a unique substring is enough) into the
+`EXPECTED_DEVICE` map at the top of the script. Serial-less identical cameras
+must be identified `by-path`, which means each camera is tied to its USB port:
+keep the plugs where they are, or re-run `--list` and update the map after
+moving one.
+
+Every session after that:
+
+```bash
+bash scripts/identify_cameras.sh                  # verify + report
+eval "$(bash scripts/identify_cameras.sh --export)"   # sets EGO_CAM, LEFT_WRIST_CAM, RIGHT_WRIST_CAM
+```
+
+`--export` emits the `EGO_CAM` / `LEFT_WRIST_CAM` / `RIGHT_WRIST_CAM`
+variables the run scripts use, so they always point at the right physical
+camera regardless of enumeration order. A missing, ambiguous, or
+double-assigned camera is a hard failure.
+
 ## Quick Start
 
 LeRobot can be installed directly from PyPI.
