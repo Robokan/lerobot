@@ -65,7 +65,7 @@ class MujocoBiOpenArmConfig(RobotConfig):
     # Elbow bend (deg) applied at connect to lift the arms off the model's
     # all-zeros pose, which is both a straight-arm singularity and exactly on
     # J4's lower stop. See BASE_ELBOW_BEND_DEG for why that matters.
-    base_elbow_bend_deg: float = 20.0
+    base_elbow_bend_deg: float = 90.0
 
     # Open an interactive on-screen MuJoCo viewer (mujoco.viewer.launch_passive)
     # so the sim can be watched while teleoperating. Off by default: recording

@@ -52,7 +52,7 @@ class VRMocapConfig(TeleoperatorConfig):
 
     # Elbow bend (deg) for the IK model's starting/rest pose. Keep this equal to
     # the robot's base_elbow_bend_deg so both models sit in the same pose.
-    base_elbow_bend_deg: float = 20.0
+    base_elbow_bend_deg: float = 90.0
 
     # Pose driver: "scripted" (headless deterministic motion, default),
     # "keyboard" (single-char terminal control), or "openxr" (Phase 2 VR).

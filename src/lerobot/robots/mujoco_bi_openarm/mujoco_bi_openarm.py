@@ -68,7 +68,7 @@ MOTOR_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6",
 # the elbow first, and a solver sitting at the singularity cannot discover that.
 # So both the sim robot and the teleop's IK model start here instead, and the
 # rest-pose bias pulls back toward it.
-BASE_ELBOW_BEND_DEG = 20.0
+BASE_ELBOW_BEND_DEG = 90.0
 
 ARM_JOINT_NAMES = MOTOR_NAMES[:7]
 # Right first, then left — matches BiOpenArmFollower / OpenArmMini ordering.
