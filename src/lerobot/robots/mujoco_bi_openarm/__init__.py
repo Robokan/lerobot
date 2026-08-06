@@ -16,18 +16,22 @@
 
 from .config_mujoco_bi_openarm import MujocoBiOpenArmConfig
 from .mujoco_bi_openarm import (
+    BASE_ELBOW_BEND_DEG,
     FINGER_OPEN_M,
     GRIPPER_OPEN_DEG,
     MujocoBiOpenArm,
+    apply_base_pose,
     gripper_deg_to_m,
     gripper_m_to_deg,
 )
 
 __all__ = [
+    "BASE_ELBOW_BEND_DEG",
     "FINGER_OPEN_M",
     "GRIPPER_OPEN_DEG",
     "MujocoBiOpenArm",
     "MujocoBiOpenArmConfig",
+    "apply_base_pose",
     "gripper_deg_to_m",
     "gripper_m_to_deg",
 ]

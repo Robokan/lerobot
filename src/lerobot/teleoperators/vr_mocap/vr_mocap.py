@@ -36,7 +36,7 @@ import os
 
 import numpy as np
 
-from lerobot.robots.mujoco_bi_openarm import gripper_m_to_deg
+from lerobot.robots.mujoco_bi_openarm import apply_base_pose, gripper_m_to_deg
 from lerobot.lerobot_types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -102,6 +102,9 @@ class VRMocap(Teleoperator):
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
         mujoco.mj_forward(self._model, self._data)
+        # Same base pose as the robot, so the IK does not start solving from the
+        # straight-arm singularity (and q_rest below is that pose).
+        apply_base_pose(mujoco, self._model, self._data, self.config.base_elbow_bend_deg)
         self._ik = IKSolver(
             self._model,
             self._data,

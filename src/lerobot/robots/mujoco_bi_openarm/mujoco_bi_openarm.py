@@ -38,6 +38,7 @@ Layout/unit conversions mirror the real follower wire format:
 """
 
 import logging
+import math
 import os
 from functools import cached_property
 from pathlib import Path
@@ -56,6 +57,19 @@ logger = logging.getLogger(__name__)
 
 # Logical motor names per arm, in the order the real follower exposes them.
 MOTOR_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper"]
+
+# Base pose: the model's all-zeros pose is a fully straight arm, which is a
+# kinematic singularity -- the Jacobian loses rank there, so the IK has no
+# authority in whole directions (measured: zero roll authority about the tool
+# axis from every joint). It is also exactly on J4's lower stop, since the elbow
+# range is 0..140 deg, so the elbow can only bend one way out of it.
+#
+# Pulling the wrist straight back from a straight arm physically requires bending
+# the elbow first, and a solver sitting at the singularity cannot discover that.
+# So both the sim robot and the teleop's IK model start here instead, and the
+# rest-pose bias pulls back toward it.
+BASE_ELBOW_BEND_DEG = 20.0
+
 ARM_JOINT_NAMES = MOTOR_NAMES[:7]
 # Right first, then left — matches BiOpenArmFollower / OpenArmMini ordering.
 SIDES = ["right", "left"]
@@ -68,6 +82,22 @@ _DEG2RAD = np.pi / 180.0
 # the MuJoCo finger slide travels 0 .. 0.044 m. Linear map through the origin.
 GRIPPER_OPEN_DEG = -165.0
 FINGER_OPEN_M = 0.044
+
+
+def apply_base_pose(mujoco, model, data, elbow_bend_deg: float = BASE_ELBOW_BEND_DEG) -> None:
+    """Put both arms in the base pose: zeros, with the elbow bent off the stop.
+
+    Called by the sim robot and by the VR teleoperator's IK model so the two stay
+    in the same configuration and neither starts at the straight-arm singularity.
+    """
+    bend = math.radians(elbow_bend_deg)
+    for side in SIDES:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint4")
+        if jid < 0:
+            raise ValueError(f"Joint 'openarm_{side}_joint4' not found in MuJoCo model.")
+        lo, hi = model.jnt_range[jid]
+        data.qpos[model.jnt_qposadr[jid]] = float(np.clip(bend, lo, hi))
+    mujoco.mj_forward(model, data)
 
 
 def gripper_deg_to_m(deg: float) -> float:
@@ -161,6 +191,7 @@ class MujocoBiOpenArm(Robot):
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
         mujoco.mj_forward(self._model, self._data)
+        apply_base_pose(mujoco, self._model, self._data, self.config.base_elbow_bend_deg)
 
         # Substeps so one send_action advances ~ 1/fps of sim time.
         if self.config.sim_substeps is not None:
