@@ -112,6 +112,8 @@ class VRMocap(Teleoperator):
             joint_weights=self.config.joint_weights,
             limit_margin_rad=math.radians(self.config.limit_margin_deg),
             max_step_rad=math.radians(self.config.max_step_deg),
+            spring_weights=self.config.spring_weights,
+            spring_gain=self.config.spring_gain,
         )
 
         self._source = self._make_source()

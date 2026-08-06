@@ -50,6 +50,17 @@ class VRMocapConfig(TeleoperatorConfig):
     limit_margin_deg: float = 15.0
     max_step_deg: float = 6.0
 
+    # Springs pulling each joint back toward the base pose; spring_gain scales
+    # them all (0 disables). Graded as you would build it mechanically -- very
+    # weak at the wrist, stiff at the shoulder -- so the wrist gives first when
+    # you move out and the shoulder recovers first when you move back. Because
+    # the base pose has the elbow bent 90 deg, a straight arm is the largest
+    # displacement and so pulls back hardest.
+    spring_weights: list[float] = field(
+        default_factory=lambda: [1.0, 1.0, 1.0, 0.6, 0.02, 0.02, 0.02]
+    )
+    spring_gain: float = 0.15
+
     # Elbow bend (deg) for the IK model's starting/rest pose. Keep this equal to
     # the robot's base_elbow_bend_deg so both models sit in the same pose.
     base_elbow_bend_deg: float = 90.0

@@ -59,6 +59,19 @@ DEFAULT_LIMIT_MARGIN_RAD = math.radians(15.0)
 # limit it is already sitting against.
 _WEIGHT_FLOOR = 0.02
 
+# Hard floor on elbow bend, for numerical hygiene only -- not a reach limit. A
+# dead-straight arm (J4 = 0) is an exact singularity: moving the hand along the
+# arm's own length needs the elbow to bend, and a straight elbow has no
+# instantaneous authority there, so pulling the hand back does nothing at all
+# (measured: smallest singular value 0.00000, condition number 1.9e12, five dead
+# control ticks). Three degrees of bend is visually straight but leaves the
+# Jacobian usable (minSV 0.00466, condition 401). The springs below are what
+# actually keep the arm away from here; this is just the backstop.
+ELBOW_SINGULARITY_FLOOR_RAD = math.radians(3.0)
+
+# Index of the elbow within the J1..J7 vectors.
+_ELBOW_IDX = 3
+
 # Per-joint cap on a single IK iteration. Near a singularity the damped solve
 # can still ask for a large step; clamping keeps that from teleporting the arm.
 DEFAULT_MAX_STEP_RAD = math.radians(6.0)
@@ -75,19 +88,51 @@ DEFAULT_MAX_DELTA_PER_CALL_RAD = math.radians(3.0)
 DEFAULT_MAX_POS_ERR_M = 0.02
 DEFAULT_MAX_ORI_ERR_RAD = math.radians(5.0)
 
-# Pull back toward the rest pose, per joint J1..J7, applied in whatever freedom
-# the pose task leaves over. Proximal joints want to go home; the wrist is left
-# alone (0.0) wherever it happens to be wound to.
+# Springs pulling each joint back toward the base pose, J1..J7. Unlike a
+# nullspace-only bias these are allowed to trade against the pose task, which is
+# what makes them behave like real springs: the arm extends when the target pulls
+# it out, and relaxes back toward the base pose when the target stops pulling.
 #
-# Together with the wrist-heavy DEFAULT_JOINT_WEIGHTS this produces last-in
-# first-out ordering, which is what makes the motion read as natural:
-#   rotating out   the wrist is cheapest, so it leads; the shoulder is pinned
-#                  home by this bias until the wrist taper forces it to help.
-#   rotating back  the shoulder is the only joint being actively pulled home, so
-#                  it unwinds first; the wrist stays wound until the shoulder is
-#                  back, then gives up its rotation.
-DEFAULT_REST_BIAS_WEIGHTS = (1.0, 1.0, 1.0, 0.7, 0.0, 0.0, 0.0)
-DEFAULT_REST_GAIN = 0.25
+# Graded the way you would build it mechanically -- very weak springs at the
+# wrist, stiff ones at the shoulder. That single gradient produces the whole
+# ordering, with no separate sequencing logic:
+#   moving out    the wrist has the least resistance, so it gives first; the
+#                 shoulder only joins once the wrist has run out of travel.
+#   moving back   the shoulder's stiffer spring dominates, so it recovers first,
+#                 and the slack wrist unwinds afterwards.
+# It also keeps the springs out of the way of fine positioning: the wrist, which
+# does the precise work, barely droops.
+#
+# A plain linear spring gives the "harder the straighter it gets" feel for free --
+# the base pose has the elbow at 90 deg, so a straight arm is the largest
+# displacement and therefore the largest restoring force.
+DEFAULT_SPRING_WEIGHTS = (1.0, 1.0, 1.0, 0.6, 0.02, 0.02, 0.02)
+DEFAULT_SPRING_GAIN = 0.15
+
+# What the spring displacement is "worth" when deciding whether an iteration made
+# progress, in metres of equivalent pose error per rad^2 of displacement. Without
+# this the progress guard would reject every spring step as a pose regression and
+# undo it. At 0.02, one joint held 90 deg off base costs about 5 cm of pose error
+# -- enough to relax the arm when the target is slack, light enough that a target
+# the arm can actually reach still wins.
+DEFAULT_SPRING_SCORE_M_PER_RAD2 = 0.02
+
+# Position error at which the springs start being allowed to move the hand, and
+# the span over which that ramps to full. Below the tolerance the target is being
+# tracked and accuracy wins; past tolerance+span the target is unreachable and the
+# springs take over to bring the arm back in.
+DEFAULT_REACH_TOL_M = 0.03
+DEFAULT_REACH_SPAN_M = 0.07
+
+# Extra willingness given to a joint that is displaced from the base pose when the
+# step being considered would bring it back. This is what makes the shoulder
+# recover first: the springs alone cannot do it, because while the target is
+# tracking they are confined to the nullspace and so cannot serve the hand motion
+# at all. Scaled per joint by spring_weights, so the same stiff-shoulder/weak-wrist
+# gradient decides the ordering. Being a weight and not a force, it changes which
+# joints do the work without costing any steady-state accuracy.
+DEFAULT_HOMING_BOOST = 6.0
+DEFAULT_HOMING_SCALE_RAD = math.radians(45.0)
 
 # Exchange rate used to score position error against orientation error when
 # deciding whether an iteration made progress: 1 rad of residual rotation counts
@@ -196,8 +241,14 @@ class IKSolver:
         max_step_rad: float = DEFAULT_MAX_STEP_RAD,
         max_pos_err_m: float = DEFAULT_MAX_POS_ERR_M,
         max_ori_err_rad: float = DEFAULT_MAX_ORI_ERR_RAD,
-        rest_bias_weights=DEFAULT_REST_BIAS_WEIGHTS,
-        rest_gain: float = DEFAULT_REST_GAIN,
+        spring_weights=DEFAULT_SPRING_WEIGHTS,
+        spring_gain: float = DEFAULT_SPRING_GAIN,
+        spring_score_m_per_rad2: float = DEFAULT_SPRING_SCORE_M_PER_RAD2,
+        elbow_floor_rad: float = ELBOW_SINGULARITY_FLOOR_RAD,
+        reach_tol_m: float = DEFAULT_REACH_TOL_M,
+        reach_span_m: float = DEFAULT_REACH_SPAN_M,
+        homing_boost: float = DEFAULT_HOMING_BOOST,
+        homing_scale_rad: float = DEFAULT_HOMING_SCALE_RAD,
         ori_pos_tradeoff: float = _ORI_TO_POS_M_PER_RAD,
         max_delta_per_call_rad: float = DEFAULT_MAX_DELTA_PER_CALL_RAD,
     ):
@@ -217,12 +268,17 @@ class IKSolver:
         self.max_step_rad = float(max_step_rad)
         self.max_pos_err_m = float(max_pos_err_m)
         self.max_ori_err_rad = float(max_ori_err_rad)
-        self.rest_bias_weights = np.asarray(rest_bias_weights, dtype=float)
-        if self.rest_bias_weights.shape != (7,):
+        self.spring_weights = np.asarray(spring_weights, dtype=float)
+        if self.spring_weights.shape != (7,):
             raise ValueError(
-                f"rest_bias_weights must have 7 entries (J1..J7), got {self.rest_bias_weights.shape}"
+                f"spring_weights must have 7 entries (J1..J7), got {self.spring_weights.shape}"
             )
-        self.rest_gain = float(rest_gain)
+        self.spring_gain = float(spring_gain)
+        self.spring_score_m_per_rad2 = float(spring_score_m_per_rad2)
+        self.reach_tol_m = float(reach_tol_m)
+        self.reach_span_m = float(reach_span_m)
+        self.homing_boost = float(homing_boost)
+        self.homing_scale_rad = float(homing_scale_rad)
         self.ori_pos_tradeoff = float(ori_pos_tradeoff)
         self.max_delta_per_call_rad = float(max_delta_per_call_rad)
         # Rest pose per side, captured the first time that arm is solved (i.e. the
@@ -245,6 +301,9 @@ class IKSolver:
         self.limits_high = {
             side: np.array([model.jnt_range[j][1] for j in ids]) for side, ids in self.joint_ids.items()
         }
+        # Keep the elbow off dead-straight (see ELBOW_SINGULARITY_FLOOR_RAD).
+        for lows in self.limits_low.values():
+            lows[_ELBOW_IDX] = max(float(lows[_ELBOW_IDX]), elbow_floor_rad)
         self.finger_qpos_idx = {
             "left": [
                 model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)]
@@ -287,17 +346,39 @@ class IKSolver:
         tgt_mat = tgt_mat.reshape(3, 3)
 
         def pose_error():
-            """(pos_err, ori_err, scalar score) at the current qpos."""
+            """(pos_err, ori_err, scalar score) at the current qpos.
+
+            The score is what the progress guard minimizes, so it has to include
+            the spring energy as well as the pose error -- otherwise every step
+            that relaxes the arm toward the base pose reads as a pose regression
+            and gets reverted.
+            """
             mujoco.mj_forward(self.model, self.data)
             p = target_pos - self.data.xpos[body_id]
             o = mat_to_axis_angle(tgt_mat @ self.data.xmat[body_id].reshape(3, 3).T)
-            score = float(np.linalg.norm(p)) + self.ori_pos_tradeoff * float(np.linalg.norm(o))
+            disp = np.array([self.data.qpos[qi] for qi in idx]) - q_rest
+            spring = self.spring_score_m_per_rad2 * float(np.sum(self.spring_weights * disp**2))
+            score = (
+                float(np.linalg.norm(p))
+                + self.ori_pos_tradeoff * float(np.linalg.norm(o))
+                + spring
+            )
             return p.copy(), o, score
 
         for _ in range(max_iter):
             pos_err, ori_err, score = pose_error()
             if np.linalg.norm(np.concatenate([pos_err, ori_err])) < 1e-4:
                 break
+
+            # How far out of reach the target is, 0 (tracking fine) .. 1 (hopeless).
+            # Gates how much the springs may pull the hand off target below.
+            reach_deficit = float(
+                np.clip(
+                    (np.linalg.norm(pos_err) - self.reach_tol_m) / max(self.reach_span_m, 1e-9),
+                    0.0,
+                    1.0,
+                )
+            )
 
             # Keep each correction inside the range where the Jacobian
             # linearization still holds. A big raw error makes the step invalid,
@@ -318,9 +399,15 @@ class IKSolver:
             # wants to travel; pass 2 re-solves with joints that are heading into
             # a nearby limit down-weighted, so the load moves to the next joint
             # out (wrist -> elbow -> shoulder) smoothly instead of in one jump.
-            dq = self._priority_solve(Jp, Jr, pos_err, ori_err, self.joint_weights, q, q_rest)
-            weights = self.joint_weights * self._limit_taper(q, lo, hi, dq)
-            dq = self._priority_solve(Jp, Jr, pos_err, ori_err, weights, q, q_rest)
+            dq = self._priority_solve(
+                Jp, Jr, pos_err, ori_err, self.joint_weights, q, q_rest, reach_deficit
+            )
+            weights = (
+                self.joint_weights
+                * self._limit_taper(q, lo, hi, dq)
+                * self._homing_boost(q, q_rest, dq)
+            )
+            dq = self._priority_solve(Jp, Jr, pos_err, ori_err, weights, q, q_rest, reach_deficit)
 
             dq = np.clip(dq, -self.max_step_rad, self.max_step_rad)
 
@@ -355,26 +442,45 @@ class IKSolver:
         A = J @ W @ J.T + lam**2 * np.eye(J.shape[0])
         return W @ J.T @ np.linalg.solve(A, dx)
 
-    def _priority_solve(self, Jp, Jr, pos_err, ori_err, weights, q, q_rest):
-        """Weighted 6-DoF solve, plus a rest-pose pull along the self-motion DoF.
+    def _priority_solve(self, Jp, Jr, pos_err, ori_err, weights, q, q_rest, reach_deficit):
+        """Weighted 6-DoF solve plus base-pose springs.
 
         The pose is solved as one weighted least-squares problem: with the wrist
         weighted high the wrist absorbs rotation first, and the limit taper hands
         the load outward as it saturates.
 
-        The rest-pose bias is projected into the nullspace of the *whole* 6-DoF
-        task, not just position. That subspace is the arm's self-motion manifold
-        (1-DoF for 7 joints against a 6-DoF task): the elbow-lift family of
-        configurations that leave the hand pose untouched. Projecting it any
-        wider lets the bias corrupt the pose it is supposed to preserve, which
-        makes the iteration fight itself and stop converging.
+        The springs are split by how well the target is being tracked, because a
+        spring that is always free to move the hand costs accuracy everywhere
+        (measured: 80 mm of steady-state droop at the stiffness the return
+        ordering wants):
+
+        * While the target is reachable the spring is confined to the nullspace of
+          the full 6-DoF task -- the self-motion manifold -- so the arm relaxes
+          toward the base pose *without* the hand drifting off target at all.
+        * As the target moves out of reach (``reach_deficit`` -> 1) the spring is
+          progressively allowed to act directly. There the hand cannot be put
+          where it was asked anyway, so pulling the arm back in beats letting it
+          hang at full extension against a singularity.
         """
         J = np.vstack([Jp, Jr])
         dx = np.concatenate([pos_err, ori_err])
         dq = self._weighted_dls(J, dx, weights, self.dls_lambda)
 
-        bias = -self.rest_gain * self.rest_bias_weights * (q - q_rest)
-        return dq + _nullspace_projector(J) @ bias
+        spring = -self.spring_gain * self.spring_weights * (q - q_rest)
+        free = _nullspace_projector(J) @ spring
+        return dq + free + reach_deficit * (spring - free)
+
+    def _homing_boost(self, q, q_rest, dq):
+        """Per-joint weight multiplier favouring joints heading back to base pose.
+
+        Only applies to joints whose step reduces their displacement, so it never
+        encourages leaving the base pose -- it just makes coming back cheap, and
+        cheapest for the joints with the stiffest springs.
+        """
+        disp = q - q_rest
+        coming_home = (disp * dq) < 0.0
+        mag = np.clip(np.abs(disp) / max(self.homing_scale_rad, 1e-9), 0.0, 1.0)
+        return 1.0 + self.homing_boost * self.spring_weights * np.where(coming_home, mag, 0.0)
 
     def _limit_taper(self, q, lo, hi, dq):
         """Scale factor per joint that fades out as it approaches a limit.
