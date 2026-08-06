@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import TeleoperatorConfig
 
@@ -37,6 +37,18 @@ class VRMocapConfig(TeleoperatorConfig):
     model_path: str = DEFAULT_MODEL_PATH
     dls_lambda: float = 0.05
     max_iter: int = 10
+
+    # Redundancy resolution. joint_weights is J1..J7 (shoulder -> wrist): a
+    # larger value makes that joint cheaper to move, so wrist-heavy defaults let
+    # the wrist absorb rotation before the elbow and shoulder are recruited.
+    # limit_margin_deg is how far ahead of a joint limit the weight starts
+    # tapering (the taper is what makes the handover smooth instead of a pop);
+    # max_step_deg caps one IK iteration so a near-singular solve cannot jump.
+    joint_weights: list[float] = field(
+        default_factory=lambda: [0.15, 0.15, 0.15, 0.35, 1.0, 1.0, 1.0]
+    )
+    limit_margin_deg: float = 15.0
+    max_step_deg: float = 6.0
 
     # Pose driver: "scripted" (headless deterministic motion, default),
     # "keyboard" (single-char terminal control), or "openxr" (Phase 2 VR).

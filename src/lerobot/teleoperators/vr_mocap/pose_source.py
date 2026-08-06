@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .ik import FINGER_OPEN_M, axis_angle_to_quat, quat_mul
+from .ik import FINGER_OPEN_M, axis_angle_to_quat, quat_inv, quat_mul
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,37 @@ class ScriptedPoseSource(PoseSource):
 # --------------------------------------------------------------------------- #
 # Keyboard driver (headless terminal, single-char stdin)
 # --------------------------------------------------------------------------- #
+# How far an integrated target may run ahead of the pose the arm actually
+# reached, before it is pulled back. Big enough that normal tracking lag is
+# untouched, small enough that reversing a key responds immediately.
+TARGET_LEASH_M = 0.05
+TARGET_LEASH_RAD = np.deg2rad(15.0)
+
+
+def _leash_to_actual(pos, quat, actual):
+    """Clamp a target pose to within the leash distance of the achieved pose."""
+    act_pos, act_quat = actual
+    act_pos = np.asarray(act_pos, dtype=float)
+    act_quat = np.asarray(act_quat, dtype=float)
+
+    delta = pos - act_pos
+    dist = float(np.linalg.norm(delta))
+    if dist > TARGET_LEASH_M:
+        pos = act_pos + delta * (TARGET_LEASH_M / dist)
+
+    # Relative rotation from achieved to target, shrunk if it exceeds the leash.
+    q_rel = quat_mul(quat, quat_inv(act_quat))
+    w = float(np.clip(abs(q_rel[0]), -1.0, 1.0))
+    angle = 2.0 * float(np.arccos(w))
+    if angle > TARGET_LEASH_RAD:
+        axis = q_rel[1:] * (1.0 if q_rel[0] >= 0.0 else -1.0)
+        n = float(np.linalg.norm(axis))
+        if n > 1e-9:
+            q_rel = axis_angle_to_quat(axis / n, TARGET_LEASH_RAD)
+            quat = quat_mul(q_rel, act_quat)
+    return pos, quat
+
+
 class KeyboardPoseSource(PoseSource):
     """Drives the active hand's EE target from single-character terminal input.
 
@@ -214,6 +245,14 @@ class KeyboardPoseSource(PoseSource):
         side = self._active_side
         pos = self._pos.setdefault(side, np.asarray(current_ee[side][0], dtype=float).copy())
         quat = self._quat.setdefault(side, np.asarray(current_ee[side][1], dtype=float).copy())
+
+        # Keep the integrated target on a leash behind what the arm actually
+        # achieved. Holding a key past the arm's reach would otherwise wind the
+        # target far beyond it, and releasing/reversing would then do nothing
+        # until the target walked all the way back -- a long dead zone that feels
+        # like the controls have stopped responding.
+        pos, quat = _leash_to_actual(pos, quat, current_ee[side])
+        self._pos[side], self._quat[side] = pos, quat
 
         for ch in self._drain_keys():
             if ch == "w":

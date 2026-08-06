@@ -31,6 +31,7 @@ does (arms just track joint targets).
 """
 
 import logging
+import math
 import os
 
 import numpy as np
@@ -101,7 +102,14 @@ class VRMocap(Teleoperator):
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
         mujoco.mj_forward(self._model, self._data)
-        self._ik = IKSolver(self._model, self._data, dls_lambda=self.config.dls_lambda)
+        self._ik = IKSolver(
+            self._model,
+            self._data,
+            dls_lambda=self.config.dls_lambda,
+            joint_weights=self.config.joint_weights,
+            limit_margin_rad=math.radians(self.config.limit_margin_deg),
+            max_step_rad=math.radians(self.config.max_step_deg),
+        )
 
         self._source = self._make_source()
         initial_ee = {s: self._ik.get_ee_pose(s) for s in SIDES}
