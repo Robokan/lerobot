@@ -62,6 +62,13 @@ class MujocoBiOpenArmConfig(RobotConfig):
     fps: int = 50
     sim_substeps: int | None = None
 
+    # Open an interactive on-screen MuJoCo viewer (mujoco.viewer.launch_passive)
+    # so the sim can be watched while teleoperating. Off by default: recording
+    # runs are headless, and the window costs a GL context plus frame time.
+    # Needs a display; when enabled, MUJOCO_GL defaults to glx instead of egl
+    # (egl is offscreen-only and cannot present a window).
+    viewer: bool = False
+
     # PD gains for the 7 arm joints (J1..J7), applied as torque on the model's
     # direct-drive `motor` actuators (tau = kp*(target-q) - kd*qdot, clamped to
     # the model forcerange). Mirrors the real follower's MIT-control gains.

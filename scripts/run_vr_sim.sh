@@ -24,21 +24,48 @@
 #   2. Headless rendering backend: MUJOCO_GL=egl (default below). Use osmesa if
 #      EGL is unavailable on your machine.
 #
+# Watching the sim (VIEWER=1) — opens an on-screen MuJoCo window. CAMERAS=0
+# additionally skips the offscreen camera renders, which nothing in teleop
+# consumes; on this box that is the difference between ~50 Hz and ~40 Hz.
+#
+# Keyboard driver keys (active hand only; Tab switches hands):
+#   w/s +x/-x   a/d +y/-y   r/f +z/-z
+#   i/k pitch   j/l yaw     u/o roll
+#   [ / ] gripper open/close       space  reset targets to current pose
+#
 # Examples:
 #   bash scripts/run_vr_sim.sh                                  # scripted teleop
+#   VIEWER=1 CAMERAS=0 DRIVER=keyboard bash scripts/run_vr_sim.sh   # watch + drive by keyboard
 #   MODE=record NUM_EPISODES=2 bash scripts/run_vr_sim.sh       # record 2 episodes
 #   DRIVER=keyboard bash scripts/run_vr_sim.sh                  # keyboard teleop
 #   DRIVER=openxr MODE=record bash scripts/run_vr_sim.sh        # VR record (headset)
+#
+# Note: MuJoCo 3.9.0 segfaults during GL teardown at interpreter exit on this
+# aarch64 box whenever the viewer has been open (reproducible with plain mujoco,
+# no lerobot involved). It happens after all work completes and after the robot
+# disconnects cleanly, so it is cosmetic — but do not mistake it for a crash in
+# the teleop loop.
 
 set -euo pipefail
-
-# Headless offscreen rendering backend for the MuJoCo cameras.
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 MODE="${MODE:-teleop}"
 DRIVER="${DRIVER:-scripted}"
 MODEL_PATH="${MODEL_PATH:-$HOME/sparkpack/openarm_mujoco/v1/scene.xml}"
 FPS="${FPS:-50}"
+
+# VIEWER=1 opens an on-screen MuJoCo window to watch the arms (debugging).
+# egl is offscreen-only so it cannot present a window; glx serves both the
+# window and the offscreen camera renders.
+VIEWER="${VIEWER:-0}"
+if [[ "${VIEWER}" == "1" ]]; then
+  export MUJOCO_GL="${MUJOCO_GL:-glx}"
+else
+  export MUJOCO_GL="${MUJOCO_GL:-egl}"
+fi
+
+# CAMERAS=0 skips the offscreen camera renders. Nothing in teleop consumes the
+# images, so dropping them buys frame time while debugging motion.
+CAMERAS="${CAMERAS:-1}"
 
 # Teleop-only
 TELEOP_TIME_S="${TELEOP_TIME_S:-20}"
@@ -55,6 +82,12 @@ ROBOT_ARGS=(
   --robot.id=mujoco_bi_openarm
   --robot.model_path="${MODEL_PATH}"
 )
+if [[ "${VIEWER}" == "1" ]]; then
+  ROBOT_ARGS+=(--robot.viewer=true)
+fi
+if [[ "${CAMERAS}" == "0" ]]; then
+  ROBOT_ARGS+=(--robot.cameras='{}')
+fi
 TELEOP_ARGS=(
   --teleop.type=vr_mocap
   --teleop.id=vr_mocap

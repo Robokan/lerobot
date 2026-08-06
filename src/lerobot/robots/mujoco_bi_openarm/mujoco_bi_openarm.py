@@ -94,6 +94,7 @@ class MujocoBiOpenArm(Robot):
         self._model = None
         self._data = None
         self._substeps = 1
+        self._viewer = None
 
         # Per-(side, joint) actuator/qpos book-keeping, filled at connect().
         self._arm_ctrl: dict[tuple[str, str], dict[str, Any]] = {}
@@ -149,7 +150,9 @@ class MujocoBiOpenArm(Robot):
         import mujoco
 
         if "MUJOCO_GL" not in os.environ:
-            os.environ["MUJOCO_GL"] = "egl"
+            # egl renders offscreen only, so a viewer window needs glx. glx also
+            # serves the offscreen camera renders, so one backend covers both.
+            os.environ["MUJOCO_GL"] = "glx" if self.config.viewer else "egl"
 
         model_path = str(Path(self.config.model_path).expanduser())
         if not Path(model_path).is_file():
@@ -172,8 +175,25 @@ class MujocoBiOpenArm(Robot):
         self._build_index_maps(mujoco)
         self._build_cameras()
 
+        if self.config.viewer:
+            self._open_viewer()
+
         logger.info("%s connected.", self)
         self._connected = True
+
+    def _open_viewer(self) -> None:
+        """Open the passive viewer, framed on the arms like the SparkJAX rig."""
+        import mujoco.viewer
+
+        self._viewer = mujoco.viewer.launch_passive(
+            self._model, self._data, show_left_ui=False, show_right_ui=False
+        )
+        cam = self._viewer.cam
+        cam.azimuth = 0.0
+        cam.elevation = -9.0
+        cam.lookat[2] = 0.4
+        cam.distance = 1.0
+        logger.info("MuJoCo viewer opened (close the window or Ctrl-C to stop).")
 
     def _build_index_maps(self, mujoco) -> None:
         """Resolve MuJoCo joint/actuator ids for the 16 logical DOF."""
@@ -299,6 +319,9 @@ class MujocoBiOpenArm(Robot):
                         d.ctrl[f["aid"]] = float(np.clip(tau, -f["frange"], f["frange"]))
             mujoco.mj_step(self._model, d)
 
+        if self._viewer is not None:
+            self._viewer.sync()
+
         # Echo the joint commands actually applied (degrees), like the real robot.
         sent: dict[str, float] = {}
         for (side, motor), tgt in arm_targets.items():
@@ -314,6 +337,12 @@ class MujocoBiOpenArm(Robot):
                 cam.disconnect()
             except Exception:  # noqa: BLE001
                 logger.debug("camera disconnect failed", exc_info=True)
+        if self._viewer is not None:
+            try:
+                self._viewer.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("viewer close failed", exc_info=True)
+            self._viewer = None
         # Keep the camera objects (re-bound on reconnect); just drop the sim.
         self._data = None
         self._model = None
