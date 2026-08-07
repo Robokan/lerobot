@@ -61,15 +61,12 @@ class VRMocapConfig(TeleoperatorConfig):
     )
     spring_gain: float = 0.15
 
-    # Elbow bend (deg) of the pose the springs pull toward. This is a *desired*
-    # pose, not a starting one: the arm may well start straight (the real robot
-    # does), and the springs are what bring it here.
+    # Elbow bend (deg) of the pose the springs pull toward. Purely a *desire*: the
+    # arm boots with the elbow straight (as the real robot does) and is never
+    # commanded here. The springs bend it toward this pose as soon as commanded
+    # motion brings the hand somewhere the elbow has room to fold.
     rest_elbow_bend_deg: float = 90.0
 
-    # Speed of the startup move from wherever the arm booted to the rest pose.
-    # 1.5 deg/tick at 50 Hz is 75 deg/s, so a straight arm reaches a 90 deg elbow
-    # in a little over a second.
-    home_rate_deg_per_tick: float = 1.5
 
     # Pose driver: "scripted" (headless deterministic motion, default),
     # "keyboard" (single-char terminal control), or "openxr" (Phase 2 VR).
