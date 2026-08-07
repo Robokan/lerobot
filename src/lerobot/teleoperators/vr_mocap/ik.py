@@ -69,6 +69,11 @@ _WEIGHT_FLOOR = 0.02
 # actually keep the arm away from here; this is just the backstop.
 ELBOW_SINGULARITY_FLOOR_RAD = math.radians(3.0)
 
+# Elbow bend of the rest pose the springs pull toward. Independent of wherever the
+# arm actually starts: the real robot powers up straight, and the whole point is
+# for it to *want* to come off that straight configuration.
+DEFAULT_REST_ELBOW_BEND_RAD = math.radians(90.0)
+
 # Index of the elbow within the J1..J7 vectors.
 _ELBOW_IDX = 3
 
@@ -249,6 +254,7 @@ class IKSolver:
         reach_span_m: float = DEFAULT_REACH_SPAN_M,
         homing_boost: float = DEFAULT_HOMING_BOOST,
         homing_scale_rad: float = DEFAULT_HOMING_SCALE_RAD,
+        rest_elbow_bend_rad: float = DEFAULT_REST_ELBOW_BEND_RAD,
         ori_pos_tradeoff: float = _ORI_TO_POS_M_PER_RAD,
         max_delta_per_call_rad: float = DEFAULT_MAX_DELTA_PER_CALL_RAD,
     ):
@@ -281,9 +287,7 @@ class IKSolver:
         self.homing_scale_rad = float(homing_scale_rad)
         self.ori_pos_tradeoff = float(ori_pos_tradeoff)
         self.max_delta_per_call_rad = float(max_delta_per_call_rad)
-        # Rest pose per side, captured the first time that arm is solved (i.e. the
-        # pose the arm is holding when teleop starts).
-        self._rest_q: dict[str, np.ndarray] = {}
+        self.rest_elbow_bend_rad = float(rest_elbow_bend_rad)
 
         self.left_tcp_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, LEFT_TCP_BODY)
         self.right_tcp_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, RIGHT_TCP_BODY)
@@ -304,6 +308,17 @@ class IKSolver:
         # Keep the elbow off dead-straight (see ELBOW_SINGULARITY_FLOOR_RAD).
         for lows in self.limits_low.values():
             lows[_ELBOW_IDX] = max(float(lows[_ELBOW_IDX]), elbow_floor_rad)
+
+        # Pose the springs pull toward. Deliberately a fixed, configured pose --
+        # NOT wherever the arm happened to be when teleop started. The real robot
+        # powers up with the elbow straight, which is a singularity, so capturing
+        # the start pose would make the springs hold the arm in the one
+        # configuration it most needs to leave.
+        self._rest_q: dict[str, np.ndarray] = {}
+        for side in self.joint_ids:
+            r = np.zeros(7)
+            r[_ELBOW_IDX] = self.rest_elbow_bend_rad
+            self._rest_q[side] = np.clip(r, self.limits_low[side], self.limits_high[side])
         self.finger_qpos_idx = {
             "left": [
                 model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)]
@@ -334,10 +349,6 @@ class IKSolver:
         hi = self.limits_high[side]
         jids = self.joint_ids[side]
 
-        # The pose this arm was holding when teleop began is "home" for the
-        # rest-pose bias below.
-        if side not in self._rest_q:
-            self._rest_q[side] = np.array([self.data.qpos[qi] for qi in idx])
         q_rest = self._rest_q[side]
         q_start = np.array([self.data.qpos[qi] for qi in idx])
 
@@ -367,7 +378,18 @@ class IKSolver:
 
         for _ in range(max_iter):
             pos_err, ori_err, score = pose_error()
-            if np.linalg.norm(np.concatenate([pos_err, ori_err])) < 1e-4:
+            # Converged only when the pose is reached AND the springs are satisfied.
+            # Testing the pose alone would exit on the first iteration whenever the
+            # hand already sits on its target -- which is the state the arm boots
+            # in -- so the springs would never run and a straight arm would stay
+            # straight forever.
+            spring_disp = self.spring_weights * (
+                np.array([self.data.qpos[qi] for qi in idx]) - q_rest
+            )
+            if (
+                np.linalg.norm(np.concatenate([pos_err, ori_err])) < 1e-4
+                and np.linalg.norm(spring_disp) < 1e-3
+            ):
                 break
 
             # How far out of reach the target is, 0 (tracking fine) .. 1 (hopeless).
@@ -500,6 +522,17 @@ class IKSolver:
         val = float(np.clip(val, 0.0, FINGER_OPEN_M))
         for idx in self.finger_qpos_idx[side]:
             self.data.qpos[idx] = val
+
+    def rest_pose(self, side):
+        """The pose the springs pull toward, for ``side`` (7 joint angles, rad)."""
+        return self._rest_q[side].copy()
+
+    def set_joint_positions(self, side, q):
+        """Write the 7 arm joint angles for ``side`` (rad), clamped to limits."""
+        q = np.clip(q, self.limits_low[side], self.limits_high[side])
+        for k, qi in enumerate(self.qpos_idx[side]):
+            self.data.qpos[qi] = float(q[k])
+        self._mujoco.mj_forward(self.model, self.data)
 
     def joint_positions(self, side):
         """Read the 7 arm joint angles (rad) for ``side`` in J1..J7 order."""

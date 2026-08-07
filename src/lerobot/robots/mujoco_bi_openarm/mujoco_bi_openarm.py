@@ -191,7 +191,8 @@ class MujocoBiOpenArm(Robot):
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
         mujoco.mj_forward(self._model, self._data)
-        apply_base_pose(mujoco, self._model, self._data, self.config.base_elbow_bend_deg)
+        if self.config.start_elbow_bend_deg:
+            apply_base_pose(mujoco, self._model, self._data, self.config.start_elbow_bend_deg)
 
         # Substeps so one send_action advances ~ 1/fps of sim time.
         if self.config.sim_substeps is not None:

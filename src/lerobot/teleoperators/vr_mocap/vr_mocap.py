@@ -36,7 +36,7 @@ import os
 
 import numpy as np
 
-from lerobot.robots.mujoco_bi_openarm import apply_base_pose, gripper_m_to_deg
+from lerobot.robots.mujoco_bi_openarm import gripper_m_to_deg
 from lerobot.lerobot_types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -67,6 +67,7 @@ class VRMocap(Teleoperator):
         self._ik = None
         self._source = None
         self._grip_m: dict[str, float] = {s: 0.0 for s in SIDES}
+        self._homing = False
         self._connected = False
 
     @property
@@ -102,9 +103,6 @@ class VRMocap(Teleoperator):
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
         mujoco.mj_forward(self._model, self._data)
-        # Same base pose as the robot, so the IK does not start solving from the
-        # straight-arm singularity (and q_rest below is that pose).
-        apply_base_pose(mujoco, self._model, self._data, self.config.base_elbow_bend_deg)
         self._ik = IKSolver(
             self._model,
             self._data,
@@ -114,12 +112,16 @@ class VRMocap(Teleoperator):
             max_step_rad=math.radians(self.config.max_step_deg),
             spring_weights=self.config.spring_weights,
             spring_gain=self.config.spring_gain,
+            rest_elbow_bend_rad=math.radians(self.config.rest_elbow_bend_deg),
         )
 
         self._source = self._make_source()
-        initial_ee = {s: self._ik.get_ee_pose(s) for s in SIDES}
-        self._source.reset(initial_ee)
         self._source.start()
+        # The arm may boot anywhere -- the real robot powers up with the elbow
+        # straight, which is a singularity. Walk to the rest pose first, then hand
+        # over to the pose source. Reset the source only once that is done, so its
+        # targets are anchored on the homed pose rather than the boot pose.
+        self._homing = True
 
         self._connected = True
         logger.info("%s connected (driver=%s).", self, self.config.driver)
@@ -159,9 +161,36 @@ class VRMocap(Teleoperator):
     def setup_motors(self) -> None:
         pass
 
+    def _home_step(self) -> bool:
+        """Move the IK model one rate-limited step toward the rest pose.
+
+        Joint-space interpolation rather than an IK solve, because the whole point
+        is to change the arm's configuration -- from a straight, singular boot pose
+        to the bent rest pose -- which necessarily moves the hand. Returns True once
+        the rest pose is reached.
+        """
+        ik = self._ik
+        step = math.radians(self.config.home_rate_deg_per_tick)
+        done = True
+        for side in SIDES:
+            q = ik.joint_positions(side)
+            err = ik.rest_pose(side) - q
+            if np.max(np.abs(err)) > math.radians(0.5):
+                done = False
+            ik.set_joint_positions(side, q + np.clip(err, -step, step))
+        return done
+
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         ik = self._ik
+
+        if self._homing:
+            if self._home_step():
+                self._homing = False
+                self._source.reset({s: ik.get_ee_pose(s) for s in SIDES})
+                logger.info("Homed to rest pose; teleop control active.")
+            return self._joint_action()
+
         current_ee = {s: ik.get_ee_pose(s) for s in SIDES}
         targets = self._source.get_targets(current_ee)
 
@@ -173,9 +202,13 @@ class VRMocap(Teleoperator):
             ik.set_finger(side, tgt.gripper_m)
             self._grip_m[side] = float(tgt.gripper_m)
 
+        return self._joint_action()
+
+    def _joint_action(self) -> RobotAction:
+        """Current IK joint angles as the 16-key right-first wire action."""
         action: dict[str, float] = {}
         for side in SIDES:
-            joints_rad = ik.joint_positions(side)
+            joints_rad = self._ik.joint_positions(side)
             for i, motor in enumerate(ARM_JOINT_NAMES):
                 action[f"{side}_{motor}.pos"] = float(joints_rad[i]) * _RAD2DEG
             action[f"{side}_gripper.pos"] = gripper_m_to_deg(self._grip_m[side])
