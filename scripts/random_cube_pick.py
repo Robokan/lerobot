@@ -1988,7 +1988,10 @@ def main() -> None:
         t = 0
         while t < max_trials:
             t += 1
-            print(f"\n=== Trial {t}/{max_trials} ===")
+            if target_eps:
+                print(f"\n=== Trial {t} — episodes saved {successes}/{target_eps} (trial cap {max_trials}) ===")
+            else:
+                print(f"\n=== Trial {t}/{max_trials} ===")
             cube0, arm = place_reachable_cube(robot, iks, rng)
             ik = iks[arm.side]
             used[arm.side] += 1
