@@ -1031,6 +1031,7 @@ class EpisodeRecorder:
 
     def __init__(self, robot: MujocoBiOpenArm, repo_id: str, fps: int, task: str):
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.utils.constants import HF_LEROBOT_HOME
         from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
         self.robot = robot
@@ -1039,14 +1040,34 @@ class EpisodeRecorder:
             hw_to_dataset_features(robot.observation_features, "observation", True),
             hw_to_dataset_features(robot.action_features, "action", True),
         )
-        self.dataset = LeRobotDataset.create(
-            repo_id,
-            fps,
-            robot_type=robot.name,
-            features=self.features,
-            use_videos=True,
-            image_writer_threads=4 * max(1, len(robot.cameras)),
-        )
+        if (HF_LEROBOT_HOME / repo_id).exists():
+            # Append to the existing dataset (generation happens in chunks).
+            self.dataset = LeRobotDataset.resume(
+                repo_id,
+                root=HF_LEROBOT_HOME / repo_id,
+                image_writer_threads=4 * max(1, len(robot.cameras)),
+            )
+            missing = set(self.features) - set(self.dataset.features)
+            if missing:
+                raise ValueError(
+                    f"Existing dataset '{repo_id}' lacks features {sorted(missing)} — "
+                    "it was probably recorded with a different --cameras setting. "
+                    "Use a new repo id (or delete the old dataset)."
+                )
+            print(
+                f"  appending to existing dataset ({self.dataset.num_episodes} episodes so far). "
+                "NOTE: use a different --seed than previous runs or the same cube "
+                "sequence will be repeated."
+            )
+        else:
+            self.dataset = LeRobotDataset.create(
+                repo_id,
+                fps,
+                robot_type=robot.name,
+                features=self.features,
+                use_videos=True,
+                image_writer_threads=4 * max(1, len(robot.cameras)),
+            )
         self.active = False
 
     def tick(self, action: dict) -> None:
