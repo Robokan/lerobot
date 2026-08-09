@@ -157,12 +157,22 @@ from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.keyboard_input import init_keyboard_listener
+from lerobot.utils.keyboard_input import apply_recording_control, init_keyboard_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
+
+
+def _drain_viewer_recording_controls(events: dict) -> None:
+    """Apply Y/T/n/q keys typed into the MuJoCo viewer (focus steals stdin)."""
+    try:
+        from lerobot.robots.mujoco_bi_openarm.viewer_keys import drain_recording_controls
+    except Exception:  # noqa: BLE001
+        return
+    for control in drain_recording_controls():
+        apply_recording_control(control, events)
 from lerobot.utils.visualization_utils import (
     init_visualization,
     log_visualization_data,
@@ -278,16 +288,24 @@ def record_loop(
             )
 
     control_interval = 1 / fps
+    # None / <=0 means no wall-clock limit (Y/T-gated capture runs until T/n/q).
+    if control_time_s is None or control_time_s <= 0:
+        control_time_s = float("inf")
 
+    # When a dataset is attached, frames are gated on events["recording_active"]
+    # (Y starts, T/n stops). Reset loops pass dataset=None and use a wall clock
+    # from loop entry like before.
+    gated = dataset is not None
     no_action_count = 0
-    timestamp = 0
-    start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
-        start_loop_t = time.perf_counter()
+    timestamp = 0.0
+    start_episode_t: float | None = None if gated else time.perf_counter()
+    was_recording = False
+    last_slow_warn_t = 0.0
+    slow_warn_interval_s = 2.0
+    has_episode_time_limit = control_time_s != float("inf")
 
-        if events["exit_early"]:
-            events["exit_early"] = False
-            break
+    while True:
+        start_loop_t = time.perf_counter()
 
         # Get robot observation
         obs = robot.get_observation()
@@ -298,11 +316,12 @@ def record_loop(
         if dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-        # Get action from teleop
+        # Get action from teleop *before* draining Y/T: KeyboardPoseSource queues
+        # viewer recording keys inside get_action/send_feedback.
         if isinstance(teleop, Teleoperator):
             act = teleop.get_action()
-            if robot.name == "unitree_g1":
-                teleop.send_feedback(obs)
+            # Most teleops no-op; OpenXR vr_mocap uses this for the headset camera feed.
+            teleop.send_feedback(obs)
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
@@ -326,7 +345,64 @@ def record_loop(
                     "This is likely to happen when resetting the environment without a teleop device. "
                     "The robot won't be at its rest position at the start of the next episode."
                 )
+            _drain_viewer_recording_controls(events)
+            if events["exit_early"] or events["stop_recording"]:
+                events["exit_early"] = False
+                events["recording_active"] = False
+                break
             continue
+
+        _drain_viewer_recording_controls(events)
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            events["recording_active"] = False
+            break
+        if events["stop_recording"]:
+            events["recording_active"] = False
+            break
+
+        if gated:
+            if events.get("recording_active"):
+                if not was_recording:
+                    start_episode_t = time.perf_counter()
+                    was_recording = True
+                    ep_idx = dataset.num_episodes
+                    limit_msg = (
+                        f"Optional max duration: {control_time_s}s."
+                        if has_episode_time_limit
+                        else "No time limit — press T to stop and save."
+                    )
+                    print(
+                        f"\n>>> RECORDING STARTED — episode {ep_idx} "
+                        f"(repo_id={dataset.repo_id})\n"
+                        f"    {limit_msg}\n",
+                        flush=True,
+                    )
+                    log_say("Recording started", play_sounds=False)
+                    logging.info(
+                        "Recording started: episode %s → %s",
+                        ep_idx,
+                        dataset.root,
+                    )
+                assert start_episode_t is not None
+                timestamp = time.perf_counter() - start_episode_t
+                if has_episode_time_limit and timestamp >= control_time_s:
+                    events["recording_active"] = False
+                    print(
+                        f"\n>>> RECORDING STOPPED — episode time limit "
+                        f"({control_time_s}s) reached; saving…\n",
+                        flush=True,
+                    )
+                    logging.info("Episode time limit reached — saving.")
+                    break
+            else:
+                was_recording = False
+        else:
+            assert start_episode_t is not None
+            timestamp = time.perf_counter() - start_episode_t
+            if timestamp >= control_time_s:
+                break
 
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
@@ -334,8 +410,8 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        # Write to dataset
-        if dataset is not None:
+        # Write to dataset only while recording is armed (Y…T).
+        if dataset is not None and events.get("recording_active"):
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
@@ -352,13 +428,20 @@ def record_loop(
 
         sleep_time_s: float = control_interval - dt_s
         if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
+            now = time.perf_counter()
+            if now - last_slow_warn_t >= slow_warn_interval_s:
+                last_slow_warn_t = now
+                logging.warning(
+                    "Record loop is running slower (%.1f Hz) than the target FPS (%s Hz). "
+                    "Dataset timestamps assume %s Hz — lower --dataset.fps (e.g. 30) or use "
+                    "CAMERAS=0 / close the viewer if you need a steadier rate. "
+                    "Common causes: camera renders, viewer GL, disk image writes.",
+                    1 / dt_s,
+                    fps,
+                    fps,
+                )
 
         precise_sleep(max(sleep_time_s, 0.0))
-
-        timestamp = time.perf_counter() - start_episode_t
 
 
 @parser.wrap()
@@ -472,7 +555,24 @@ def record(
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                events["recording_active"] = False
+                events["exit_early"] = False
+                ep_idx = dataset.num_episodes
+                print(
+                    f"\n=== Episode {ep_idx} ready "
+                    f"(will save as episode-{ep_idx:06d} under {dataset.root}) ===\n"
+                    f"    repo_id: {dataset.repo_id}\n"
+                    f"    Press Y to START recording, T to STOP and save.\n"
+                    f"    (n=end early, Left arrow=re-record, q=quit; "
+                    f"letter r is teleop +z, not re-record)\n",
+                    flush=True,
+                )
+                log_say(f"Ready for episode {ep_idx}. Press Y to start.", cfg.play_sounds)
+                logging.info(
+                    "Press Y to start recording episode %s (%s), T to stop and save.",
+                    ep_idx,
+                    dataset.repo_id,
+                )
                 record_loop(
                     robot=robot,
                     events=events,
@@ -495,6 +595,7 @@ def record(
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
+                    events["recording_active"] = False
 
                     record_loop(
                         robot=robot,
@@ -514,19 +615,81 @@ def record(
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
+                    events["recording_active"] = False
                     dataset.clear_episode_buffer()
                     continue
 
-                dataset.save_episode()
+                # Only save when the episode buffer has frames (Y…T / timeout).
+                if not dataset.has_pending_frames():
+                    print(
+                        "\n>>> No frames captured — nothing saved. Press Y to start recording.\n",
+                        flush=True,
+                    )
+                    logging.warning("No frames captured for this episode — skipping save.")
+                    if events["stop_recording"]:
+                        break
+                    continue
+
+                ep_idx = dataset.num_episodes
+                n_frames = (
+                    dataset.writer.episode_buffer["size"]
+                    if dataset.writer is not None and dataset.writer.episode_buffer is not None
+                    else 0
+                )
+                print(
+                    f"\n>>> RECORDING STOPPED — saving episode {ep_idx} "
+                    f"({n_frames} frames)…\n",
+                    flush=True,
+                )
+                # Sequential video encode: ProcessPool after MuJoCo viewer/GL init
+                # deadlocks on this box (fork + OpenGL), looking like a freeze on Map:.
+                print(
+                    "\n>>> Encoding videos (sequential — may take a bit for long episodes)…\n",
+                    flush=True,
+                )
+                dataset.save_episode(parallel_encoding=False)
                 recorded_episodes += 1
+                print(
+                    f"\n>>> SAVED episode {ep_idx} as:\n"
+                    f"    repo_id : {dataset.repo_id}\n"
+                    f"    path    : {dataset.root}\n"
+                    f"    episode : episode-{ep_idx:06d}  ({n_frames} frames)\n"
+                    f"    total episodes in dataset: {dataset.num_episodes}\n",
+                    flush=True,
+                )
+                logging.info(
+                    "Saved episode %s (%s frames) to %s (repo_id=%s)",
+                    ep_idx,
+                    n_frames,
+                    dataset.root,
+                    dataset.repo_id,
+                )
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        # Persist any unsaved frames before viewer disconnect / os._exit.
+        if dataset is not None and dataset.has_pending_frames():
+            try:
+                ep_idx = dataset.num_episodes
+                n_frames = dataset.writer.episode_buffer["size"]
+                print(
+                    f"\n>>> Flushing unsaved episode {ep_idx} ({n_frames} frames) on exit…\n",
+                    flush=True,
+                )
+                dataset.save_episode(parallel_encoding=False)
+                print(
+                    f"\n>>> SAVED episode {ep_idx} as:\n"
+                    f"    repo_id : {dataset.repo_id}\n"
+                    f"    path    : {dataset.root}\n"
+                    f"    episode : episode-{ep_idx:06d}  ({n_frames} frames)\n",
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001
+                logging.exception("Failed to flush pending episode on exit")
 
         if dataset:
             dataset.finalize()
 
-        if robot.is_connected:
-            robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()
 
@@ -543,6 +706,11 @@ def record(
                 logging.warning("No episodes saved — skipping push to hub")
 
         log_say("Exiting", cfg.play_sounds)
+
+        # Disconnect robot last: VIEWER=1 registers atexit(os._exit) which skips
+        # remaining cleanup if we disconnect earlier.
+        if robot.is_connected:
+            robot.disconnect()
     return dataset
 
 

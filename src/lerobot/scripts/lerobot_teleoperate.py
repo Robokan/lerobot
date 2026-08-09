@@ -197,8 +197,8 @@ def teleop_loop(
         # given that it is the identity processor as default
         obs = robot.get_observation()
 
-        if robot.name == "unitree_g1":
-            teleop.send_feedback(obs)
+        # Most teleops no-op; OpenXR vr_mocap uses this for the headset camera feed.
+        teleop.send_feedback(obs)
 
         # Get teleop action
         raw_action = teleop.get_action()

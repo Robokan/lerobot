@@ -80,6 +80,8 @@ class VRMocap(Teleoperator):
 
     @property
     def feedback_features(self) -> dict[str, type]:
+        # OpenXR consumes RGB observation images (ego / wrists) for the headset
+        # view; other drivers ignore send_feedback.
         return {}
 
     @property
@@ -182,9 +184,18 @@ class VRMocap(Teleoperator):
             action[f"{side}_gripper.pos"] = gripper_m_to_deg(self._grip_m[side])
         return action
 
-    def send_feedback(self, feedback: dict[str, float]) -> None:
-        # No haptics for the sim teleoperator.
-        pass
+    def send_feedback(self, feedback: dict) -> None:
+        """Forward robot observation images to the OpenXR headset view."""
+        source = self._source
+        if source is None or not hasattr(source, "update_camera_frames"):
+            return
+        frames = {
+            key: value
+            for key, value in feedback.items()
+            if isinstance(value, np.ndarray) and getattr(value, "ndim", 0) == 3
+        }
+        if frames:
+            source.update_camera_frames(frames)
 
     @check_if_not_connected
     def disconnect(self) -> None:

@@ -169,6 +169,30 @@ def quat_inv(q):
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
+def quat_rotate(q, v):
+    """Rotate vector ``v`` by unit quaternion ``q`` [w, x, y, z]."""
+    # q v q^{-1} via the standard sandwich product.
+    qv = np.array([0.0, v[0], v[1], v[2]])
+    return quat_mul(quat_mul(q, qv), quat_inv(q))[1:]
+
+
+# TCP body pose relative to ``openarm_<side>_hand`` in the MuJoCo model
+# (``pos="0 0 0.08"``). Wrist/keyboard rotations pivot about the hand origin,
+# not the TCP tip 8 cm out — holding the tip fixed made the wrist orbit it and
+# the apparent center change with each rotation axis.
+TCP_OFFSET_IN_HAND_M = np.array([0.0, 0.0, 0.08])
+
+
+def hand_pos_from_tcp(tcp_pos, tcp_quat):
+    """World hand origin from TCP pose (inverse of the fixed hand→TCP offset)."""
+    return np.asarray(tcp_pos, dtype=float) - quat_rotate(tcp_quat, TCP_OFFSET_IN_HAND_M)
+
+
+def tcp_pos_from_hand(hand_pos, tcp_quat):
+    """World TCP position that keeps ``hand_pos`` fixed at the given orientation."""
+    return np.asarray(hand_pos, dtype=float) + quat_rotate(tcp_quat, TCP_OFFSET_IN_HAND_M)
+
+
 def mat_to_axis_angle(R):
     """Rotation matrix -> axis*angle (rotation vector)."""
     angle = math.acos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
@@ -350,6 +374,12 @@ class IKSolver:
         jids = self.joint_ids[side]
 
         q_rest = self._rest_q[side]
+        # Enforce joint limits (incl. elbow singularity floor) before iterating.
+        # A qpos below ``lo`` would be clipped on the first step, move XYZ, then
+        # get reverted by the progress guard -- freezing the arm at an illegal
+        # configuration (seen at the straight hang pose).
+        for k, qi in enumerate(idx):
+            self.data.qpos[qi] = np.clip(self.data.qpos[qi], lo[k], hi[k])
         q_start = np.array([self.data.qpos[qi] for qi in idx])
 
         tgt_mat = np.zeros(9)
@@ -417,34 +447,66 @@ class IKSolver:
             Jr = jacr[:, dof_idx]
             q = np.array([self.data.qpos[qi] for qi in idx])
 
-            # Two-pass weighted least-norm. Pass 1 finds which way each joint
-            # wants to travel; pass 2 re-solves with joints that are heading into
-            # a nearby limit down-weighted, so the load moves to the next joint
-            # out (wrist -> elbow -> shoulder) smoothly instead of in one jump.
-            dq = self._priority_solve(
-                Jp, Jr, pos_err, ori_err, self.joint_weights, q, q_rest, reach_deficit
-            )
-            weights = (
-                self.joint_weights
-                * self._limit_taper(q, lo, hi, dq)
-                * self._homing_boost(q, q_rest, dq)
-            )
-            dq = self._priority_solve(Jp, Jr, pos_err, ori_err, weights, q, q_rest, reach_deficit)
+            # Default: full 6-DoF priority solve (position + orientation + springs).
+            # A hard "position only in null(Jr)" lock made most axes undriveable
+            # from the hang pose (especially +z). Prefer orientation with a high
+            # task weight instead, and reject a step only if it *worsens* wrist
+            # attitude beyond a small tolerance — that still stops a twist-to-
+            # reach cheat without freezing ordinary translation.
+            #
+            # When the TCP is already on target and only orientation remains
+            # (pure wrist keys after the pose source rewrote the tip on a sphere
+            # about the hand), put orientation in null(Jp) so we don't shove XYZ
+            # to chase a twist.
+            pos_n = float(np.linalg.norm(pos_err))
+            ori_n = float(np.linalg.norm(ori_err))
+            hold_pos = pos_n < 0.008 and ori_n > 1e-4
+            if hold_pos:
+                ori_err = _clamp_norm(ori_err, min(self.max_ori_err_rad * 1.6, math.radians(8.0)))
+                N = _nullspace_projector(Jp)
+                dq_pos = self._weighted_dls(Jp, pos_err, np.ones(7), self.dls_lambda)
+                dq_ori = N @ self._weighted_dls(Jr, ori_err, self.joint_weights, self.dls_lambda)
+                dq = dq_pos + dq_ori
+            else:
+                # Orientation rows weighted up so translation prefers solutions
+                # that keep the wrist attitude.
+                ori_w = 8.0
+                J = np.vstack([Jp, ori_w * Jr])
+                dx = np.concatenate([pos_err, ori_w * ori_err])
+                dq = self._weighted_dls(J, dx, self.joint_weights, self.dls_lambda)
+                weights = (
+                    self.joint_weights
+                    * self._limit_taper(q, lo, hi, dq)
+                    * self._homing_boost(q, q_rest, dq)
+                )
+                dq = self._weighted_dls(J, dx, weights, self.dls_lambda)
+                spring = -self.spring_gain * self.spring_weights * (q - q_rest)
+                # Springs in the nullspace of the weighted task so they cannot
+                # buy rest-pose relaxation by twisting the wrist.
+                dq = dq + _nullspace_projector(J) @ spring
 
             dq = np.clip(dq, -self.max_step_rad, self.max_step_rad)
 
             for k, qi in enumerate(idx):
                 self.data.qpos[qi] = np.clip(q[k] + dq[k], lo[k], hi[k])
 
-            # Only keep a step that actually improved the pose. Once the target
-            # is out of reach -- wrist wound to its stop, say -- the linearized
-            # step stops helping and the joints would otherwise thrash against
-            # their limits (the source of the remaining jumps and drift). Undo
-            # and stop instead: the arm rotates as far as it can and holds.
-            if pose_error()[2] > score:
-                for k, qi in enumerate(idx):
-                    self.data.qpos[qi] = q[k]
-                break
+            new_pos_err, new_ori_err, new_score = pose_error()
+            if hold_pos:
+                if float(np.linalg.norm(new_pos_err)) > pos_n + 0.003:
+                    for k, qi in enumerate(idx):
+                        self.data.qpos[qi] = q[k]
+                    break
+            else:
+                # Soft no-twist: allow motion, but undo a step that makes the
+                # wrist attitude clearly worse than before.
+                if float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0):
+                    for k, qi in enumerate(idx):
+                        self.data.qpos[qi] = q[k]
+                    break
+                if new_score > score:
+                    for k, qi in enumerate(idx):
+                        self.data.qpos[qi] = q[k]
+                    break
 
         # Rate-limit the tick as a whole, then settle the model on the result.
         lim = self.max_delta_per_call_rad

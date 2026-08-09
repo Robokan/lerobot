@@ -37,6 +37,7 @@ Layout/unit conversions mirror the real follower wire format:
   needed — that is the dict-keyed equivalent of ``replay_episode._swap_halves``).
 """
 
+import atexit
 import logging
 import math
 import os
@@ -125,6 +126,11 @@ class MujocoBiOpenArm(Robot):
         self._data = None
         self._substeps = 1
         self._viewer = None
+        # Set when a viewer has been opened; used to skip the broken MuJoCo 3.9
+        # aarch64 GL teardown that SIGSEGVs at interpreter exit (see disconnect).
+        self._viewer_was_opened = False
+        # Viewer fixed-camera cycle index (0 = free orbit). Advanced by keyboard `c`.
+        self._viewer_cam_idx = 0
 
         # Per-(side, joint) actuator/qpos book-keeping, filled at connect().
         self._arm_ctrl: dict[tuple[str, str], dict[str, Any]] = {}
@@ -190,6 +196,9 @@ class MujocoBiOpenArm(Robot):
         logger.info("Loading MuJoCo model: %s", model_path)
         self._model = mujoco.MjModel.from_xml_path(model_path)
         self._data = mujoco.MjData(self._model)
+        if self.config.disable_collisions:
+            self._model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+            logger.info("MuJoCo contacts disabled (disable_collisions=True).")
         mujoco.mj_forward(self._model, self._data)
         if self.config.start_elbow_bend_deg:
             apply_base_pose(mujoco, self._model, self._data, self.config.start_elbow_bend_deg)
@@ -215,17 +224,64 @@ class MujocoBiOpenArm(Robot):
 
     def _open_viewer(self) -> None:
         """Open the passive viewer, framed on the arms like the SparkJAX rig."""
+        import mujoco
         import mujoco.viewer
 
+        from .viewer_keys import push_glfw_key
+
         self._viewer = mujoco.viewer.launch_passive(
-            self._model, self._data, show_left_ui=False, show_right_ui=False
+            self._model,
+            self._data,
+            show_left_ui=False,
+            show_right_ui=False,
+            # Forward keys from the viewer window to keyboard teleop (stdin is
+            # idle while the MuJoCo window has focus).
+            key_callback=push_glfw_key,
         )
         cam = self._viewer.cam
         cam.azimuth = 0.0
         cam.elevation = -9.0
         cam.lookat[2] = 0.4
         cam.distance = 1.0
-        logger.info("MuJoCo viewer opened (close the window or Ctrl-C to stop).")
+        # Draw camera frustums so ego (torso) + wrist mounts are visible in free
+        # orbit; toggle with the viewer's usual camera-vis shortcut if needed.
+        self._viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CAMERA] = True
+        self._viewer_was_opened = True
+        self._viewer_cam_idx = 0
+        logger.info(
+            "MuJoCo viewer opened (close the window or Ctrl-C to stop). "
+            "Press 'c' to cycle ego / right_wrist / left_wrist / free."
+        )
+
+    # Fixed cameras in the OpenArm scene, matching the VR headset toggles
+    # (ego / right / left) plus the default free orbit view.
+    _VIEWER_CAM_CYCLE = ("free", "ego_camera", "right_wrist_camera", "left_wrist_camera")
+
+    def _apply_viewer_camera_cycles(self) -> None:
+        """Honor pending `c` key presses: cycle the passive viewer camera."""
+        if self._viewer is None:
+            return
+        from .viewer_keys import drain_camera_cycles
+
+        n = drain_camera_cycles()
+        if n <= 0:
+            return
+        import mujoco
+
+        # One step per control tick even if key-repeat queued several `c`s.
+        self._viewer_cam_idx = (self._viewer_cam_idx + 1) % len(self._VIEWER_CAM_CYCLE)
+        name = self._VIEWER_CAM_CYCLE[self._viewer_cam_idx]
+        if name == "free":
+            self._viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            logger.info("Viewer camera -> free orbit")
+            return
+        cid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_CAMERA, name)
+        if cid < 0:
+            logger.warning("Viewer camera '%s' not found in model", name)
+            return
+        self._viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+        self._viewer.cam.fixedcamid = int(cid)
+        logger.info("Viewer camera -> %s", name)
 
     def _build_index_maps(self, mujoco) -> None:
         """Resolve MuJoCo joint/actuator ids for the 16 logical DOF."""
@@ -352,7 +408,17 @@ class MujocoBiOpenArm(Robot):
             mujoco.mj_step(self._model, d)
 
         if self._viewer is not None:
-            self._viewer.sync()
+            self._apply_viewer_camera_cycles()
+            if self._viewer.is_running():
+                self._viewer.sync()
+            else:
+                # Window closed by the user — drop the handle so we don't keep
+                # syncing a dead viewer (can SIGSEGV on some MuJoCo builds).
+                try:
+                    self._viewer.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("viewer close after is_running=False failed", exc_info=True)
+                self._viewer = None
 
         # Echo the joint commands actually applied (degrees), like the real robot.
         sent: dict[str, float] = {}
@@ -371,7 +437,8 @@ class MujocoBiOpenArm(Robot):
                 logger.debug("camera disconnect failed", exc_info=True)
         if self._viewer is not None:
             try:
-                self._viewer.close()
+                if self._viewer.is_running():
+                    self._viewer.close()
             except Exception:  # noqa: BLE001
                 logger.debug("viewer close failed", exc_info=True)
             self._viewer = None
@@ -379,4 +446,11 @@ class MujocoBiOpenArm(Robot):
         self._data = None
         self._model = None
         self._connected = False
+
+        # MuJoCo 3.9.0 on this aarch64 box SIGSEGVs in GL teardown at interpreter
+        # exit whenever a viewer was opened (reproducible with plain mujoco, no
+        # lerobot). Apport then writes ~1GB crash dumps per run. Skip remaining
+        # atexit/GL destructors with os._exit after a clean disconnect.
+        if self._viewer_was_opened and os.environ.get("MUJOCO_SAFE_EXIT_AFTER_VIEWER", "0") == "1":
+            atexit.register(os._exit, 0)
         logger.info("%s disconnected.", self)

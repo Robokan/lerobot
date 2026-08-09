@@ -22,17 +22,21 @@ from lerobot.cameras.mujoco import MujocoCameraConfig
 from ..config import RobotConfig
 
 # Default MuJoCo scene shipped in the openarm_mujoco repo (arms + floor +
-# front/side tracking cameras). Override via `--robot.model_path=...`.
+# ego/wrist cameras matching the real rig). Override via `--robot.model_path=...`.
 DEFAULT_MODEL_PATH = "~/sparkpack/openarm_mujoco/v1/scene.xml"
 
 
 def _default_cameras() -> dict[str, CameraConfig]:
     # Keys are the dataset feature names; `mujoco_name` is the <camera> element
-    # in the model. The v1 scene only ships front/side fixed cameras (a richer
-    # ego/wrist scene is a later milestone, per the plan's "out of scope").
+    # in the model. Matches the real OpenArm ego + left/right wrist layout.
     return {
-        "front": MujocoCameraConfig(mujoco_name="front_camera", fps=50, width=640, height=480),
-        "side": MujocoCameraConfig(mujoco_name="side_camera", fps=50, width=640, height=480),
+        "ego": MujocoCameraConfig(mujoco_name="ego_camera", fps=50, width=640, height=480),
+        "left_wrist": MujocoCameraConfig(
+            mujoco_name="left_wrist_camera", fps=50, width=640, height=480
+        ),
+        "right_wrist": MujocoCameraConfig(
+            mujoco_name="right_wrist_camera", fps=50, width=640, height=480
+        ),
     }
 
 
@@ -75,6 +79,11 @@ class MujocoBiOpenArmConfig(RobotConfig):
     # (egl is offscreen-only and cannot present a window).
     viewer: bool = False
 
+    # Disable all MuJoCo contacts. Default False so arms collide with the table,
+    # themselves, and the cube (for grasping). Set True only for unit tests /
+    # kinematic debugging that need contacts off.
+    disable_collisions: bool = False
+
     # PD gains for the 7 arm joints (J1..J7), applied as torque on the model's
     # direct-drive `motor` actuators (tau = kp*(target-q) - kd*qdot, clamped to
     # the model forcerange). Mirrors the real follower's MIT-control gains.
@@ -84,5 +93,7 @@ class MujocoBiOpenArmConfig(RobotConfig):
     # Gains for finger joints that are driven as `motor` (torque) actuators in
     # the model (the left fingers). Position-type finger actuators (right
     # fingers) are commanded directly with the target opening in meters.
-    finger_kp: float = 2000.0
-    finger_kd: float = 50.0
+    # Left-arm fingers are torque actuators in the model; keep these stiff so a
+    # closed gripper keeps squeezing when an object blocks the travel.
+    finger_kp: float = 5000.0
+    finger_kd: float = 80.0

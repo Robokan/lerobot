@@ -153,19 +153,44 @@ def pynput_listener_is_trusted(listener, timeout_s: float = 1.0) -> bool:
 def apply_recording_control(control: str, events: dict) -> None:
     """Apply a recording control-flow key press to the shared ``events`` dict.
 
-    Centralizes the mapping so the ``pynput`` and terminal backends behave
-    identically. ``control`` is one of ``"right"`` (end the loop early), ``"left"``
-    (re-record the last episode), or ``"esc"`` (stop recording).
+    Centralizes the mapping so the ``pynput``, terminal, and MuJoCo-viewer
+    backends behave identically. ``control`` is one of:
+
+    * ``"y"`` — start capturing frames (SparkJAX-style)
+    * ``"t"`` — stop capturing and save the episode (SparkJAX-style)
+    * ``"right"`` / ``"n"`` — end the episode early (only while recording)
+    * ``"left"`` — re-record the last episode (Left arrow only; letter ``r`` is
+      reserved for keyboard teleop +z and must not discard the episode)
+    * ``"esc"`` / ``"q"`` — quit recording entirely
     """
-    if control == "right":
-        print("Right arrow key pressed. Exiting loop...")
-        events["exit_early"] = True
+    if control == "y":
+        if not events.get("recording_active"):
+            events["recording_active"] = True
+            print("\n[Y] Recording STARTED — capturing frames. Press T to stop.\n", flush=True)
+        else:
+            print("\n[Y] Already recording — press T to stop and save.\n", flush=True)
+    elif control == "t":
+        if events.get("recording_active"):
+            events["recording_active"] = False
+            events["exit_early"] = True
+            print("\n[T] Recording STOPPED — saving episode…\n", flush=True)
+        else:
+            print("\n[T] Not recording — press Y to start.\n", flush=True)
+    elif control == "right":
+        if events.get("recording_active"):
+            events["recording_active"] = False
+            events["exit_early"] = True
+            print("\n[n/→] Ending episode early — saving…\n", flush=True)
+        else:
+            print("\n[n/→] Ignored (not recording; press Y to start).\n", flush=True)
     elif control == "left":
-        print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+        print("\n[←] Re-record last episode (discarding buffer)…\n", flush=True)
+        events["recording_active"] = False
         events["rerecord_episode"] = True
         events["exit_early"] = True
     elif control == "esc":
-        print("Escape key pressed. Stopping data recording...")
+        print("\n[q/Esc] Quit recording session…\n", flush=True)
+        events["recording_active"] = False
         events["stop_recording"] = True
         events["exit_early"] = True
 
@@ -407,34 +432,43 @@ def init_keyboard_listener():
     * otherwise no listener (non-interactive / piped runs) — recording relies on
       the episode/reset timers (or Ctrl+C).
 
-    Both backends accept the same controls: Right/Left/Esc, plus the single-byte letter
-    equivalents ``n`` (next), ``r`` (re-record) and ``q`` (quit). The letters are the most
-    reliable choice over high-latency SSH/VNC links, where arrow-key escape sequences can
-    be split, delayed, or intercepted by the terminal.
+    Both backends accept the same controls: ``y``/``t`` (start/stop episode capture),
+    Right/``n`` (end early), Left arrow (re-record), Esc/``q`` (quit).
+
+    Letter ``r`` is intentionally *not* bound to re-record: keyboard teleop uses
+    ``r``/``f`` for +z/-z, and a global ``pynput`` listener would otherwise discard
+    the episode buffer on every upward move.
 
     Returns:
         A tuple ``(listener, events)`` where ``listener`` exposes ``.stop()`` or is
-        ``None``, and ``events`` is the dict of flags (``exit_early``,
-        ``rerecord_episode``, ``stop_recording``) set by key presses.
+        ``None``, and ``events`` is the dict of flags (``recording_active``,
+        ``exit_early``, ``rerecord_episode``, ``stop_recording``) set by key presses.
     """
     events = {
+        "recording_active": False,
         "exit_early": False,
         "rerecord_episode": False,
         "stop_recording": False,
     }
 
-    # Accept the single-byte letter equivalents n/r/q alongside the arrow/Esc keys: the
-    # letters are immune to the escape-sequence split/delay/interception that affects arrows
-    # over laggy SSH/VNC links. Case-insensitive so Shift+letter still works.
+    # Letter equivalents for arrows where they do not collide with teleop motion
+    # keys. Case-insensitive so Shift+letter still works.
     def on_key(name: str) -> None:
         key = name.lower()
-        if key in ("right", "n"):
+        if key == "y":
+            apply_recording_control("y", events)
+        elif key == "t":
+            apply_recording_control("t", events)
+        elif key in ("right", "n"):
             apply_recording_control("right", events)
-        elif key in ("left", "r"):
+        elif key == "left":
+            # Left arrow only — do NOT bind letter "r" (teleop +z).
             apply_recording_control("left", events)
         elif key in ("esc", "q"):
             apply_recording_control("esc", events)
-        # other keys (incl. up/down) are intentionally ignored
+        # other keys (incl. up/down and letter "r") are intentionally ignored
 
-    listener = create_key_listener(on_key, controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit")
+    listener = create_key_listener(
+        on_key, controls_help="Y=start T=stop, n=end early, Left=re-record, q=quit"
+    )
     return listener, events

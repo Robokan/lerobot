@@ -132,12 +132,63 @@ def test_pynput_listener_is_trusted(monkeypatch):
 
 # --- Control mapping --------------------------------------------------------
 def test_apply_recording_control():
-    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    events = {
+        "recording_active": False,
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
     apply_recording_control("left", events)
-    assert events == {"exit_early": True, "rerecord_episode": True, "stop_recording": False}
+    assert events == {
+        "recording_active": False,
+        "exit_early": True,
+        "rerecord_episode": True,
+        "stop_recording": False,
+    }
     apply_recording_control("esc", events)
     assert events["stop_recording"] is True
     apply_recording_control("up", events)  # unknown control -> no-op (no error)
+
+
+def test_apply_recording_control_y_start_t_stop():
+    """SparkJAX-style Y arms capture; T disarms and ends the episode for save."""
+    events = {
+        "recording_active": False,
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+    apply_recording_control("y", events)
+    assert events["recording_active"] is True
+    assert events["exit_early"] is False
+
+    apply_recording_control("y", events)  # already active — stay armed
+    assert events["recording_active"] is True
+
+    apply_recording_control("t", events)
+    assert events["recording_active"] is False
+    assert events["exit_early"] is True
+
+    events["exit_early"] = False
+    apply_recording_control("t", events)  # idle — no exit
+    assert events["exit_early"] is False
+    assert events["recording_active"] is False
+
+
+def test_apply_recording_control_n_only_while_active():
+    events = {
+        "recording_active": False,
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+    apply_recording_control("right", events)
+    assert events["exit_early"] is False
+
+    events["recording_active"] = True
+    apply_recording_control("right", events)
+    assert events["recording_active"] is False
+    assert events["exit_early"] is True
 
 
 # --- Terminal escape-sequence parsing (the tricky bit) ----------------------
@@ -189,17 +240,47 @@ def test_init_returns_none_without_tty(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("key", "flag"),
-    [("right", "exit_early"), ("r", "rerecord_episode"), ("q", "stop_recording")],
+    ("key", "flag", "pre"),
+    [
+        ("right", "exit_early", {"recording_active": True}),
+        ("left", "rerecord_episode", {}),
+        ("q", "stop_recording", {}),
+        ("y", "recording_active", {}),
+    ],
 )
-def test_init_terminal_key_routing(monkeypatch, key, flag):
+def test_init_terminal_key_routing(monkeypatch, key, flag, pre):
     """Arrows and their letter equivalents drive the same events (terminal backend)."""
     monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
     _set_tty(monkeypatch, is_tty=True)
     monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
     listener, events = init_keyboard_listener()
+    events.update(pre)
     listener._on_key(key)
     assert events[flag] is True
+
+
+def test_letter_r_does_not_rerecord(monkeypatch):
+    """Letter r is teleop +z; must not discard the episode via the global listener."""
+    monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
+    _set_tty(monkeypatch, is_tty=True)
+    monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
+    listener, events = init_keyboard_listener()
+    events["recording_active"] = True
+    listener._on_key("r")
+    assert events["rerecord_episode"] is False
+    assert events["exit_early"] is False
+    assert events["recording_active"] is True
+
+
+def test_init_terminal_key_routing_t_stops(monkeypatch):
+    monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
+    _set_tty(monkeypatch, is_tty=True)
+    monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
+    listener, events = init_keyboard_listener()
+    events["recording_active"] = True
+    listener._on_key("t")
+    assert events["recording_active"] is False
+    assert events["exit_early"] is True
 
 
 # --- Shared factory + pynput key resolver -----------------------------------

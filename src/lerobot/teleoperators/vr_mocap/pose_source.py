@@ -35,6 +35,7 @@ the OpenXR backend lives in a separate module and imports its deps lazily).
 
 import abc
 import logging
+import math
 import sys
 import threading
 from collections import deque
@@ -42,14 +43,30 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .ik import FINGER_OPEN_M, axis_angle_to_quat, quat_inv, quat_mul
+from .ik import (
+    FINGER_OPEN_M,
+    axis_angle_to_quat,
+    hand_pos_from_tcp,
+    quat_inv,
+    quat_mul,
+    tcp_pos_from_hand,
+)
 
 logger = logging.getLogger(__name__)
 
-# Per-tick increments (match SparkJAX test_vr_ik.py keyboard mode).
+# Per-keypress increments. SparkJAX used 0.04 rad/tick while a key was *held*
+# at ~50 Hz; our keyboard driver applies one step per discrete press/repeat, so
+# rotation needs a larger step or i/k/j/l/u/o feel almost still.
 POS_STEP = 0.005
-ROT_STEP = 0.04
+ROT_STEP = 0.15  # ~8.6 deg per press
 GRIP_STEP = 0.005
+
+# Key-repeat / viewer flood can enqueue many identical chars between teleop
+# ticks. Applying every one produces a 5–10 cm target jump and the IK rate
+# limit then looks like a pop. Cap the net delta applied per get_targets call.
+MAX_POS_DELTA_PER_TICK_M = 0.010  # 2 x POS_STEP
+MAX_ROT_DELTA_PER_TICK_RAD = ROT_STEP  # one press-worth of body rotation
+MAX_GRIP_DELTA_PER_TICK_M = GRIP_STEP
 
 SIDES = ("left", "right")
 
@@ -141,7 +158,9 @@ class ScriptedPoseSource(PoseSource):
 # reached, before it is pulled back. Big enough that normal tracking lag is
 # untouched, small enough that reversing a key responds immediately.
 TARGET_LEASH_M = 0.05
-TARGET_LEASH_RAD = np.deg2rad(15.0)
+# Orientation leash used to be 15 deg, which capped keyboard pitch as soon as
+# IK lagged even slightly. Keep a looser cap so i/k/j/l/u/o can accumulate.
+TARGET_LEASH_RAD = np.deg2rad(60.0)
 
 
 def _leash_to_actual(pos, quat, actual):
@@ -169,17 +188,21 @@ def _leash_to_actual(pos, quat, actual):
 
 
 class KeyboardPoseSource(PoseSource):
-    """Drives the active hand's EE target from single-character terminal input.
+    """Drives the active hand's EE target from single-character keyboard input.
 
-    Runs without a GUI: a background thread reads stdin in cbreak mode. On a
-    non-interactive stdin (piped/headless CI) it degrades gracefully to holding
-    the reset pose. Keys (mirroring the SparkJAX keyboard test intent)::
+    Keys are taken from stdin (terminal focus) and, when the MuJoCo viewer is
+    open, from the viewer window via :mod:`viewer_keys`. On a non-interactive
+    stdin (piped/headless CI) with no viewer it degrades to holding the reset
+    pose. Keys::
 
         w / s   +x / -x          i / k   pitch +/- (rot Y)
         a / d   +y / -y          j / l   yaw   +/- (rot Z)
         r / f   +z / -z          u / o   roll  +/- (rot X)
         [ / ]   gripper open/close
         tab     switch active hand        space  reset targets to current pose
+        c       cycle viewer camera (ego / right_wrist / left_wrist / free)
+        y / t   start / stop recording (when using lerobot-record)
+        n / q   end episode early / quit recording
     """
 
     def __init__(self):
@@ -192,11 +215,33 @@ class KeyboardPoseSource(PoseSource):
         self._thread: threading.Thread | None = None
         self._running = False
 
+    _HELP = """
+============================================================
+  Keyboard teleop  (active hand: {hand})
+============================================================
+  w / s     +x / -x (forward / back)
+  a / d     +y / -y (left / right)
+  r / f     +z / -z (up / down)
+  i / k     pitch +/-
+  j / l     yaw   +/-
+  u / o     roll  +/-
+  [ / ]     gripper open / close
+  Tab       switch active hand
+  Space     reset targets to current pose
+  c         cycle viewer cam (ego / right / left / free)
+  y / t     start / stop recording (record mode)
+  n / q     end episode early / quit recording
+
+  With VIEWER=1, focus the MuJoCo window for keys.
+============================================================
+""".strip()
+
     def start(self):
+        print(self._HELP.format(hand=self._active_side.upper()), flush=True)
         if not sys.stdin or not sys.stdin.isatty():
             logger.warning(
-                "KeyboardPoseSource: stdin is not a TTY; running in hold mode "
-                "(no keyboard input). Use driver='scripted' for headless motion."
+                "KeyboardPoseSource: stdin is not a TTY; use the MuJoCo viewer "
+                "window for keys (VIEWER=1), or driver='scripted' for headless."
             )
             return
         self._running = True
@@ -236,6 +281,13 @@ class KeyboardPoseSource(PoseSource):
         with self._lock:
             keys = list(self._queue)
             self._queue.clear()
+        # Keys typed into the MuJoCo viewer window (when VIEWER=1).
+        try:
+            from lerobot.robots.mujoco_bi_openarm.viewer_keys import drain_keys as drain_viewer_keys
+
+            keys.extend(drain_viewer_keys())
+        except Exception:  # noqa: BLE001
+            pass
         return keys
 
     def get_targets(self, current_ee):
@@ -254,6 +306,35 @@ class KeyboardPoseSource(PoseSource):
         pos, quat = _leash_to_actual(pos, quat, current_ee[side])
         self._pos[side], self._quat[side] = pos, quat
 
+        act_pos = np.asarray(current_ee[side][0], dtype=float)
+        pos_before = pos.copy()
+        grip_before = self._grip[side]
+        # Accumulate requested body-fixed rotation as an axis-angle in the hand
+        # frame, then apply once (capped) so a key-repeat flood cannot wind the
+        # orientation target many presses ahead of IK in a single tick.
+        rot_axis_angle = np.zeros(3)
+        rot_synced = False
+        # Pivot for i/k/j/l/u/o: the hand origin (wrist), not the TCP tip.
+        # Holding the tip fixed made the wrist orbit it and the apparent
+        # rotation center jump whenever the axis changed.
+        pivot_hand = hand_pos_from_tcp(act_pos, np.asarray(current_ee[side][1], dtype=float))
+
+        def _body_rot(local_axis: np.ndarray, angle: float) -> None:
+            """Queue a body-fixed rotation about the hand / wrist origin.
+
+            World-fixed pitch about +Y is singular at the hang pose and IK
+            rejects it; body-fixed axes track. The hand pivot stays fixed and
+            the TCP target is rewritten to match the new orientation.
+            """
+            nonlocal pos, quat, rot_synced
+            if not rot_synced:
+                quat = np.asarray(current_ee[side][1], dtype=float).copy()
+                pos = tcp_pos_from_hand(pivot_hand, quat)
+                self._pos[side] = pos
+                self._quat[side] = quat
+                rot_synced = True
+            rot_axis_angle[:3] += local_axis * angle
+
         for ch in self._drain_keys():
             if ch == "w":
                 pos[0] += POS_STEP
@@ -268,17 +349,17 @@ class KeyboardPoseSource(PoseSource):
             elif ch == "f":
                 pos[2] -= POS_STEP
             elif ch == "i":
-                quat[:] = quat_mul(axis_angle_to_quat(np.array([0, 1, 0]), ROT_STEP), quat)
+                _body_rot(np.array([0.0, 1.0, 0.0]), ROT_STEP)
             elif ch == "k":
-                quat[:] = quat_mul(axis_angle_to_quat(np.array([0, 1, 0]), -ROT_STEP), quat)
+                _body_rot(np.array([0.0, 1.0, 0.0]), -ROT_STEP)
             elif ch == "j":
-                quat[:] = quat_mul(axis_angle_to_quat(np.array([0, 0, 1]), ROT_STEP), quat)
+                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP)
             elif ch == "l":
-                quat[:] = quat_mul(axis_angle_to_quat(np.array([0, 0, 1]), -ROT_STEP), quat)
+                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP)
             elif ch == "u":
-                quat[:] = quat_mul(axis_angle_to_quat(np.array([1, 0, 0]), ROT_STEP), quat)
+                _body_rot(np.array([1.0, 0.0, 0.0]), ROT_STEP)
             elif ch == "o":
-                quat[:] = quat_mul(axis_angle_to_quat(np.array([1, 0, 0]), -ROT_STEP), quat)
+                _body_rot(np.array([1.0, 0.0, 0.0]), -ROT_STEP)
             elif ch == "[":
                 self._grip[side] = min(self._grip[side] + GRIP_STEP, FINGER_OPEN_M)
             elif ch == "]":
@@ -286,10 +367,60 @@ class KeyboardPoseSource(PoseSource):
             elif ch in ("\t", ";"):
                 self._active_side = "left" if side == "right" else "right"
                 logger.info("Active hand: %s", self._active_side.upper())
+            elif ch == "c":
+                # Cycle the MuJoCo viewer through ego / wrist cams (VR X/A analog).
+                try:
+                    from lerobot.robots.mujoco_bi_openarm.viewer_keys import (
+                        request_cycle_camera,
+                    )
+
+                    request_cycle_camera()
+                except Exception:  # noqa: BLE001
+                    logger.debug("viewer camera cycle request failed", exc_info=True)
+            elif ch in ("y", "t", "n", "q"):
+                # Forward recording controls to lerobot-record (viewer has focus).
+                # Note: teleop `r` (+z) is NOT remapped — use Left arrow for re-record.
+                try:
+                    from lerobot.robots.mujoco_bi_openarm.viewer_keys import (
+                        request_recording_control,
+                    )
+
+                    control = {"y": "y", "t": "t", "n": "right", "q": "esc"}[ch]
+                    request_recording_control(control)
+                except Exception:  # noqa: BLE001
+                    logger.debug("recording control request failed", exc_info=True)
             elif ch == " ":
                 self.reset(current_ee)
+                pos = self._pos[side]
+                quat = self._quat[side]
+                pos_before = pos.copy()
+                grip_before = self._grip[side]
+                rot_axis_angle[:] = 0.0
+                rot_synced = False
 
-        quat[:] = quat / np.linalg.norm(quat)
+        # Clamp net translation / gripper so a held key cannot jump the target.
+        if not rot_synced:
+            delta = pos - pos_before
+            dist = float(np.linalg.norm(delta))
+            if dist > MAX_POS_DELTA_PER_TICK_M:
+                pos[:] = pos_before + delta * (MAX_POS_DELTA_PER_TICK_M / dist)
+        grip_delta = self._grip[side] - grip_before
+        if abs(grip_delta) > MAX_GRIP_DELTA_PER_TICK_M:
+            self._grip[side] = grip_before + math.copysign(MAX_GRIP_DELTA_PER_TICK_M, grip_delta)
+
+        rot_angle = float(np.linalg.norm(rot_axis_angle))
+        if rot_angle > 1e-12:
+            if rot_angle > MAX_ROT_DELTA_PER_TICK_RAD:
+                rot_axis_angle *= MAX_ROT_DELTA_PER_TICK_RAD / rot_angle
+                rot_angle = MAX_ROT_DELTA_PER_TICK_RAD
+            quat[:] = quat_mul(quat, axis_angle_to_quat(rot_axis_angle / rot_angle, rot_angle))
+            quat[:] = quat / np.linalg.norm(quat)
+            # Keep the wrist/hand pivot fixed; tip follows on a sphere about it.
+            pos[:] = tcp_pos_from_hand(pivot_hand, quat)
+        else:
+            quat[:] = quat / np.linalg.norm(quat)
+
+        self._pos[side], self._quat[side] = pos, quat
 
         targets: dict[str, HandTarget] = {}
         for s in SIDES:
