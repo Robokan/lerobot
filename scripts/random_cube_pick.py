@@ -41,8 +41,15 @@ CUBE_X_RANGE = (0.26, 0.48)
 CUBE_Y_RANGE = (-0.32, 0.32)
 
 HOVER_CLEARANCE = 0.08
-# Tip-mid height above cube center (near cube top so open pads clear the table).
-GRASP_CLEARANCE = 0.030
+# Tip-mid height above cube center. Measured at the pitched grasp pose: the pad
+# face extends 2.5 cm below the estimated tip, so +3.0 cm here made the pads
+# grip only the cube's TOP 2 cm. +1.0 cm centers the contact patch on the
+# cube's middle (pad bottom stays ~1.5 cm above the table).
+GRASP_CLEARANCE = 0.010
+# Extra grasp height applied on a placement RETRY: at some cube spots the
+# mid-cube depth is geometrically unreachable (the finger corner catches the
+# table first, deterministically). Upper-middle grip beats a failed episode.
+_GRASP_Z_RELIEF = {"m": 0.0}
 # Horizontal inset so the cube sits a bit inside the jaws (XY only).
 GRASP_INSET_M = 0.010
 GRASP_PITCH_RAD = math.radians(25.0)
@@ -58,17 +65,19 @@ GRASP_CLOSED_M = 0.032
 # the pads shut at whatever the position servo can deliver; ramping the target
 # closes gently and lets the cube settle between the pads instead of being
 # batted. 30 mm/s: full open -> hold in ~1.1 s.
-GRIP_RAMP_MPS = 0.030
-PITCH_DURATION_S = 2.5
-LIFT_CLEARANCE = 0.14
+GRIP_RAMP_MPS = 0.060
+PITCH_DURATION_S = 1.3
+# Lift the cube to double its own height (5 cm cube -> +10 cm), then hold.
+LIFT_CLEARANCE = 0.10
+LIFT_HOLD_S = 1.0
 SUCCESS_CUBE_Z = CUBE_Z + 0.05
 # True finger bottom hangs ~3.2 cm below the estimated tip-mid (measured), so
 # table + 0.035 put the pads exactly AT the table. 0.042 keeps ~1 cm of air.
-MIN_TIP_Z = TABLE_TOP_Z + 0.042
+MIN_TIP_Z = TABLE_TOP_Z + 0.033
 GRASP_TIP_TOL = 0.015
 TRANSIT_CLEARANCE = 0.10
-APPROACH_SPEED_MPS = 0.12
-LIFT_DURATION_S = 2.2
+APPROACH_SPEED_MPS = 0.24
+LIFT_DURATION_S = 1.1
 REACH_TIP_TOL = 0.035
 
 # Quiet idle seeds for IK / teleport.
@@ -97,9 +106,10 @@ class ArmSpec:
     side: str
     idle_deg: np.ndarray
     park_deg: np.ndarray
+    tuck_deg: np.ndarray
     start_x: tuple[float, float]
     start_y: tuple[float, float]
-    start_z: tuple[float, float] = (0.50, 0.58)
+    start_z: tuple[float, float] = (0.46, 0.64)
 
     @property
     def other(self) -> str:
@@ -130,10 +140,18 @@ class ArmSpec:
         return f"openarm_{self.side}"
 
 
+# In-episode retreat pose for the arm NOT picking: like its side park, rotated
+# a bit forward so the hand hovers just over the table's near edge
+# (FK: hand ~(0.22, ±0.15, 0.47)). Stays by the robot's side — never swings
+# outside the table.
+RIGHT_TUCK_DEG = np.array([-50.0, 5.0, 0.0, 125.0, 0.0, 0.0, 0.0])
+LEFT_TUCK_DEG = np.array([50.0, 5.0, 0.0, 125.0, 0.0, 0.0, 0.0])
+
 RIGHT_ARM = ArmSpec(
     side="right",
     idle_deg=RIGHT_IDLE_DEG,
     park_deg=RIGHT_PARK_DEG,
+    tuck_deg=RIGHT_TUCK_DEG,
     start_x=(0.32, 0.48),
     start_y=(-0.30, -0.10),
 )
@@ -141,6 +159,7 @@ LEFT_ARM = ArmSpec(
     side="left",
     idle_deg=LEFT_IDLE_DEG,
     park_deg=LEFT_PARK_DEG,
+    tuck_deg=LEFT_TUCK_DEG,
     start_x=(0.32, 0.48),
     start_y=(0.10, 0.30),
 )
@@ -476,10 +495,35 @@ def _arm_q_from_obs(obs: dict, side: str) -> np.ndarray:
     return np.array([obs[f"{side}_joint_{i}.pos"] * math.pi / 180.0 for i in range(1, 8)])
 
 
+# Per-tick retreat rate for the arm that is NOT picking: it starts at a random
+# pose like the active arm and drifts back to its tucked side pose while the
+# pick happens (12 deg/s at 30 fps — deliberate, unhurried).
+_RETREAT_STEP_RAD = math.radians(0.8)
+_OTHER_GRIP: dict[str, float] = {}
+# Where the idle arm retreats this trial: its half-tuck by default, or the full
+# park when the cube spawned too close to the half-tuck spot to be safe.
+_RETREAT_TARGET: dict[str, np.ndarray] = {}
+# Half-tuck hand position (xy) per side, from the IK plan behind *_TUCK_DEG.
+_TUCK_TIP_XY = {"right": np.array([0.22, -0.15]), "left": np.array([0.22, 0.15])}
+_TUCK_CLEARANCE_M = 0.22
+
+
 def _park_action(side: str) -> dict[str, float]:
-    park = ARMS_BY_SIDE[side].park_deg
-    return {f"{side}_joint_{i}.pos": float(park[i - 1]) for i in range(1, 8)} | {
-        f"{side}_gripper.pos": 0.0
+    """One slow step of the unused arm toward its retreat pose (half-tuck over
+    the table edge, or the full park when the cube spawned too close)."""
+    park = _RETREAT_TARGET.get(side)
+    if park is None:
+        park = np.deg2rad(ARMS_BY_SIDE[side].tuck_deg)
+    cur = _LAST_CMD.get(side)
+    if cur is None:
+        cur = park.copy()
+    q = cur + np.clip(park - cur, -_RETREAT_STEP_RAD, _RETREAT_STEP_RAD)
+    _LAST_CMD[side] = q
+    grip = _OTHER_GRIP.get(side, 0.0)
+    grip = max(0.0, grip - GRIP_RAMP_MPS / 30.0)
+    _OTHER_GRIP[side] = grip
+    return {f"{side}_joint_{i}.pos": float(math.degrees(q[i - 1])) for i in range(1, 8)} | {
+        f"{side}_gripper.pos": gripper_m_to_deg(grip)
     }
 
 
@@ -620,6 +664,8 @@ def grasp_tip_target(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -> 
     tip = tip_mid_world(robot, arm)
     hand = hand_pos_world(robot, arm)
     out_xy = tip[:2] - hand[:2]
+    cube = cube.copy()
+    cube[2] += _GRASP_Z_RELIEF["m"]
     n = float(np.linalg.norm(out_xy))
     target = np.asarray(cube, dtype=float).copy()
     if n > 1e-6:
@@ -697,6 +743,8 @@ def send_q(
         action[f"{ik.arm.side}_joint_{i}.pos"] = float(math.degrees(qi))
     action[f"{ik.arm.side}_gripper.pos"] = gripper_m_to_deg(grip_m)
     robot.send_action(action)
+    if _RECORDER is not None:
+        _RECORDER.tick(action)
 
 
 def _set_arm_qpos(robot: MujocoBiOpenArm, side: str, q_rad: np.ndarray) -> None:
@@ -943,11 +991,27 @@ def teleport_to_tip(
     return err < 0.05
 
 
-def make_robot(model_path: str, fps: int, viewer: bool) -> MujocoBiOpenArm:
+def make_robot(
+    model_path: str, fps: int, viewer: bool, cameras: str = "none"
+) -> MujocoBiOpenArm:
+    from lerobot.cameras.mujoco import MujocoCameraConfig
+
+    # Camera sets for recording: "chest" = ego only, "all" = ego + both wrists.
+    # Names match the real chocolate-dataset schema (ego/left_wrist/right_wrist).
+    cam_cfg: dict = {}
+    if cameras in ("chest", "all"):
+        cam_cfg["ego"] = MujocoCameraConfig(mujoco_name="ego_camera", fps=fps, width=640, height=480)
+    if cameras == "all":
+        cam_cfg["left_wrist"] = MujocoCameraConfig(
+            mujoco_name="left_wrist_camera", fps=fps, width=640, height=480
+        )
+        cam_cfg["right_wrist"] = MujocoCameraConfig(
+            mujoco_name="right_wrist_camera", fps=fps, width=640, height=480
+        )
     robot = MujocoBiOpenArm(
         MujocoBiOpenArmConfig(
             viewer=viewer,
-            cameras={},
+            cameras=cam_cfg,
             model_path=model_path,
             fps=fps,
             start_elbow_bend_deg=90.0,
@@ -957,24 +1021,155 @@ def make_robot(model_path: str, fps: int, viewer: bool) -> MujocoBiOpenArm:
     return robot
 
 
+class EpisodeRecorder:
+    """Record every commanded tick into a LeRobotDataset episode.
+
+    Frames are captured in send_q — the single funnel every phase's commands
+    pass through — so the recorded action stream is exactly what drove the
+    sim, including the idle arm's slow tuck. Failed trials are dropped.
+    """
+
+    def __init__(self, robot: MujocoBiOpenArm, repo_id: str, fps: int, task: str):
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
+
+        self.robot = robot
+        self.task = task
+        self.features = combine_feature_dicts(
+            hw_to_dataset_features(robot.observation_features, "observation", True),
+            hw_to_dataset_features(robot.action_features, "action", True),
+        )
+        self.dataset = LeRobotDataset.create(
+            repo_id,
+            fps,
+            robot_type=robot.name,
+            features=self.features,
+            use_videos=True,
+            image_writer_threads=4 * max(1, len(robot.cameras)),
+        )
+        self.active = False
+
+    def tick(self, action: dict) -> None:
+        if not self.active:
+            return
+        from lerobot.utils.feature_utils import build_dataset_frame
+
+        obs = self.robot.get_observation()
+        frame = build_dataset_frame(self.features, obs, prefix="observation")
+        frame.update(build_dataset_frame(self.features, action, prefix="action"))
+        self.dataset.add_frame({**frame, "task": self.task})
+
+    def start(self) -> None:
+        self.active = True
+
+    def drop(self) -> None:
+        self.active = False
+        self.dataset.clear_episode_buffer()
+
+    def save(self) -> None:
+        self.active = False
+        self.dataset.save_episode()
+
+    def finalize(self) -> None:
+        self.dataset.finalize()
+
+
+_RECORDER: EpisodeRecorder | None = None
+
+
+def _random_start_offsets(rng: np.random.Generator) -> np.ndarray:
+    """Whole-arm start randomization. Wrist gets the most (visible gripper
+    orientation variety); proximal joints get some too, so starts vary in arm
+    CONFIGURATION and not just tip placement — every IK plan from the same
+    idle seed lands in the same configuration family otherwise."""
+    return np.array([
+        float(rng.uniform(-0.17, 0.17)),   # J1 ±10°
+        float(rng.uniform(-0.14, 0.14)),   # J2 ±8°
+        float(rng.uniform(-0.17, 0.17)),   # J3 ±10°
+        float(rng.uniform(-0.17, 0.17)),   # J4 ±10°
+        float(rng.uniform(-0.35, 0.35)),   # J5 wrist pitch ±20°
+        float(rng.uniform(-0.25, 0.25)),   # J6 wrist yaw   ±14°
+        float(rng.uniform(-0.50, 0.50)),   # J7 wrist roll  ±29°
+    ])
+
+
+def _random_start_q(
+    ik: PositionOnlyIK, arm: ArmSpec, rng: np.random.Generator
+) -> np.ndarray:
+    """Random start configuration for one arm — a mixture, for VLA variety:
+    75% a random pose in the workspace box, 25% a perturbed tucked pose (arms
+    in real deployments often start at rest by the robot's side)."""
+    def _tips_safe(q: np.ndarray) -> bool:
+        # Estimated tips sit ~3.2 cm above the true finger bottom, so demand
+        # est tip z > table + 8 cm: at 2x speed the PD lag is bigger and a low
+        # random start sweeps the fingers into the table on the first move.
+        ik.set_q(q)
+        return float(ik.tip_mid()[2]) > TABLE_TOP_Z + 0.08
+
+    for _ in range(12):
+        if rng.uniform() < 0.25:
+            q = np.clip(np.deg2rad(arm.park_deg) + _random_start_offsets(rng), ik.lo, ik.hi)
+        else:
+            tip = random_start_tip(arm, rng)
+            q0 = plan_q_to_tip_mid(
+                ik, np.deg2rad(arm.idle_deg), clamp_tip_target(tip), max_iters=800, tol=0.02, yaw=0.0
+            )
+            if q0 is None:
+                q0 = np.deg2rad(arm.idle_deg)
+            q = np.clip(q0 + _random_start_offsets(rng), ik.lo, ik.hi)
+        if _tips_safe(q):
+            return q
+    return np.clip(np.deg2rad(arm.idle_deg), ik.lo, ik.hi)
+
+
 def setup_start_pose(
     robot: MujocoBiOpenArm, ik: PositionOnlyIK, rng: np.random.Generator, fps: int
 ) -> np.ndarray:
-    tip = random_start_tip(ik.arm, rng)
+    """Teleport BOTH arms to random start poses with slightly random gripper
+    orientation. The unused arm will retreat to its park pose on its own
+    (see _park_action); the active arm levels its gripper before approaching."""
+    import mujoco
+
+    q_active = _random_start_q(ik, ik.arm, rng)
+    ik.set_q(q_active)
+    tip = ik.tip_mid().copy()
     print(f"  {ik.arm.side} start tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f})")
-    if not teleport_to_tip(robot, ik, tip, FINGER_OPEN_M, yaw=0.0):
-        teleport_arms(robot, ik, np.deg2rad(ik.arm.idle_deg), FINGER_OPEN_M)
-        go_to_tips(
-            robot,
-            ik,
-            tip,
-            FINGER_OPEN_M,
-            fps,
-            timeout_s=8.0,
-            tol=0.04,
-            label=f"{ik.arm.side} random start",
+
+    other = ARMS_BY_SIDE[ik.arm.other]
+    other_ik = PositionOnlyIK(ik.model, ik.data, other)
+    q_other = _random_start_q(other_ik, other, rng)
+
+    # Grippers start in a random state too (anywhere from closed to fully
+    # open). The active arm ramps open as its first act of the episode; the
+    # idle arm's gripper ramps closed during its tuck.
+    g_active = float(rng.uniform(0.0, FINGER_OPEN_M))
+    g_other = float(rng.uniform(0.0, FINGER_OPEN_M))
+
+    _set_arm_qpos(robot, ik.arm.side, q_active)
+    _set_gripper_qpos(robot, ik.arm.side, g_active)
+    _set_arm_qpos(robot, other.side, q_other)
+    _set_gripper_qpos(robot, other.side, g_other)
+    zero_sim_velocity(robot)
+    mujoco.mj_forward(robot._model, robot._data)
+    ik.set_q(q_active)
+    _LAST_CMD[ik.arm.side] = q_active.copy()
+    _LAST_CMD[other.side] = q_other.copy()
+    _OTHER_GRIP[other.side] = g_other
+    cube_now = cube_pos(robot)
+    d_tuck = float(np.linalg.norm(cube_now[:2] - _TUCK_TIP_XY[other.side]))
+    if d_tuck < _TUCK_CLEARANCE_M:
+        _RETREAT_TARGET[other.side] = np.deg2rad(other.park_deg)
+        print(
+            f"  cube is {d_tuck * 100:.0f} cm from {other.side}'s half-tuck spot "
+            f"— {other.side} will retreat to full park instead"
         )
-    settle_pose(robot, ik, FINGER_OPEN_M, fps, hold_s=0.2)
+    else:
+        _RETREAT_TARGET[other.side] = np.deg2rad(other.tuck_deg)
+    print(
+        f"  {other.side} starts random too (grip {g_other * 1000:.0f} mm); "
+        f"will half-tuck over the table edge during the pick"
+    )
+    settle_pose(robot, ik, g_active, fps, hold_s=0.2)
     return tip
 
 
@@ -1158,12 +1353,12 @@ def play_tip_cartesian(
         for _ in range(2):
             ik.step_tip_mid(
                 tip_t,
-                max_dq=math.radians(0.8),
+                max_dq=math.radians(1.6),
                 yaw=yaw,
                 level=not freeze_wrist,
                 freeze_wrist=wrist,
             )
-        q = _rate_limit_q(ik.q(), q_prev, math.radians(0.7))
+        q = _rate_limit_q(ik.q(), q_prev, math.radians(1.4))
         _command_q(robot, ik, q, grip_m, fps)
         q_prev = q.copy()
         if grasp_table_fault(robot, ik.arm) is not None:
@@ -1222,8 +1417,8 @@ def center_tip_over_cube(
         tip_t = tip_cmd
         ik.set_q(_arm_q_real(robot, ik))  # model = reality; command stays chained
         for _ in range(2):
-            ik.step_tip_mid(tip_t, max_dq=math.radians(0.8), yaw=yaw, level=True)
-        q = _rate_limit_q(ik.q(), q_prev, math.radians(0.7))
+            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), yaw=yaw, level=True)
+        q = _rate_limit_q(ik.q(), q_prev, math.radians(1.4))
         _command_q(robot, ik, q, FINGER_OPEN_M, fps)
         q_prev = q.copy()
         if grasp_table_fault(robot, ik.arm) is not None:
@@ -1272,7 +1467,7 @@ def pitch_tips_onto_cube(
     dq_plan = np.abs(q_grasp - q_hover)
     n = max(
         int(max(duration_s, 2.8) * fps),
-        int(math.ceil(float(np.max(dq_plan)) / math.radians(0.55))),
+        int(math.ceil(float(np.max(dq_plan)) / math.radians(1.1))),
     )
     print(
         f"  pitch+lower: joint blend over {n / fps:.1f}s "
@@ -1283,7 +1478,7 @@ def pitch_tips_onto_cube(
     for k in range(n):
         u = (k + 1) / n
         s = u * u * (3.0 - 2.0 * u)
-        q = _rate_limit_q((1.0 - s) * q_hover + s * q_grasp, q_prev, math.radians(0.6))
+        q = _rate_limit_q((1.0 - s) * q_hover + s * q_grasp, q_prev, math.radians(1.2))
         _command_q(robot, ik, q, FINGER_OPEN_M, fps)
         q_prev = q.copy()
         if grasp_table_fault(robot, ik.arm) is not None:
@@ -1407,13 +1602,13 @@ def servo_tip_to_cube_center(
             for _ in range(4):
                 ik.step_tip_mid(
                     tip_t,
-                    max_dq=math.radians(0.8),
+                    max_dq=math.radians(1.6),
                     yaw=yaw,
                     pitch=pitch,
                     level=True,
                     proximal_scale=0.4,
                 )
-            q = _rate_limit_q(ik.q(), q_prev, math.radians(0.7))
+            q = _rate_limit_q(ik.q(), q_prev, math.radians(1.4))
             _command_q(robot, ik, q, FINGER_OPEN_M, fps)
             q_prev = q.copy()
             fault = grasp_table_fault(robot, ik.arm)
@@ -1446,6 +1641,22 @@ def approach_above_cube(
     fps: int,
     yaw: float,
 ) -> np.ndarray | None:
+    # First: orient the gripper parallel to the table, in place, up high. The
+    # start pose deliberately has a bit of random wrist orientation; levelling
+    # is its own visible, deliberate motion before the reach begins.
+    q_now = _cmd_seed(robot, ik.arm.side)
+    ik.set_q(q_now)
+    if vertical_tilt_rad(ik) > math.radians(6.0):
+        tip_here = clamp_tip_target(tip_mid_world(robot, ik.arm))
+        # Level AT a safe altitude: leveling in place at a low start sweeps the
+        # fingertips through the table (they trail the tip estimate by ~3 cm).
+        tip_here[2] = max(float(tip_here[2]), float(cube[2] + TRANSIT_CLEARANCE))
+        q_level = plan_q_to_tip_mid_robust(ik, q_now, tip_here, yaw=0.0, pitch=0.0)
+        if q_level is not None:
+            dq = float(np.max(np.abs(q_level - q_now)))
+            dur = max(0.5, dq / math.radians(50.0))
+            play_joint_path(robot, ik, q_now, q_level, FINGER_OPEN_M, fps, dur, "level gripper")
+
     tip0 = tip_mid_world(robot, ik.arm)
     transit_z = float(cube[2] + TRANSIT_CLEARANCE)
     slide_z = max(float(tip0[2]), transit_z + 0.01)
@@ -1516,7 +1727,7 @@ def approach_above_cube(
             print(f"  hover: best plan still {math.degrees(plan_tilt):.0f}° tilted — rejecting")
             return None
         dq = float(np.max(np.abs(q_hover - q_now)))
-        dur = max(1.2, dq / math.radians(20.0))
+        dur = max(0.6, dq / math.radians(40.0))
         if not play_joint_path(robot, ik, q_now, q_hover, FINGER_OPEN_M, fps, dur, "level hover blend"):
             return None
         if center_tip_over_cube(robot, ik, cube_pos(robot), hover_z, fps, yaw, tol_xy=0.01):
@@ -1562,17 +1773,40 @@ def run_trial(
     print(f"  grasp yaw={math.degrees(yaw):+.0f}° (align pads to cube faces)")
     pitch = GRASP_PITCH_RAD
 
-    # 1) Open and move over the cube.
-    set_gripper(robot, ik, FINGER_OPEN_M, fps, hold_s=0.2)
-    if approach_above_cube(robot, ik, cube_pos(robot), fps, yaw) is None:
-        print("  fail: could not move over cube")
-        return False
-    if grasp_table_fault(robot, ik.arm) is not None:
-        print(f"  fail: TABLE HIT {grasp_table_fault(robot, ik.arm)}")
-        return False
+    # Yaw-scaled grasp relief: at a yawed grasp the pad's leading corner swings
+    # lower (half-gap * sin|yaw|), and past ~15° the mid-cube depth would put
+    # that corner inside the table — deterministically unreachable. Face-on
+    # grasps keep the full mid-cube depth.
+    _GRASP_Z_RELIEF["m"] = 0.035 * max(0.0, abs(math.sin(yaw)) - 0.15)
+    if _GRASP_Z_RELIEF["m"] > 0.0:
+        print(f"  yawed grasp: relieving depth by {_GRASP_Z_RELIEF['m'] * 1000:.0f} mm")
 
-    # 2) Rotate wrist and place gripper tips around the cube.
-    if not pitch_tips_onto_cube(robot, ik, fps, yaw, pitch_end=pitch):
+    # 1+2) Approach and place tips, with ONE full re-approach retry — a servo
+    # table strike usually means this particular descent geometry was bad, and
+    # a fresh approach from above fixes it more often than not.
+    placed = False
+    base_relief = _GRASP_Z_RELIEF["m"]
+    for attempt in range(2):
+        if attempt == 1:
+            _GRASP_Z_RELIEF["m"] = base_relief + 0.008  # retry shallower still
+        set_gripper(robot, ik, FINGER_OPEN_M, fps, hold_s=0.2)
+        if approach_above_cube(robot, ik, cube_pos(robot), fps, yaw) is None:
+            print("  fail: could not move over cube")
+            return False
+        if grasp_table_fault(robot, ik.arm) is not None:
+            print(f"  fail: TABLE HIT {grasp_table_fault(robot, ik.arm)}")
+            return False
+        if pitch_tips_onto_cube(robot, ik, fps, yaw, pitch_end=pitch):
+            placed = True
+            break
+        if attempt == 0:
+            print("  placement failed — lifting clear and re-approaching once")
+            tip_up = tip_mid_world(robot, ik.arm) + np.array([0.0, 0.0, 0.07])
+            play_tip_cartesian(
+                robot, ik, tip_up, FINGER_OPEN_M, fps, yaw,
+                label="retreat up", freeze_wrist=True,
+            )
+    if not placed:
         print("  fail: could not place tips around cube")
         return False
     tip = tip_mid_world(robot, ik.arm)
@@ -1652,10 +1886,10 @@ def run_trial(
                 airborne = float(cube_pos(robot)[2]) > cube_held[2] + 0.02
                 for _ in range(3):
                     if airborne:
-                        ik.step_tip_mid(tip_t, max_dq=math.radians(0.4), yaw=yaw, pitch=pitch, level=True)
+                        ik.step_tip_mid(tip_t, max_dq=math.radians(0.8), yaw=yaw, pitch=pitch, level=True)
                     else:
-                        ik.step_tip_mid(tip_t, max_dq=math.radians(0.8), freeze_wrist=wrist_hold)
-                q = _rate_limit_q(ik.q(), q_prev, math.radians(0.7))
+                        ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), freeze_wrist=wrist_hold)
+                q = _rate_limit_q(ik.q(), q_prev, math.radians(1.4))
                 ik.set_q(q)
                 _hold_fingers(robot, ik, hold_grip)
                 precise_sleep(1.0 / fps)
@@ -1675,6 +1909,14 @@ def run_trial(
                         print("    lift: cube LOST — aborting lift early")
                         break
 
+        # Hold the cube at the top for a beat before the episode ends.
+        n_hold = max(1, int(LIFT_HOLD_S * fps))
+        print(f"  holding at the top for {LIFT_HOLD_S:.1f}s (cube_z={cube_pos(robot)[2]:.3f})…")
+        for _ in range(n_hold):
+            ik.set_q(q_prev)
+            _hold_fingers(robot, ik, hold_grip)
+            precise_sleep(1.0 / fps)
+
         cube_f = cube_pos(robot)
         ok = float(cube_f[2]) >= SUCCESS_CUBE_Z
         log_grasp_contacts(robot, ik.arm, "after-lift")
@@ -1692,39 +1934,94 @@ def main() -> None:
         default=str(Path.home() / "sparkpack/openarm_mujoco/v1/scene.xml"),
     )
     parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument(
+        "--record",
+        default=None,
+        metavar="REPO_ID",
+        help="Record successful picks into a LeRobotDataset (e.g. local/openarm_sim_cube).",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=0,
+        help="With --record: keep going until this many SUCCESSFUL episodes are saved.",
+    )
+    parser.add_argument(
+        "--cameras",
+        choices=["chest", "all"],
+        default="all",
+        help="Cameras to record: 'chest' (ego only) or 'all' (ego + both wrists).",
+    )
+    parser.add_argument(
+        "--task",
+        default="pick up the red cube and lift it",
+        help="Task string stored with every recorded frame (VLA language conditioning).",
+    )
     args = parser.parse_args()
 
+    global _RECORDER
     rng = np.random.default_rng(args.seed)
-    robot = make_robot(args.model_path, args.fps, viewer=not args.no_viewer)
+    robot = make_robot(
+        args.model_path,
+        args.fps,
+        viewer=not args.no_viewer,
+        cameras=args.cameras if args.record else "none",
+    )
+    if args.record:
+        _RECORDER = EpisodeRecorder(robot, args.record, args.fps, args.task)
+        print(
+            f"Recording to '{args.record}' (cameras={args.cameras}, task='{args.task}');"
+            f" target {args.episodes or args.trials} successful episodes"
+        )
     iks = {arm.side: build_ik(robot, arm) for arm in ARMS}
 
     # Park both arms at their low side poses immediately.
     park_both_arms(robot, iks)
     settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.2)
 
-    print(f"Running {args.trials} randomized bilateral pick trial(s)…")
+    target_eps = args.episodes if (args.record and args.episodes > 0) else 0
+    max_trials = args.trials if not target_eps else max(args.trials, target_eps * 3)
+    print(f"Running randomized bilateral pick trial(s)…")
     successes = 0
     used = {"left": 0, "right": 0}
     try:
-        for t in range(args.trials):
-            print(f"\n=== Trial {t + 1}/{args.trials} ===")
+        t = 0
+        while t < max_trials:
+            t += 1
+            print(f"\n=== Trial {t}/{max_trials} ===")
             cube0, arm = place_reachable_cube(robot, iks, rng)
             ik = iks[arm.side]
             used[arm.side] += 1
             print(f"  start: {arm.other} side-parked, teleport {arm.side} to random pose")
             setup_start_pose(robot, ik, rng, args.fps)
 
-            if run_trial(robot, ik, args.fps, cube0):
+            if _RECORDER is not None:
+                _RECORDER.start()
+            ok = run_trial(robot, ik, args.fps, cube0)
+            if ok:
                 successes += 1
+                if _RECORDER is not None:
+                    _RECORDER.save()
+                    print(f"  episode {successes} saved")
                 print(f"  pick succeeded ({arm.side})")
             else:
+                if _RECORDER is not None:
+                    _RECORDER.drop()
+                    print("  failed trial — episode dropped")
                 print(f"  pick failed ({arm.side})")
-            # Park both before the next drop.
+            # Park both before the next drop (never recorded).
             park_both_arms(robot, iks)
             settle_pose(robot, ik, 0.0, args.fps, hold_s=0.15)
+            if target_eps and successes >= target_eps:
+                break
+            if not target_eps and t >= args.trials:
+                break
     finally:
+        if _RECORDER is not None:
+            _RECORDER.finalize()
+            print(f"dataset finalized: {successes} episodes")
         print(
-            f"\nDone: {successes}/{args.trials} successful picks "
+            f"\nDone: {successes}/{t} successful picks "
             f"(used left={used['left']}, right={used['right']})"
         )
         robot.disconnect()
