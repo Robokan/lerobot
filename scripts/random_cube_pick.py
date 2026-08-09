@@ -467,6 +467,11 @@ class PositionOnlyIK:
         return float(np.linalg.norm(self.tip_mid() - tip_mid_target))
 
 
+def _arm_q_real(robot: MujocoBiOpenArm, ik: PositionOnlyIK) -> np.ndarray:
+    """Actual joint angles straight from sim state (cheap; no camera renders)."""
+    return np.array([float(robot._data.qpos[a]) for a in ik.qadr])
+
+
 def _arm_q_from_obs(obs: dict, side: str) -> np.ndarray:
     return np.array([obs[f"{side}_joint_{i}.pos"] * math.pi / 180.0 for i in range(1, 8)])
 
@@ -662,6 +667,23 @@ def build_ik(robot: MujocoBiOpenArm, arm: ArmSpec) -> PositionOnlyIK:
     return PositionOnlyIK(model, data, arm)
 
 
+# Last commanded arm target per side. Phases must chain their command streams
+# from this — re-seeding a phase from *observation* snaps the command backward
+# by the PD tracking lag at every phase boundary, which is exactly the jerk
+# visible at each transition.
+_LAST_CMD: dict[str, np.ndarray] = {}
+
+
+def _cmd_seed(robot: MujocoBiOpenArm, side: str) -> np.ndarray:
+    """Where a new phase's command stream should start: the previous phase's
+    last command (continuity), falling back to observation only when no
+    command has been issued since the last teleport."""
+    q = _LAST_CMD.get(side)
+    if q is not None:
+        return q.copy()
+    return _arm_q_from_obs(robot.get_observation(), side)
+
+
 def send_q(
     robot: MujocoBiOpenArm,
     ik: PositionOnlyIK,
@@ -669,6 +691,7 @@ def send_q(
 ) -> None:
     """Command active arm from IK; keep the other arm parked."""
     q = ik.q()
+    _LAST_CMD[ik.arm.side] = np.asarray(q, dtype=float).copy()
     action = _park_action(ik.arm.other)
     for i, qi in enumerate(q, start=1):
         action[f"{ik.arm.side}_joint_{i}.pos"] = float(math.degrees(qi))
@@ -722,6 +745,8 @@ def teleport_arms(
     zero_sim_velocity(robot)
     mujoco.mj_forward(robot._model, robot._data)
     ik.set_q(q_active)
+    _LAST_CMD[ik.arm.side] = np.asarray(q_active, dtype=float).copy()
+    _LAST_CMD[other.side] = np.deg2rad(other.park_deg)
 
 
 def park_both_arms(robot: MujocoBiOpenArm, iks: dict[str, PositionOnlyIK]) -> None:
@@ -735,6 +760,7 @@ def park_both_arms(robot: MujocoBiOpenArm, iks: dict[str, PositionOnlyIK]) -> No
     mujoco.mj_forward(robot._model, robot._data)
     for arm in ARMS:
         iks[arm.side].set_q(np.deg2rad(arm.park_deg))
+        _LAST_CMD[arm.side] = np.deg2rad(arm.park_deg)
 
 
 def settle_pose(
@@ -1010,9 +1036,8 @@ def set_gripper(
 
     Returns the commanded opening, or -1.0 if it never closed/opened in time.
     """
-    obs = robot.get_observation()
     start = float(np.clip(_finger_opening_m(robot, ik.arm.side), 0.0, FINGER_OPEN_M))
-    ik.set_q(_arm_q_from_obs(obs, ik.arm.side))
+    ik.set_q(_cmd_seed(robot, ik.arm.side))
     q_hold = ik.q().copy()
     target = float(np.clip(grip_m, 0.0, FINGER_OPEN_M))
     closing = target < start - 1e-4
@@ -1118,8 +1143,7 @@ def play_tip_cartesian(
     duration_s = max(0.5, dist / max(speed_mps, 1e-3))
     n = max(2, int(duration_s * fps))
     print(f"  {label}: cartesian tip move ({duration_s:.1f}s, {dist * 100:.0f} cm)…")
-    obs = robot.get_observation()
-    q0 = _arm_q_from_obs(obs, ik.arm.side)
+    q0 = _cmd_seed(robot, ik.arm.side)
     wrist = q0[4:7].copy() if freeze_wrist else None
     ik.set_q(q0)
     q_prev = q0.copy()
@@ -1171,8 +1195,7 @@ def center_tip_over_cube(
         f"true lowest z=({low_dbg[0]:.3f},{low_dbg[1]:.3f}) "
         f"tilt={math.degrees(tilt_dbg):.1f}°]"
     )
-    obs = robot.get_observation()
-    ik.set_q(_arm_q_from_obs(obs, ik.arm.side))
+    ik.set_q(_cmd_seed(robot, ik.arm.side))
     q_prev = ik.q().copy()
     last_err = 1e9
     z_bump = 0.0
@@ -1197,6 +1220,7 @@ def center_tip_over_cube(
         tip_t = np.array([cube[0], cube[1], hold_z + z_bump + z_tilt])
         tip_cmd = tip_t if tip_cmd is None else 0.75 * tip_cmd + 0.25 * tip_t
         tip_t = tip_cmd
+        ik.set_q(_arm_q_real(robot, ik))  # model = reality; command stays chained
         for _ in range(2):
             ik.step_tip_mid(tip_t, max_dq=math.radians(0.8), yaw=yaw, level=True)
         q = _rate_limit_q(ik.q(), q_prev, math.radians(0.7))
@@ -1226,8 +1250,7 @@ def pitch_tips_onto_cube(
     cube = cube_pos(robot)
     hold_z = max(float(tip0[2]), float(cube[2] + HOVER_CLEARANCE * 0.5), MIN_TIP_Z)
 
-    obs = robot.get_observation()
-    q_hover = _arm_q_from_obs(obs, ik.arm.side)
+    q_hover = _cmd_seed(robot, ik.arm.side)
     ik.set_q(q_hover)
 
     grasp_tip = grasp_tip_target(robot, ik.arm, cube)
@@ -1315,8 +1338,7 @@ def servo_tip_to_cube_center(
     corrects until both XY and Z are on the cube (or timeout).
     """
     deadline = time.perf_counter() + timeout_s
-    obs = robot.get_observation()
-    ik.set_q(_arm_q_from_obs(obs, ik.arm.side))
+    ik.set_q(_cmd_seed(robot, ik.arm.side))
     q_prev = ik.q().copy()
     last_err = 1e9
     # Pads close along this axis: an error here decides whether the cube is
@@ -1336,13 +1358,6 @@ def servo_tip_to_cube_center(
     if True:
         while time.perf_counter() < deadline:
             tick += 1
-            if tick % 6 == 0:
-                # Re-anchor the internal model to reality. Advancing q_prev from
-                # commands alone lets model-vs-robot drift accumulate until the
-                # servo chases a phantom (measured: 1.4 cm start diverging to
-                # 5.5 cm timeout).
-                q_prev = _arm_q_from_obs(robot.get_observation(), ik.arm.side)
-                ik.set_q(q_prev)
             cube = cube_pos(robot)
             target = grasp_tip_target(robot, ik.arm, cube)
             tip = tip_mid_world(robot, ik.arm)
@@ -1374,11 +1389,21 @@ def servo_tip_to_cube_center(
             tip_t[2] = max(float(target[2]) + z_bump, MIN_TIP_Z)
             # Integrate the tracking residual into the command (droop_bias),
             # then low-pass so per-tick re-targeting cannot twitch the arm.
-            droop_bias = np.clip(droop_bias + 0.2 * (tip_t - tip), -0.035, 0.035)
+            # Gravity only pulls DOWN, so the z bias is one-sided: it may lift
+            # the command, never push it below the grasp target (a negative z
+            # bias walked the fingers into the table).
+            droop_bias = droop_bias + 0.2 * (tip_t - tip)
+            droop_bias[:2] = np.clip(droop_bias[:2], -0.02, 0.02)
+            droop_bias[2] = float(np.clip(droop_bias[2], 0.0, 0.035))
             tip_t = clamp_tip_target(tip_t + droop_bias)
             tip_cmd = tip_t if tip_cmd is None else 0.75 * tip_cmd + 0.25 * tip_t
             tip_t = tip_cmd
-            ik.set_q(q_prev)
+            # Model anchored to REALITY every tick (the IK linearizes about the
+            # true pose; a model chained off commands diverges and the servo
+            # chases a phantom). The droop integrator above supplies the lead
+            # the old command-chained model provided implicitly. The command
+            # stream q_prev stays continuous — never snapped back to obs.
+            ik.set_q(_arm_q_real(robot, ik))
             for _ in range(4):
                 ik.step_tip_mid(
                     tip_t,
@@ -1390,7 +1415,6 @@ def servo_tip_to_cube_center(
                 )
             q = _rate_limit_q(ik.q(), q_prev, math.radians(0.7))
             _command_q(robot, ik, q, FINGER_OPEN_M, fps)
-            # Advance from command so PD lag cannot stall the climb.
             q_prev = q.copy()
             fault = grasp_table_fault(robot, ik.arm)
             if fault is not None:
@@ -1470,7 +1494,7 @@ def approach_above_cube(
     # limits) — the robust planner either finds a level hover pose or tells us
     # now. A single blend can also under-deliver (PD lag), so measure and retry.
     for attempt in range(2):
-        q_now = _arm_q_from_obs(robot.get_observation(), ik.arm.side)
+        q_now = _cmd_seed(robot, ik.arm.side)
         ik.set_q(q_now)
         cube = cube_pos(robot)
         hover_tip = clamp_tip_target(np.array([cube[0], cube[1], hover_z]))
@@ -1567,7 +1591,7 @@ def run_trial(
     print(f"  close {ik.arm.side} (will not lift until closed)…")
     if True:
         for close_try in range(2):
-            ik.set_q(_arm_q_from_obs(robot.get_observation(), ik.arm.side))
+            ik.set_q(_cmd_seed(robot, ik.arm.side))
             hold_grip = set_gripper(robot, ik, GRASP_HOLD_M, fps, hold_s=3.0)
             if hold_grip < 0.0:
                 print("  fail: gripper never finished closing — not lifting")
@@ -1604,7 +1628,7 @@ def run_trial(
         # table pry it out of the jaws — pinch 17 N at 2% of the lift, cube
         # gone by 18%. Stepping the tip vertically with yaw/pitch enforced
         # keeps the pads glued to the cube instead.
-        q_now = _arm_q_from_obs(robot.get_observation(), ik.arm.side)
+        q_now = _cmd_seed(robot, ik.arm.side)
         ik.set_q(q_now)
         tip0_l = tip_mid_world(robot, ik.arm)
         # Freeze the wrist at whatever orientation the grasp actually ended at.
