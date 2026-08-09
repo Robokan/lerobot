@@ -63,6 +63,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     lekiwi,
     make_robot_from_config,
+    mujoco_bi_openarm,
     omx_follower,
     openarm_follower,
     reachy2,
