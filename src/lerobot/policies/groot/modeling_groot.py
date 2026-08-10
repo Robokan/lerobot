@@ -471,6 +471,41 @@ class GrootPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
     @torch.no_grad()
+    def _trt_socket_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Route the model call to a TRT inference server (GROOT_TRT_SOCKET).
+
+        The server (Isaac-GR00T sim_cube_trt_server) receives the filtered,
+        preprocessed inputs and returns the raw action chunk; all lerobot
+        pre/post processing stays local, bit-identical to training.
+        """
+        import os
+        import pickle
+        import socket as _socket
+        import struct
+
+        if getattr(self, "_trt_sock", None) is None:
+            path = os.environ["GROOT_TRT_SOCKET"]
+            self._trt_sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            self._trt_sock.connect(path)
+            logger.info("GrootPolicy: model calls -> TRT server at %s", path)
+        gi = self._filter_groot_inputs(batch, include_action=False)
+        msg = {}
+        for k, v in gi.items():
+            if isinstance(v, torch.Tensor):
+                t = v.detach().cpu()
+                if t.dtype == torch.bfloat16:
+                    t = t.float()
+                msg[k] = t.numpy()
+        data = pickle.dumps(msg, protocol=4)
+        self._trt_sock.sendall(struct.pack(">I", len(data)) + data)
+        hdr = self._trt_sock.recv(4, _socket.MSG_WAITALL)
+        (n,) = struct.unpack(">I", hdr)
+        reply = pickle.loads(self._trt_sock.recv(n, _socket.MSG_WAITALL))
+        if "error" in reply:
+            raise RuntimeError(f"TRT server error: {reply['error']}")
+        device = next(self.parameters()).device
+        return torch.from_numpy(reply["action"]).to(device)
+
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: object) -> Tensor:
         """Predict a chunk of actions for inference by delegating to Isaac-GR00T.
 
@@ -480,6 +515,11 @@ class GrootPolicy(PreTrainedPolicy):
         action-overlap options before calling the underlying model.
         """
         self.eval()
+
+        import os
+
+        if os.environ.get("GROOT_TRT_SOCKET"):
+            return self._trt_socket_chunk(batch)
 
         # Preprocessing is handled by the processor pipeline, so we just filter the batch.
         # During inference, we do not pass action because it is predicted.
