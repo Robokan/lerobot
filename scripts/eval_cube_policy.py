@@ -76,6 +76,37 @@ class CheckpointPolicy:
         self.action_keys: list[str] | None = None
         self.robot_type: str | None = None
         self.obs_features: dict | None = None
+        self._trt_sock = None
+
+    def connect_trt(self, socket_path: str) -> None:
+        """Route the model call to a TRT inference server (lerobot pre/post
+        processing stays local and bit-identical to training)."""
+        import socket as _socket
+
+        self._trt_sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self._trt_sock.connect(socket_path)
+        print(f"  policy model calls -> TRT server at {socket_path}")
+
+    def _remote_chunk(self, preprocessed: dict):
+        import pickle
+        import socket as _socket
+        import struct
+
+        msg = {}
+        for k, v in preprocessed.items():
+            if hasattr(v, "detach"):
+                t = v.detach().to("cpu")
+                if t.dtype == self.torch.bfloat16:
+                    t = t.float()
+                msg[k] = t.numpy()
+        data = pickle.dumps(msg, protocol=4)
+        self._trt_sock.sendall(struct.pack(">I", len(data)) + data)
+        hdr = self._trt_sock.recv(4, _socket.MSG_WAITALL)
+        (n,) = struct.unpack(">I", hdr)
+        reply = pickle.loads(self._trt_sock.recv(n, _socket.MSG_WAITALL))
+        if "error" in reply:
+            raise RuntimeError(f"TRT server error: {reply['error']}")
+        return self.torch.from_numpy(reply["action"]).to(self.device)
 
     def configure_for_robot(self, robot) -> None:
         from lerobot.utils.feature_utils import hw_to_dataset_features
@@ -103,7 +134,11 @@ class CheckpointPolicy:
                     frame, self.device, self.task, self.robot_type
                 )
                 preprocessed = self.pre(prepared)
-                actions = self.policy.predict_action_chunk(preprocessed)
+                if self._trt_sock is not None:
+                    gi = self.policy._filter_groot_inputs(preprocessed, include_action=False)
+                    actions = self._remote_chunk(gi)
+                else:
+                    actions = self.policy.predict_action_chunk(preprocessed)
                 processed = self.post(actions)
             chunk = processed.squeeze(0).cpu().numpy()
             n = getattr(self.policy.config, "n_action_steps", chunk.shape[0])
@@ -176,6 +211,11 @@ def main() -> None:
     parser.add_argument("--task", default="pick up the red cube and lift it")
     parser.add_argument("--model-path", default=str(Path.home() / "sparkpack/openarm_mujoco/v1/scene.xml"))
     parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument(
+        "--trt-socket",
+        default=None,
+        help="Unix socket of a sim_cube_trt_server; model calls go to TRT engines.",
+    )
     args = parser.parse_args()
 
     robot = rcp.make_robot(args.model_path, args.fps, viewer=not args.no_viewer, cameras=args.cameras)
@@ -188,6 +228,8 @@ def main() -> None:
     else:
         policy = CheckpointPolicy(args.policy, args.dataset, args.task)
         policy.configure_for_robot(robot)
+        if args.trt_socket:
+            policy.connect_trt(args.trt_socket)
 
     rng = np.random.default_rng(args.seed)
     results = []
