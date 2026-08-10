@@ -12,6 +12,8 @@ set -euo pipefail
 
 DATASET="${DATASET:-local/openarm_sim_cube}"
 OUT="${OUT:-outputs/pi05_sim_cube}"
+# pi0.5 consumes 3 views. For a chest-only dataset (--cameras chest), pad the
+# two missing views:  EMPTY_CAMERAS=2 DATASET=local/..._chest bash $0
 
 lerobot-train \
   --dataset.repo_id="${DATASET}" \
@@ -19,6 +21,7 @@ lerobot-train \
   --policy.pretrained_path=lerobot/pi05_base \
   --policy.normalization_mapping='{"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}' \
   --policy.n_action_steps=10 \
+  --policy.empty_cameras="${EMPTY_CAMERAS:-0}" \
   --policy.freeze_vision_encoder=false \
   --policy.train_expert_only=false \
   --policy.gradient_checkpointing=true \
