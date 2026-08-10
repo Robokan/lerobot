@@ -196,6 +196,65 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
     }
 
 
+def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str):
+    """Construct lerobot's real RTC engine around our policy + processors."""
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference.factory import RTCInferenceConfig, create_inference_engine
+    from lerobot.rollout.robot_wrapper import ThreadSafeRobot
+    from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
+
+    dataset_features = combine_feature_dicts(
+        hw_to_dataset_features(robot.observation_features, "observation", True),
+        hw_to_dataset_features(robot.action_features, "action", True),
+    )
+    engine = create_inference_engine(
+        RTCInferenceConfig(rtc=RTCConfig(execution_horizon=horizon)),
+        policy=pol.policy,
+        preprocessor=pol.pre,
+        postprocessor=pol.post,
+        robot_wrapper=ThreadSafeRobot(robot),
+        hw_features=pol.obs_features,
+        dataset_features=dataset_features,
+        ordered_action_keys=list(robot.action_features.keys()),
+        task=task,
+        fps=float(fps),
+        device="cuda",
+    )
+    engine.start()
+    return engine
+
+
+def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
+    """One episode under async RTC: continuous 30 Hz control, background chunks."""
+    import time as _time
+
+    from lerobot.utils.feature_utils import build_dataset_frame
+    from lerobot.utils.robot_utils import precise_sleep
+
+    engine.reset()
+    engine.resume()  # the RTC background thread starts paused
+    t_end = _time.perf_counter() + time_limit_s
+    held_since = None
+    while _time.perf_counter() < t_end:
+        t0 = _time.perf_counter()
+        obs = robot.get_observation()
+        engine.notify_observation(obs)
+        frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
+        a = engine.get_action(frame)
+        if a is not None:
+            vals = a.detach().cpu().numpy().reshape(-1)
+            robot.send_action({k: float(v) for k, v in zip(pol.action_keys, vals, strict=True)})
+        z = float(rcp.cube_pos(robot)[2])
+        if z >= rcp.SUCCESS_CUBE_Z:
+            held_since = held_since or _time.perf_counter()
+            if _time.perf_counter() - held_since > 0.5:
+                return True, _time.perf_counter() - (t_end - time_limit_s)
+        else:
+            held_since = None
+        precise_sleep(max(1.0 / fps - (_time.perf_counter() - t0), 0.0))
+    return False, time_limit_s
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True, help="checkpoint dir, or 'zeros' for self-test")
@@ -211,6 +270,13 @@ def main() -> None:
     parser.add_argument("--task", default="pick up the red cube and lift it")
     parser.add_argument("--model-path", default=str(Path.home() / "sparkpack/openarm_mujoco/v1/scene.xml"))
     parser.add_argument("--no-viewer", action="store_true")
+    parser.add_argument(
+        "--rtc",
+        action="store_true",
+        help="Drive trials through lerobot's async RTCInferenceEngine (background "
+             "inference, continuous motion) instead of blocking sync chunks.",
+    )
+    parser.add_argument("--rtc-horizon", type=int, default=8)
     parser.add_argument(
         "--trt-socket",
         default=None,
@@ -232,10 +298,29 @@ def main() -> None:
             policy.connect_trt(args.trt_socket)
 
     rng = np.random.default_rng(args.seed)
+    engine = None
+    if args.rtc:
+        engine = build_rtc_engine(policy, robot, args.fps, args.rtc_horizon, args.task)
+
     results = []
     try:
         for t in range(args.trials):
-            r = run_trial(robot, iks, rng, policy, args.fps, args.time_limit)
+            if engine is not None:
+                cube0, arm = rcp.place_reachable_cube(robot, iks, rng)
+                rcp.setup_start_pose(robot, iks[arm.side], rng, args.fps)
+                policy.reset()
+                ok, t_used = run_rtc_trial(robot, engine, policy, args.fps, args.time_limit)
+                cz = float(rcp.cube_pos(robot)[2])
+                r = {"success": ok, "t_success": t_used if ok else None,
+                     "cube_y": float(cube0[1]), "intended_arm": arm.side,
+                     "committed_arm": arm.side, "final_cube_z": cz}
+                print(f"trial {t + 1:>3}/{args.trials}: "
+                      f"{'SUCCESS' if ok else 'fail   '} cube_y={cube0[1]:+.2f} "
+                      f"rtc t={t_used:.1f}s cube_z={cz:.3f}")
+                rcp.park_both_arms(robot, iks)
+                rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
+            else:
+                r = run_trial(robot, iks, rng, policy, args.fps, args.time_limit)
             results.append(r)
             print(
                 f"trial {t + 1:>3}/{args.trials}: {'SUCCESS' if r['success'] else 'fail   '} "
@@ -246,6 +331,8 @@ def main() -> None:
             rcp.park_both_arms(robot, iks)
             rcp.settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.15)
     finally:
+        if engine is not None:
+            engine.stop()
         n = len(results)
         if n:
             ok = [r for r in results if r["success"]]
