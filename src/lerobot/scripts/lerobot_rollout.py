@@ -152,6 +152,7 @@ Usage examples
 
 import logging
 
+from lerobot.cameras.mujoco import MujocoCameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
@@ -166,6 +167,7 @@ from lerobot.robots import (  # noqa: F401
     hope_jr,
     koch_follower,
     lekiwi,
+    mujoco_bi_openarm,
     omx_follower,
     openarm_follower,
     reachy2,
