@@ -1369,7 +1369,14 @@ def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
     require_package("transformers", extra="groot")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    image_processor = Qwen2VLImageProcessor.from_pretrained(model_name, trust_remote_code=True)
+    # The FAST (torchvision) image processor: the slow Qwen2VLImageProcessor
+    # does not accept the `device` kwarg the encode step passes (transformers
+    # >= 5 raises TypeError), and fast is what Isaac-GR00T uses anyway.
+    from transformers import AutoImageProcessor
+
+    image_processor = AutoImageProcessor.from_pretrained(
+        model_name, trust_remote_code=True, use_fast=True
+    )
     video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=True)
     proc = Qwen3VLProcessor(
         image_processor=image_processor,
@@ -2190,7 +2197,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "return_tensors": "pt",
             "padding": True,
         }
-        if target_device is not None:
+        if target_device is not None and getattr(self.proc.image_processor, "is_fast", False):
             proc_kwargs["device"] = str(target_device)
         encoded = self.proc(**proc_kwargs)
         for key, value in encoded.items():
