@@ -8,9 +8,14 @@ set -euo pipefail
 DATASET="${DATASET:-local/openarm_sim_cube}"
 OUT="${OUT:-outputs/groot_sim_cube}"
 
+# Image augmentation is off by default: the default transform set includes a
+# sharpness jitter whose CPU depthwise conv sporadically crashes oneDNN's
+# aarch64 JIT ("Xbyak::Error: label is too far") in spawned dataloader
+# workers on this Grace machine. Sim renders are visually uniform anyway.
+# To re-enable everything EXCEPT sharpness on other hardware, pass
+# --dataset.image_transforms.enable=true and a custom tfs dict.
 lerobot-train \
   --dataset.repo_id="${DATASET}" \
-  --dataset.image_transforms.enable=true \
   --policy.type=groot \
   --policy.base_model_path=nvidia/GR00T-N1.7-3B \
   --policy.embodiment_tag=new_embodiment \
