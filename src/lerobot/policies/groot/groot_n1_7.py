@@ -445,6 +445,15 @@ class Qwen3Backbone(nn.Module):
         optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
+        # Grid metadata must stay on CPU: transformers computes
+        # image_grid_thw.prod(-1) and int64 prod on GPU goes through torch's
+        # NVRTC jiterator, which cannot target very new compute capabilities
+        # (fails with "invalid value for --gpu-architecture" on GB10/sm_121).
+        # The values are only used to derive python split sizes anyway.
+        for _grid_key in ("image_grid_thw", "video_grid_thw"):
+            _grid = model_input.get(_grid_key)
+            if isinstance(_grid, torch.Tensor) and _grid.is_cuda:
+                model_input[_grid_key] = _grid.cpu()
         self._ensure_mm_token_type_ids(model_input)
         self._ensure_legacy_qwen3_position_ids(model_input)
         features = self._last_decoder_layer_output(model_input)
