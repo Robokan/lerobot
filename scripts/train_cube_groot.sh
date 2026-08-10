@@ -26,4 +26,5 @@ lerobot-train \
   --batch_size="${BATCH:-16}" \
   --steps="${STEPS:-20000}" \
   --save_freq=5000 \
-  --log_freq=100
+  --log_freq=100 \
+  "$@"
