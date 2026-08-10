@@ -1087,9 +1087,21 @@ class EpisodeRecorder:
         self.active = False
         self.dataset.clear_episode_buffer()
 
-    def save(self) -> None:
+    def save(self) -> bool:
         self.active = False
-        self.dataset.save_episode()
+        try:
+            self.dataset.save_episode()
+            return True
+        except Exception as e:  # noqa: BLE001
+            # One bad episode (e.g. a staging PNG lost to a transient disk
+            # error) must not kill a multi-hour generation run — drop it and
+            # keep generating.
+            print(f"  WARNING: episode save failed ({e}); dropping episode and continuing")
+            try:
+                self.dataset.clear_episode_buffer()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
 
     def finalize(self) -> None:
         self.dataset.finalize()
@@ -2023,10 +2035,12 @@ def main() -> None:
                 _RECORDER.start()
             ok = run_trial(robot, ik, args.fps, cube0)
             if ok:
-                successes += 1
                 if _RECORDER is not None:
-                    _RECORDER.save()
-                    print(f"  episode {successes} saved")
+                    if _RECORDER.save():
+                        successes += 1
+                        print(f"  episode {successes} saved")
+                else:
+                    successes += 1
                 print(f"  pick succeeded ({arm.side})")
             else:
                 if _RECORDER is not None:
