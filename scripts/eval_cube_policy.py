@@ -75,22 +75,40 @@ class CheckpointPolicy:
         )
         self.action_keys: list[str] | None = None
         self.robot_type: str | None = None
+        self.obs_features: dict | None = None
+
+    def configure_for_robot(self, robot) -> None:
+        from lerobot.utils.feature_utils import hw_to_dataset_features
+
+        self.action_keys = list(robot.action_features.keys())
+        self.robot_type = robot.name
+        self.obs_features = hw_to_dataset_features(robot.observation_features, "observation", True)
 
     def reset(self):
         self.policy.reset()
+        self._queue: list[np.ndarray] = []
 
     def act(self, obs: dict) -> dict:
-        action = self._predict_action(
-            obs,
-            self.policy,
-            self.device,
-            self.pre,
-            self.post,
-            use_amp=False,
-            task=self.task,
-            robot_type=self.robot_type,
-        )
-        vals = action.cpu().numpy().reshape(-1)
+        # Chunked inference: relative-action policies (GR00T) must decode a
+        # whole chunk against the observation it was generated from, so we
+        # preprocess once, predict a chunk, postprocess the full chunk to
+        # absolute actions, then feed them out one per tick.
+        if not self._queue:
+            from lerobot.policies.utils import prepare_observation_for_inference
+            from lerobot.utils.feature_utils import build_dataset_frame
+
+            frame = build_dataset_frame(self.obs_features, obs, prefix="observation")
+            with self.torch.inference_mode():
+                prepared = prepare_observation_for_inference(
+                    frame, self.device, self.task, self.robot_type
+                )
+                preprocessed = self.pre(prepared)
+                actions = self.policy.predict_action_chunk(preprocessed)
+                processed = self.post(actions)
+            chunk = processed.squeeze(0).cpu().numpy()
+            n = getattr(self.policy.config, "n_action_steps", chunk.shape[0])
+            self._queue = [chunk[i] for i in range(min(n, chunk.shape[0]))]
+        vals = self._queue.pop(0).reshape(-1)
         return {k: float(v) for k, v in zip(self.action_keys, vals, strict=True)}
 
 
@@ -169,8 +187,7 @@ def main() -> None:
         policy = ZerosPolicy(robot)
     else:
         policy = CheckpointPolicy(args.policy, args.dataset, args.task)
-        policy.action_keys = list(robot.action_features.keys())
-        policy.robot_type = robot.name
+        policy.configure_for_robot(robot)
 
     rng = np.random.default_rng(args.seed)
     results = []
