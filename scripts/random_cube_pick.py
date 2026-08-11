@@ -1991,6 +1991,12 @@ def main() -> None:
         default="pick up the red cube and lift it",
         help="Task string stored with every recorded frame (VLA language conditioning).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose per-trial output (cube pose, IK plans, phase logs). "
+        "Default is quiet: one 'episode N' line per saved episode.",
+    )
     args = parser.parse_args()
 
     global _RECORDER
@@ -2015,42 +2021,59 @@ def main() -> None:
 
     target_eps = args.episodes if (args.record and args.episodes > 0) else 0
     max_trials = args.trials if not target_eps else max(args.trials, target_eps * 3)
-    print(f"Running randomized bilateral pick trial(s)…")
+    print("Running randomized bilateral pick trial(s)…")
     successes = 0
     used = {"left": 0, "right": 0}
+
+    import contextlib
+    import io
+
+    def _trial_output():
+        # Quiet by default: swallow the per-trial chatter so the console is
+        # one clean 'episode N' line per saved episode. --debug restores it.
+        if args.debug:
+            return contextlib.nullcontext()
+        return contextlib.redirect_stdout(io.StringIO())
+
     try:
         t = 0
         while t < max_trials:
             t += 1
-            if target_eps:
-                print(f"\n=== Trial {t} — episodes saved {successes}/{target_eps} (trial cap {max_trials}) ===")
-            else:
-                print(f"\n=== Trial {t}/{max_trials} ===")
-            cube0, arm = place_reachable_cube(robot, iks, rng)
-            ik = iks[arm.side]
-            used[arm.side] += 1
-            print(f"  start: {arm.other} side-parked, teleport {arm.side} to random pose")
-            setup_start_pose(robot, ik, rng, args.fps)
-
-            if _RECORDER is not None:
-                _RECORDER.start()
-            ok = run_trial(robot, ik, args.fps, cube0)
-            if ok:
-                if _RECORDER is not None:
-                    if _RECORDER.save():
-                        successes += 1
-                        print(f"  episode {successes} saved")
+            with _trial_output():
+                if target_eps:
+                    print(f"\n=== Trial {t} — episodes saved {successes}/{target_eps} (trial cap {max_trials}) ===")
                 else:
-                    successes += 1
-                print(f"  pick succeeded ({arm.side})")
-            else:
+                    print(f"\n=== Trial {t}/{max_trials} ===")
+                cube0, arm = place_reachable_cube(robot, iks, rng)
+                ik = iks[arm.side]
+                used[arm.side] += 1
+                print(f"  start: {arm.other} side-parked, teleport {arm.side} to random pose")
+                setup_start_pose(robot, ik, rng, args.fps)
+
                 if _RECORDER is not None:
-                    _RECORDER.drop()
-                    print("  failed trial — episode dropped")
-                print(f"  pick failed ({arm.side})")
-            # Park both before the next drop (never recorded).
-            park_both_arms(robot, iks)
-            settle_pose(robot, ik, 0.0, args.fps, hold_s=0.15)
+                    _RECORDER.start()
+                ok = run_trial(robot, ik, args.fps, cube0)
+                if ok:
+                    if _RECORDER is not None:
+                        if _RECORDER.save():
+                            successes += 1
+                            print(f"  episode {successes} saved")
+                        else:
+                            ok = False
+                    else:
+                        successes += 1
+                    if ok:
+                        print(f"  pick succeeded ({arm.side})")
+                else:
+                    if _RECORDER is not None:
+                        _RECORDER.drop()
+                        print("  failed trial — episode dropped")
+                    print(f"  pick failed ({arm.side})")
+                # Park both before the next drop (never recorded).
+                park_both_arms(robot, iks)
+                settle_pose(robot, ik, 0.0, args.fps, hold_s=0.15)
+            if ok and not args.debug:
+                print(f"episode {successes}", flush=True)
             if target_eps and successes >= target_eps:
                 break
             if not target_eps and t >= args.trials:
