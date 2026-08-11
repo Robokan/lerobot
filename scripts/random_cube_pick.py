@@ -2027,13 +2027,46 @@ def main() -> None:
 
     import contextlib
     import io
+    import os
 
+    if not args.debug:
+        # The episode save path is noisy on stderr: HF datasets shows a Map
+        # progress bar and the AV1 encoder (SVT, via libav) prints its whole
+        # config banner per video. Silence both at the source where an API
+        # exists; anything left is caught by the fd-level redirect below.
+        try:
+            import datasets
+
+            datasets.disable_progress_bars()
+        except Exception:
+            pass
+        try:
+            import av
+
+            av.logging.set_level(av.logging.PANIC)
+        except Exception:
+            pass
+
+    @contextlib.contextmanager
     def _trial_output():
         # Quiet by default: swallow the per-trial chatter so the console is
         # one clean 'episode N' line per saved episode. --debug restores it.
+        # stderr must be redirected at the file-descriptor level: the video
+        # encoder logs from C code, below Python's sys.stderr.
         if args.debug:
-            return contextlib.nullcontext()
-        return contextlib.redirect_stdout(io.StringIO())
+            yield
+            return
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        saved_err = os.dup(2)
+        try:
+            os.close(2)
+            os.dup2(devnull, 2)
+            with contextlib.redirect_stdout(io.StringIO()):
+                yield
+        finally:
+            os.dup2(saved_err, 2)
+            os.close(saved_err)
+            os.close(devnull)
 
     try:
         t = 0
