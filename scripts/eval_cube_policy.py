@@ -346,18 +346,28 @@ def run_jit_trial(robot, pol, fps: int, time_limit_s: float = 30.0, slew: float 
     queue: list = []
     future = None
     cmd = None
+    pops_since_submit = 0
     while _time.perf_counter() < t_end:
         t0 = _time.perf_counter()
         obs = robot.get_observation()
-        if len(queue) == prefetch_at and future is None:
+        if len(queue) <= prefetch_at and future is None:
             future = pool.submit(chunk_from, dict(obs))
+            pops_since_submit = 0
         if not queue:
             if future is not None:
-                queue = future.result()
+                rows = future.result()
+                # The chunk was conditioned on the observation captured at
+                # submit time; the ticks executed since then are already in
+                # the past. Without this skip the new chunk re-commands the
+                # arm back along the path it just travelled — a visible
+                # forward/back/forward sweep at every chunk boundary.
+                skip = min(pops_since_submit, len(rows) - 1)
+                queue = rows[skip:]
                 future = None
             else:
                 queue = chunk_from(obs)  # first chunk of the episode (blocking)
         target = queue.pop(0)
+        pops_since_submit += 1
         cmd = target.copy() if cmd is None else cmd + np.clip(target - cmd, -slew, slew)
         robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
         z = float(rcp.cube_pos(robot)[2])
