@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -42,6 +43,33 @@ class ZerosPolicy:
 
     def act(self, obs: dict) -> dict:
         return {k: float(v) for k, v in obs.items() if k.endswith(".pos")}
+
+
+class _SmoothedPost:
+    """Postprocessor wrapper: zero-phase 3-tap smoothing of chunk rows.
+
+    Applied to the decoded absolute chunk (B, T, A) — including inside the RTC
+    engine, which receives this wrapper as its postprocessor. Gripper columns
+    pass through untouched (binary open/close must not be diluted). Endpoint
+    rows are kept so chunk boundaries stay anchored. Delegates everything else
+    (e.g. ``.steps`` introspection) to the wrapped pipeline.
+    """
+
+    def __init__(self, inner, action_keys: list[str]):
+        self._inner = inner
+        self._joint_idx = [i for i, k in enumerate(action_keys) if "gripper" not in k]
+
+    def __call__(self, actions):
+        out = self._inner(actions)
+        if out.ndim == 3 and out.shape[1] >= 3:
+            sm = out.clone()
+            sm[:, 1:-1] = 0.25 * out[:, :-2] + 0.5 * out[:, 1:-1] + 0.25 * out[:, 2:]
+            out = out.clone()
+            out[:, :, self._joint_idx] = sm[:, :, self._joint_idx]
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 class CheckpointPolicy:
@@ -114,6 +142,26 @@ class CheckpointPolicy:
         self.action_keys = list(robot.action_features.keys())
         self.robot_type = robot.name
         self.obs_features = hw_to_dataset_features(robot.observation_features, "observation", True)
+
+        # More Euler steps = better-integrated flow = less within-chunk wiggle.
+        # Measured on the sim-cube checkpoint: 4 -> 16 steps cuts intra-chunk
+        # direction reversals from ~50% to ~37% of steps. Eager path only; the
+        # TRT server has its own GROOT_TRT_DENOISE_STEPS knob.
+        steps = int(os.environ.get("GROOT_DENOISE_STEPS", "0"))
+        if steps > 0:
+            head = getattr(getattr(self.policy, "_groot_model", None), "action_head", None)
+            if head is not None:
+                head.num_inference_timesteps = steps
+                print(f"  denoise steps -> {steps}")
+
+        # Zero-phase smoothing of each predicted chunk (arm joints only): the
+        # policy's raw chunks reverse direction on ~half their steps while the
+        # training data reverses on ~4%; a centered 3-tap filter on the PLAN
+        # adds no feedback lag (unlike filtering executed commands, which
+        # costs enough tracking accuracy to break the grasp).
+        if os.environ.get("GROOT_SMOOTH_CHUNK") == "1":
+            self.post = _SmoothedPost(self.post, self.action_keys)
+            print("  chunk smoothing ENABLED (centered 3-tap, arms only)")
 
     def reset(self):
         self.policy.reset()
@@ -359,7 +407,24 @@ def main() -> None:
         default=None,
         help="Unix socket of a sim_cube_trt_server; model calls go to TRT engines.",
     )
+    parser.add_argument(
+        "--smooth-chunk",
+        action="store_true",
+        help="zero-phase 3-tap smoothing of each predicted chunk (arm joints only); "
+             "kills within-chunk dither without feedback lag",
+    )
+    parser.add_argument(
+        "--denoise-steps",
+        type=int,
+        default=0,
+        help="override flow-matching Euler steps (eager path; use GROOT_TRT_DENOISE_STEPS "
+             "on the TRT server). 16 markedly reduces chunk wiggle vs the default 4.",
+    )
     args = parser.parse_args()
+    if args.smooth_chunk:
+        os.environ["GROOT_SMOOTH_CHUNK"] = "1"
+    if args.denoise_steps:
+        os.environ["GROOT_DENOISE_STEPS"] = str(args.denoise_steps)
 
     robot = rcp.make_robot(args.model_path, args.fps, viewer=not args.no_viewer, cameras=args.cameras)
     iks = {a.side: rcp.build_ik(robot, a) for a in rcp.ARMS}
