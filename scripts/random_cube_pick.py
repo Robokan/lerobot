@@ -211,6 +211,18 @@ class ContactHit:
     force_n: float  # contact force magnitude (N)
 
 
+# Name of the body/geom the grasp machinery targets. The cube sim leaves this
+# as "cube"; other scenarios (e.g. the chocolate-bars sim) retarget it per pick
+# via set_target_body() — geoms are matched by substring, so body and geom
+# names must share this string.
+_TARGET_BODY = "cube"
+
+
+def set_target_body(name: str) -> None:
+    global _TARGET_BODY
+    _TARGET_BODY = name
+
+
 def contacts_between(
     robot: MujocoBiOpenArm, a_substr: str, b_substr: str
 ) -> list[ContactHit]:
@@ -244,7 +256,7 @@ def arm_hits_table(robot: MujocoBiOpenArm, arm: ArmSpec) -> list[ContactHit]:
 
 
 def arm_hits_cube(robot: MujocoBiOpenArm, arm: ArmSpec) -> list[ContactHit]:
-    return contacts_between(robot, arm.geom_prefix, "cube")
+    return contacts_between(robot, arm.geom_prefix, _TARGET_BODY)
 
 
 def finger_hits_cube(robot: MujocoBiOpenArm, arm: ArmSpec) -> list[ContactHit]:
@@ -258,7 +270,7 @@ def finger_hits_cube(robot: MujocoBiOpenArm, arm: ArmSpec) -> list[ContactHit]:
 
 def hand_hits_cube(robot: MujocoBiOpenArm, arm: ArmSpec) -> list[ContactHit]:
     """Contacts between the hand/palm body (gripper mount) and the cube."""
-    return contacts_between(robot, f"{arm.side}_hand", "cube")
+    return contacts_between(robot, f"{arm.side}_hand", _TARGET_BODY)
 
 
 def hand_hits_table(robot: MujocoBiOpenArm, arm: ArmSpec) -> list[ContactHit]:
@@ -546,7 +558,7 @@ def set_cube_xy(robot: MujocoBiOpenArm, x: float, y: float, yaw: float = 0.0) ->
 def cube_pos(robot: MujocoBiOpenArm) -> np.ndarray:
     import mujoco
 
-    bid = mujoco.mj_name2id(robot._model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    bid = mujoco.mj_name2id(robot._model, mujoco.mjtObj.mjOBJ_BODY, _TARGET_BODY)
     return robot._data.xpos[bid].copy()
 
 
@@ -569,7 +581,7 @@ def cube_yaw(robot: MujocoBiOpenArm) -> float:
     """
     import mujoco
 
-    bid = mujoco.mj_name2id(robot._model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    bid = mujoco.mj_name2id(robot._model, mujoco.mjtObj.mjOBJ_BODY, _TARGET_BODY)
     R = robot._data.xmat[bid].reshape(3, 3)
     yaw = math.atan2(R[1, 0], R[0, 0])
     return (yaw + math.pi / 4) % (math.pi / 2) - math.pi / 4
@@ -938,34 +950,23 @@ def choose_arm(
     cube: np.ndarray | None = None,
     grasp_yaw: float = 0.0,
 ) -> ArmSpec | None:
+    """Deterministic side rule: the cube's side of the robot centerline picks
+    the arm — left arm for y >= 0, right arm for y < 0.
+
+    Earlier versions scored plan quality and coin-flipped ties, so central
+    cubes were sometimes picked cross-body. That gives the policy an
+    ambiguous visual mapping to learn. One consistent rule makes the
+    demonstration data unambiguous: same cube position, same arm, always.
+    If the side's arm cannot reach, return None so the caller resamples the
+    cube pose instead of teaching a cross-body exception.
+    """
     if not reachable:
         return None
-    if len(reachable) == 1:
-        return reachable[0]
-    if iks is None or cube is None:
-        return reachable[int(rng.integers(0, len(reachable)))]
-    # Both arms qualify — prefer the one whose grasp-pose plan is better
-    # (closer + more level). A coin flip here hands central cubes to the arm
-    # that then stalls centimetres short (measured: two timeouts per batch).
-    scored = []
-    grasp = clamp_tip_target(np.array([cube[0], cube[1], cube[2] + GRASP_CLEARANCE]))
+    side = "left" if (cube is None or float(cube[1]) >= 0.0) else "right"
     for arm in reachable:
-        ik = iks[arm.side]
-        q = plan_q_to_tip_mid_robust(
-            ik, np.deg2rad(arm.idle_deg), grasp, yaw=grasp_yaw, pitch=GRASP_PITCH_RAD
-        )
-        if q is None:
-            continue
-        ik.set_q(q)
-        err = float(np.linalg.norm(ik.tip_mid() - grasp))
-        tilt = float(np.linalg.norm(ik.ori_err(grasp_yaw, GRASP_PITCH_RAD)))
-        scored.append((err + 0.03 * tilt, arm))
-    if not scored:
-        return reachable[int(rng.integers(0, len(reachable)))]
-    scored.sort(key=lambda x: x[0])
-    if len(scored) > 1 and scored[1][0] - scored[0][0] < 0.005:
-        return scored[int(rng.integers(0, 2))][1]  # true tie — keep variety
-    return scored[0][1]
+        if arm.side == side:
+            return arm
+    return None
 
 
 def teleport_to_tip(
