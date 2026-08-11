@@ -52,8 +52,16 @@ class LatencyTracker:
         return len(self._values)
 
     def max(self) -> float | None:
-        """Return the maximum latency or None if empty."""
-        return self.max_latency
+        """Return the maximum latency within the sliding window or None if empty.
+
+        RTC turns this value into the frozen-prefix length, so a slow outlier
+        (e.g. first-call warmup) must age out with the window rather than pin
+        the reported max for the rest of the session — a pinned max freezes the
+        entire overlap and disables inpainting's blending ramp.
+        """
+        if not self._values:
+            return None
+        return max(self._values)
 
     def percentile(self, q: float) -> float | None:
         """Return the q-quantile (q in [0,1]) of recorded latencies or None if empty."""
@@ -63,7 +71,7 @@ class LatencyTracker:
         if q <= 0.0:
             return min(self._values)
         if q >= 1.0:
-            return self.max_latency
+            return max(self._values)
         vals = np.array(list(self._values), dtype=np.float32)
         return float(np.quantile(vals, q))
 

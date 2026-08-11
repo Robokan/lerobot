@@ -357,13 +357,23 @@ class GrootPolicy(PreTrainedPolicy):
             # Generic RTC only provides normalized leftovers from the previous chunk. For
             # native relative-action N1.7 checkpoints those rows are tied to the old
             # observation state and old per-horizon stats row, so using them as the next
-            # prefix can push the policy in the wrong direction. Run without native RTC
-            # overlap guidance until a GROOT-specific RTC path can pass re-anchored
-            # absolute leftovers through.
-            if not getattr(self, "_warned_native_relative_rtc_prefix_disabled", False):
-                logger.info("Disabling native GR00T RTC prefix for relative-action policy")
-                self._warned_native_relative_rtc_prefix_disabled = True
-            return inputs, None
+            # prefix can push the policy in the wrong direction. However, LeRobot's RTC
+            # engine re-anchors relative leftovers against the live state
+            # (reanchor_relative_rtc_prefix) before calling this method, which is exactly
+            # the GROOT-specific path the guard below was waiting for. Set
+            # GROOT_NATIVE_RTC_PREFIX=1 to trust the re-anchored prefix and enable native
+            # inpainting (chunk-seam blending); default stays conservative.
+            import os as _os
+
+            if _os.environ.get("GROOT_NATIVE_RTC_PREFIX") != "1":
+                if not getattr(self, "_warned_native_relative_rtc_prefix_disabled", False):
+                    logger.info("Disabling native GR00T RTC prefix for relative-action policy")
+                    self._warned_native_relative_rtc_prefix_disabled = True
+                return inputs, None
+            if not getattr(self, "_warned_native_relative_rtc_prefix_enabled", False):
+                logger.info("Native GR00T RTC prefix ENABLED for relative-action policy "
+                            "(re-anchored leftovers)")
+                self._warned_native_relative_rtc_prefix_enabled = True
         if not isinstance(prev_chunk_left_over, torch.Tensor):
             raise TypeError("prev_chunk_left_over must be a torch.Tensor for GR00T N1.7 RTC.")
         if prev_chunk_left_over.numel() == 0:
@@ -430,13 +440,24 @@ class GrootPolicy(PreTrainedPolicy):
             frozen_steps = int(inference_delay or 0)
         except (TypeError, ValueError):
             frozen_steps = 0
-        frozen_steps = max(0, min(frozen_steps, overlap_steps))
+        # The merge step discards the first `real_delay` rows of the returned
+        # chunk, so execution starts right at the frozen/ramp boundary. Extend
+        # the freeze slightly past the estimated delay so the first rows that
+        # actually reach the robot are still constrained to the previous plan.
+        import os as _os2
+
+        freeze_margin = int(_os2.environ.get("GROOT_RTC_FREEZE_MARGIN", "2"))
+        frozen_steps = max(0, min(frozen_steps + freeze_margin, overlap_steps))
 
         options = {
             "action_horizon": action_horizon,
             "rtc_overlap_steps": overlap_steps,
             "rtc_frozen_steps": frozen_steps,
-            "rtc_ramp_rate": float(getattr(self._groot_model.config, "rtc_ramp_rate", 6.0)),
+            "rtc_ramp_rate": float(
+                _os2.environ.get(
+                    "GROOT_RTC_RAMP_RATE", getattr(self._groot_model.config, "rtc_ramp_rate", 6.0)
+                )
+            ),
         }
 
         inputs = dict(inputs)
@@ -471,7 +492,7 @@ class GrootPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
     @torch.no_grad()
-    def _trt_socket_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def _trt_socket_chunk(self, batch: dict[str, Tensor], **kwargs: object) -> Tensor:
         """Route the model call to a TRT inference server (GROOT_TRT_SOCKET).
 
         The server (Isaac-GR00T sim_cube_trt_server) receives the filtered,
@@ -489,7 +510,14 @@ class GrootPolicy(PreTrainedPolicy):
             self._trt_sock.connect(path)
             logger.info("GrootPolicy: model calls -> TRT server at %s", path)
         gi = self._filter_groot_inputs(batch, include_action=False)
+        gi, options = self._prepare_n1_7_rtc_inputs(
+            gi,
+            inference_delay=kwargs.get("inference_delay"),
+            prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
+        )
         msg = {}
+        if options is not None:
+            msg["__options__"] = {k: v for k, v in options.items() if not isinstance(v, torch.Tensor)}
         for k, v in gi.items():
             if isinstance(v, torch.Tensor):
                 t = v.detach().cpu()
@@ -519,7 +547,7 @@ class GrootPolicy(PreTrainedPolicy):
         import os
 
         if os.environ.get("GROOT_TRT_SOCKET"):
-            return self._trt_socket_chunk(batch)
+            return self._trt_socket_chunk(batch, **kwargs)
 
         # Preprocessing is handled by the processor pipeline, so we just filter the batch.
         # During inference, we do not pass action because it is predicted.

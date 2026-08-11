@@ -2449,6 +2449,111 @@ class GrootN17ActionDecodeStep(ProcessorStep):
         )
         return new_transition
 
+    def reanchor_rtc_prefix(self, prev_actions_absolute: torch.Tensor) -> torch.Tensor:
+        """Encode absolute env actions back into model space for the RTC prefix.
+
+        Exact inverse of ``__call__`` for the leftover tail of the previous chunk:
+        relative groups are re-expressed against the raw state cached by the
+        connected pack step (i.e. the observation the *next* chunk will be
+        predicted from), then min-max normalized with the same per-timestep
+        stats rows 0..L-1 that will decode the new chunk's first L rows. This
+        guarantees frozen inpainted rows decode back to the exact absolute
+        actions already streaming to the robot — without it, native-relative
+        leftovers stay anchored to the previous state and every chunk seam
+        jumps by the robot's motion during inference.
+
+        Args:
+            prev_actions_absolute: (L, env_action_dim) absolute env actions.
+
+        Returns:
+            (L, sum-of-group-dims) normalized model-space prefix rows.
+        """
+        if self.raw_stats is None or self.modality_config is None:
+            raise RuntimeError("GrootN17ActionDecodeStep has no stats/modality config to encode a prefix.")
+        if self.action_decode_transform:
+            raise NotImplementedError(
+                f"RTC prefix re-anchoring does not support action_decode_transform="
+                f"{self.action_decode_transform!r}."
+            )
+        action_config = self.modality_config.get("action", {})
+        action_keys = action_config.get("modality_keys", [])
+        action_configs = action_config.get("action_configs", [])
+
+        prev_np = prev_actions_absolute.detach().cpu().float().numpy()
+        if prev_np.ndim != 2:
+            raise ValueError(f"Expected (L, action_dim) prefix, got shape {prev_np.shape}")
+        prev_np = prev_np[None]  # (1, L, D)
+        horizon = prev_np.shape[1]
+
+        raw_state = self.pack_step.get_cached_raw_state() if self.pack_step is not None else None
+        encoded_groups: list[np.ndarray] = []
+        start_idx = 0
+        for idx, key in enumerate(action_keys):
+            if not isinstance(key, str):
+                continue
+            stats_entry = self.raw_stats.get("action", {}).get(key, {})
+            if not isinstance(stats_entry, dict):
+                continue
+            dim = stat_dim_from_entry(stats_entry)
+            if dim <= 0:
+                continue
+            cfg = (
+                action_configs[idx]
+                if idx < len(action_configs) and isinstance(action_configs[idx], dict)
+                else {}
+            )
+            group = prev_np[..., start_idx : start_idx + dim]
+            if group.shape[-1] < dim:
+                # Groups beyond the env action dim were sliced off during decode;
+                # there is nothing to anchor them to, so pad neutral rows.
+                pad = np.zeros((*group.shape[:-1], dim - group.shape[-1]), dtype=group.dtype)
+                group = np.concatenate([group, pad], axis=-1)
+            if self.use_relative_action and config_value(cfg.get("rep")) == "relative":
+                state_key = cfg.get("state_key") or key
+                if raw_state is None or state_key not in raw_state:
+                    raise RuntimeError(
+                        f"RTC prefix re-anchoring needs cached raw state '{state_key}'; run the "
+                        "preprocessor on the current observation first."
+                    )
+                reference = raw_state[state_key]
+                if isinstance(reference, torch.Tensor):
+                    reference = reference.detach().cpu().float().numpy()
+                action_type = config_value(cfg.get("type"))
+                if action_type == "non_eef":
+                    group = group - reference[:, None, :]
+                else:
+                    raise NotImplementedError(
+                        f"RTC prefix re-anchoring is not implemented for relative action type "
+                        f"'{action_type}' (key '{key}')."
+                    )
+            min_v, max_v = _n1_7_decode_stats_for_action(
+                self.raw_stats,
+                key,
+                cfg,
+                use_relative_action=self.use_relative_action,
+                use_percentiles=self.use_percentiles,
+            )
+            if min_v.ndim == 2 and horizon <= min_v.shape[0]:
+                min_v = min_v[:horizon]
+                max_v = max_v[:horizon]
+            span = max_v - min_v
+            normalized = np.where(
+                np.abs(span) < 1e-8,
+                np.zeros_like(group),
+                (group - min_v) / np.where(np.abs(span) < 1e-8, 1.0, span) * 2.0 - 1.0,
+            )
+            # Decode clips to [-1, 1]; clip here too so frozen rows round-trip
+            # to exactly what will be executed.
+            encoded_groups.append(np.clip(normalized, -1.0, 1.0))
+            start_idx += dim
+
+        if not encoded_groups:
+            raise RuntimeError("RTC prefix re-anchoring produced no action groups.")
+        encoded = np.concatenate(encoded_groups, axis=-1)[0]  # (L, sum_dims)
+        return torch.as_tensor(
+            encoded, dtype=prev_actions_absolute.dtype, device=prev_actions_absolute.device
+        )
+
     def transform_features(self, features):
         return features
 

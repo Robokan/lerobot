@@ -165,6 +165,14 @@ class RTCInferenceEngine(InferenceEngine):
             (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
             None,
         )
+        # Policies whose relative/absolute conversion lives inside a custom
+        # postprocessor step (e.g. GR00T N1.7 native relative actions) expose a
+        # `reanchor_rtc_prefix` hook there instead of using the generic
+        # RelativeActionsProcessorStep.
+        self._native_reanchor_step = next(
+            (s for s in postprocessor.steps if hasattr(s, "reanchor_rtc_prefix")),
+            None,
+        )
         if self._relative_step is not None:
             if self._relative_step.action_names is None:
                 cfg_names = getattr(policy.config, "action_feature_names", None)
@@ -269,7 +277,10 @@ class RTCInferenceEngine(InferenceEngine):
             time_per_chunk = 1.0 / self._fps
             policy_device = torch.device(self._device)
 
-            warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 0
+            # The first inference always pays one-time costs (allocator/graph capture,
+            # remote-backend connection), so its latency is never representative:
+            # treat it as warmup even without torch.compile.
+            warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 1
             inference_count = 0
             consecutive_errors = 0
 
@@ -316,6 +327,16 @@ class RTCInferenceEngine(InferenceEngine):
                                         normalizer_step=self._normalizer_step,
                                         policy_device=policy_device,
                                     )
+                        elif prev_actions is not None and self._native_reanchor_step is not None:
+                            # Native-relative checkpoints: re-encode the absolute
+                            # leftovers against the state cached by the preprocess
+                            # call above, so the prefix decodes back to exactly the
+                            # actions already streaming to the robot.
+                            prev_abs = queue.get_processed_left_over()
+                            if prev_abs is not None and prev_abs.numel() > 0:
+                                prev_actions = self._native_reanchor_step.reanchor_rtc_prefix(
+                                    prev_abs
+                                ).to(policy_device)
 
                         if prev_actions is not None:
                             prev_actions = _normalize_prev_actions_length(
@@ -333,7 +354,7 @@ class RTCInferenceEngine(InferenceEngine):
 
                         inference_count += 1
                         consecutive_errors = 0
-                        is_warmup = self._use_torch_compile and inference_count <= warmup_required
+                        is_warmup = inference_count <= warmup_required
                         if is_warmup:
                             latency_tracker.reset()
                         else:

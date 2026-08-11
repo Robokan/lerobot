@@ -231,10 +231,14 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
     from lerobot.utils.feature_utils import build_dataset_frame
     from lerobot.utils.robot_utils import precise_sleep
 
+    import numpy as _np
+
     engine.reset()
     engine.resume()  # the RTC background thread starts paused
     t_end = _time.perf_counter() + time_limit_s
     held_since = None
+    cmd = None  # slew-limited command state
+    slew = 2.5  # deg per tick — spreads chunk-seam jumps (measured up to 28 deg)
     while _time.perf_counter() < t_end:
         t0 = _time.perf_counter()
         obs = robot.get_observation()
@@ -242,8 +246,15 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
         frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
         a = engine.get_action(frame)
         if a is not None:
-            vals = a.detach().cpu().numpy().reshape(-1)
-            robot.send_action({k: float(v) for k, v in zip(pol.action_keys, vals, strict=True)})
+            target = a.detach().cpu().numpy().reshape(-1)
+            if cmd is None:
+                cmd = target.copy()
+            else:
+                cmd = cmd + _np.clip(target - cmd, -slew, slew)
+            robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
+        elif cmd is not None:
+            # queue priming/gap: hold the last command so the sim keeps stepping
+            robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
         z = float(rcp.cube_pos(robot)[2])
         if z >= rcp.SUCCESS_CUBE_Z:
             held_since = held_since or _time.perf_counter()
@@ -252,6 +263,65 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
         else:
             held_since = None
         precise_sleep(max(1.0 / fps - (_time.perf_counter() - t0), 0.0))
+    return False, time_limit_s
+
+
+def run_jit_trial(robot, pol, fps: int, time_limit_s: float = 30.0, slew: float = 2.5):
+    """Just-in-time sequential chunking: execute each chunk to completion and
+    compute the next one in a background thread during the current chunk's
+    tail. New chunks start from (nearly) the state the old chunk actually
+    reached, so seams are policy-consistent — the pattern NVIDIA's GR00T
+    demos use, feasible here because TRT inference (~0.2 s) fits inside the
+    chunk tail (~0.3 s)."""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+
+    from lerobot.utils.robot_utils import precise_sleep
+
+    pol.reset()
+    pool = ThreadPoolExecutor(max_workers=1)
+    prefetch_at = max(2, int(0.25 * fps) + 2)  # ticks-left threshold to prefetch
+
+    # direct chunk computation without the act() side effects
+    def chunk_from(obs) -> list:
+        pol._queue = []
+        first = pol.act(dict(obs))
+        rows = [np.array([first[k] for k in pol.action_keys])]
+        rows += [r.copy() for r in pol._queue]
+        pol._queue = []
+        return rows
+
+    t_end = _time.perf_counter() + time_limit_s
+    held_since = None
+    queue: list = []
+    future = None
+    cmd = None
+    while _time.perf_counter() < t_end:
+        t0 = _time.perf_counter()
+        obs = robot.get_observation()
+        if len(queue) == prefetch_at and future is None:
+            future = pool.submit(chunk_from, dict(obs))
+        if not queue:
+            if future is not None:
+                queue = future.result()
+                future = None
+            else:
+                queue = chunk_from(obs)  # first chunk of the episode (blocking)
+        target = queue.pop(0)
+        cmd = target.copy() if cmd is None else cmd + np.clip(target - cmd, -slew, slew)
+        robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
+        z = float(rcp.cube_pos(robot)[2])
+        if z >= rcp.SUCCESS_CUBE_Z:
+            held_since = held_since or _time.perf_counter()
+            if _time.perf_counter() - held_since > 0.5:
+                pool.shutdown(wait=False)
+                return True, _time.perf_counter() - (t_end - time_limit_s)
+        else:
+            held_since = None
+        precise_sleep(max(1.0 / fps - (_time.perf_counter() - t0), 0.0))
+    pool.shutdown(wait=False)
     return False, time_limit_s
 
 
@@ -277,6 +347,13 @@ def main() -> None:
              "inference, continuous motion) instead of blocking sync chunks.",
     )
     parser.add_argument("--rtc-horizon", type=int, default=8)
+    parser.add_argument(
+        "--jit",
+        action="store_true",
+        help="Just-in-time sequential chunking: full-chunk execution with the "
+             "next chunk computed in the background during the tail. Smoothest "
+             "async mode; needs TRT-fast inference.",
+    )
     parser.add_argument(
         "--trt-socket",
         default=None,
@@ -305,7 +382,20 @@ def main() -> None:
     results = []
     try:
         for t in range(args.trials):
-            if engine is not None:
+            if args.jit:
+                cube0, arm = rcp.place_reachable_cube(robot, iks, rng)
+                rcp.setup_start_pose(robot, iks[arm.side], rng, args.fps)
+                ok, t_used = run_jit_trial(robot, policy, args.fps, args.time_limit)
+                cz = float(rcp.cube_pos(robot)[2])
+                r = {"success": ok, "t_success": t_used if ok else None,
+                     "cube_y": float(cube0[1]), "intended_arm": arm.side,
+                     "committed_arm": arm.side, "final_cube_z": cz}
+                print(f"trial {t + 1:>3}/{args.trials}: "
+                      f"{'SUCCESS' if ok else 'fail   '} cube_y={cube0[1]:+.2f} "
+                      f"jit t={t_used:.1f}s cube_z={cz:.3f}")
+                rcp.park_both_arms(robot, iks)
+                rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
+            elif engine is not None:
                 cube0, arm = rcp.place_reachable_cube(robot, iks, rng)
                 rcp.setup_start_pose(robot, iks[arm.side], rng, args.fps)
                 policy.reset()
