@@ -165,14 +165,20 @@ from lerobot.utils.utils import (
 )
 
 
-def _drain_viewer_recording_controls(events: dict) -> None:
-    """Apply Y/T/n/q keys typed into the MuJoCo viewer (focus steals stdin)."""
+def _drain_viewer_recording_controls(events: dict, teleop=None) -> None:
+    """Apply recording controls from the MuJoCo viewer keys and, when the
+    teleoperator surfaces them (VR controller B/A/X), from the headset."""
     try:
         from lerobot.robots.mujoco_bi_openarm.viewer_keys import drain_recording_controls
     except Exception:  # noqa: BLE001
-        return
-    for control in drain_recording_controls():
-        apply_recording_control(control, events)
+        pass
+    else:
+        for control in drain_recording_controls():
+            apply_recording_control(control, events)
+    drain = getattr(teleop, "drain_recording_controls", None)
+    if callable(drain):
+        for control in drain():
+            apply_recording_control(control, events)
 from lerobot.utils.visualization_utils import (
     init_visualization,
     log_visualization_data,
@@ -345,14 +351,14 @@ def record_loop(
                     "This is likely to happen when resetting the environment without a teleop device. "
                     "The robot won't be at its rest position at the start of the next episode."
                 )
-            _drain_viewer_recording_controls(events)
+            _drain_viewer_recording_controls(events, teleop)
             if events["exit_early"] or events["stop_recording"]:
                 events["exit_early"] = False
                 events["recording_active"] = False
                 break
             continue
 
-        _drain_viewer_recording_controls(events)
+        _drain_viewer_recording_controls(events, teleop)
 
         if events["exit_early"]:
             events["exit_early"] = False

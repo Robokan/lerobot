@@ -45,11 +45,13 @@
 #
 # OpenXR driver (Quest / WiVRn) — keep CAMERAS=1 (default) so the headset can
 # show the MuJoCo ego + wrist feeds:
-#   Y  toggle tracking (delta teleop from current controller pose)
-#   B  toggle passthrough ↔ MuJoCo camera view
-#   X  toggle ego ↔ right_wrist
-#   A  toggle ego ↔ left_wrist
+#   X  toggle tracking (delta teleop from current controller pose)
+#   Y  toggle passthrough ↔ MuJoCo camera view
+#   thumbstick  left = left wrist cam, right = right wrist cam, center = chest
+#   B  start recording        A  stop recording & save
+#   right grip squeeze  cancel (re-record) the current episode
 #   triggers = grippers
+#   (keyboard y/t/n/←/q still work as a fallback in record mode)
 #
 # Examples:
 #   bash scripts/run_vr_sim.sh                                  # scripted teleop

@@ -28,10 +28,13 @@ When MuJoCo (or real) camera frames are fed in via :meth:`update_camera_frames`,
 the headset can show them as a composition quad with the same controls as
 SparkJAX:
 
-  Y — toggle tracking
-  B — toggle passthrough ↔ active MuJoCo/robot camera
-  X — toggle ego ↔ right_wrist
-  A — toggle ego ↔ left_wrist
+  X — toggle tracking
+  Y — toggle passthrough ↔ active MuJoCo/robot camera
+  thumbstick — push left = left wrist cam, push right = right wrist cam,
+               centered = chest (ego) cam
+  B — start recording          A — stop recording & save episode
+  right grip squeeze — cancel (re-record) the current episode
+  triggers — grippers
 
 The controller-relative *reference capture* (delta-teleop) is performed in
 :meth:`get_targets` (teleop thread) against the robot's current TCP pose, so the
@@ -152,7 +155,20 @@ class OpenXRPoseSource(PoseSource):
         self._cam_frames: dict[str, np.ndarray] = {}
         self._cam_seq = 0
         self._active_camera = "ego"
-        self._force_passthrough = True  # SparkJAX default: passthrough until B
+        self._force_passthrough = True  # SparkJAX default: passthrough until Y
+
+        # Recording control requests (B=start, A=stop&save, X=discard) drained
+        # by the record loop via drain_recording_controls().
+        self._record_controls: list[str] = []
+        # Left-grip squeeze edge state (tracking toggle) with hysteresis.
+        self._squeeze_was_high = False
+
+    def drain_recording_controls(self) -> list[str]:
+        """Return and clear pending controller recording requests (B/A/X)."""
+        with self._lock:
+            controls = list(self._record_controls)
+            self._record_controls.clear()
+        return controls
 
     # ------------------------------------------------------------------ lifecycle
     def start(self):
@@ -347,6 +363,12 @@ class OpenXRPoseSource(PoseSource):
         b_button_action = xr.create_action(action_set, xr.ActionCreateInfo(
             action_name="b_button", action_type=xr.ActionType.BOOLEAN_INPUT,
             localized_action_name="B Button", subaction_paths=right_path))
+        squeeze_action = xr.create_action(action_set, xr.ActionCreateInfo(
+            action_name="squeeze", action_type=xr.ActionType.FLOAT_INPUT,
+            localized_action_name="Grip Squeeze", subaction_paths=hand_paths))
+        stick_x_action = xr.create_action(action_set, xr.ActionCreateInfo(
+            action_name="stick_x", action_type=xr.ActionType.FLOAT_INPUT,
+            localized_action_name="Thumbstick X", subaction_paths=hand_paths))
 
         for profile_path, extras in [
             ("/interaction_profiles/htc/vive_controller",
@@ -354,23 +376,30 @@ class OpenXRPoseSource(PoseSource):
               "activate": "/user/hand/left/input/menu/click",
               "x_btn": "/user/hand/left/input/trackpad/click",
               "a_btn": "/user/hand/right/input/trackpad/click",
-              "b_btn": None}),
+              "b_btn": None,
+              "squeeze": "/input/squeeze/click",
+              "stick_x": "/input/trackpad/x"}),
             ("/interaction_profiles/htc/vive_focus3_controller",
              {"trigger": "/input/trigger/value",
               "activate": "/user/hand/left/input/y/click",
               "x_btn": "/user/hand/left/input/x/click",
               "a_btn": "/user/hand/right/input/a/click",
-              "b_btn": "/user/hand/right/input/b/click"}),
+              "b_btn": "/user/hand/right/input/b/click",
+              "squeeze": "/input/squeeze/value",
+              "stick_x": "/input/thumbstick/x"}),
             ("/interaction_profiles/oculus/touch_controller",
              {"trigger": "/input/trigger/value",
               "activate": "/user/hand/left/input/y/click",
               "x_btn": "/user/hand/left/input/x/click",
               "a_btn": "/user/hand/right/input/a/click",
-              "b_btn": "/user/hand/right/input/b/click"}),
+              "b_btn": "/user/hand/right/input/b/click",
+              "squeeze": "/input/squeeze/value",
+              "stick_x": "/input/thumbstick/x"}),
             ("/interaction_profiles/khr/simple_controller",
              {"trigger": "/input/select/click",
               "activate": "/user/hand/left/input/menu/click",
-              "x_btn": None, "a_btn": None, "b_btn": None}),
+              "x_btn": None, "a_btn": None, "b_btn": None,
+              "squeeze": None, "stick_x": None}),
         ]:
             try:
                 bindings = []
@@ -381,6 +410,14 @@ class OpenXRPoseSource(PoseSource):
                     bindings.append(xr.ActionSuggestedBinding(
                         action=trigger_action,
                         binding=xr.string_to_path(instance, f"{hand}{extras['trigger']}")))
+                    if extras.get("squeeze"):
+                        bindings.append(xr.ActionSuggestedBinding(
+                            action=squeeze_action,
+                            binding=xr.string_to_path(instance, f"{hand}{extras['squeeze']}")))
+                    if extras.get("stick_x"):
+                        bindings.append(xr.ActionSuggestedBinding(
+                            action=stick_x_action,
+                            binding=xr.string_to_path(instance, f"{hand}{extras['stick_x']}")))
                 bindings.append(xr.ActionSuggestedBinding(
                     action=activate_action,
                     binding=xr.string_to_path(instance, extras["activate"])))
@@ -639,8 +676,8 @@ class OpenXRPoseSource(PoseSource):
                             except xr.exception.XrException:
                                 pass
 
-                        # Y button toggles tracking.
-                        if _edge(activate_action, left_path[0]):
+                        # X toggles tracking.
+                        if _edge(x_button_action, left_path[0]):
                             with self._lock:
                                 self._tracking = not self._tracking
                                 if self._tracking:
@@ -651,16 +688,59 @@ class OpenXRPoseSource(PoseSource):
                                 else:
                                     tracking_now = False
                             logger.info(
-                                "Tracking %s (Y button)",
+                                "Tracking %s (X button)",
                                 "ACTIVATED" if tracking_now else "PAUSED",
                             )
 
-                        # X / A camera switching (SparkJAX: X = ego↔right, A = ego↔left).
+                        # Right grip squeeze cancels the current take
+                        # (re-record). 0.7/0.3 hysteresis so an analog grip
+                        # can't chatter the edge.
+                        squeeze_cancel = False
+                        try:
+                            sq = xr.get_action_state_float(session, xr.ActionStateGetInfo(
+                                action=squeeze_action, subaction_path=hand_paths[1]))
+                            sq_val = sq.current_state if sq.is_active else 0.0
+                            if not self._squeeze_was_high and sq_val > 0.7:
+                                self._squeeze_was_high = True
+                                squeeze_cancel = True
+                            elif self._squeeze_was_high and sq_val < 0.3:
+                                self._squeeze_was_high = False
+                        except xr.exception.XrException:
+                            pass
+
+                        # B starts recording, A stops & saves, right squeeze
+                        # discards the current take. Drained by the record loop.
+                        control = None
+                        if _edge(b_button_action, right_path[0]):
+                            control = "y"
+                        elif _edge(a_button_action, right_path[0]):
+                            control = "t"
+                        elif squeeze_cancel:
+                            control = "left"
+                        if control is not None:
+                            with self._lock:
+                                self._record_controls.append(control)
+
+                        # Thumbstick x picks the headset camera: push left =
+                        # left wrist, push right = right wrist, centered = chest
+                        # (ego). Either stick works; the larger deflection wins.
+                        # 0.6/0.3 hysteresis keeps the boundary from flickering.
+                        stick = 0.0
+                        for hp in hand_paths:
+                            try:
+                                st_x = xr.get_action_state_float(session, xr.ActionStateGetInfo(
+                                    action=stick_x_action, subaction_path=hp))
+                                if st_x.is_active and abs(st_x.current_state) > abs(stick):
+                                    stick = st_x.current_state
+                            except xr.exception.XrException:
+                                pass
                         new_cam = None
-                        if _edge(x_button_action, left_path[0]):
-                            new_cam = "ego" if self._active_camera == "right" else "right"
-                        if _edge(a_button_action, right_path[0]):
-                            new_cam = "ego" if self._active_camera == "left" else "left"
+                        if stick < -0.6:
+                            new_cam = "left"
+                        elif stick > 0.6:
+                            new_cam = "right"
+                        elif abs(stick) < 0.3:
+                            new_cam = "ego"
                         if new_cam is not None and new_cam != self._active_camera:
                             with self._lock:
                                 available = set(self._cam_frames)
@@ -674,14 +754,14 @@ class OpenXRPoseSource(PoseSource):
                                     sorted(available) or "none",
                                 )
 
-                        # B toggles passthrough ↔ camera feed.
-                        if _edge(b_button_action, right_path[0]):
+                        # Y toggles passthrough ↔ camera feed.
+                        if _edge(activate_action, left_path[0]):
                             self._force_passthrough = not self._force_passthrough
                             if self._force_passthrough:
-                                logger.info("View -> PASSTHROUGH (B button)")
+                                logger.info("View -> PASSTHROUGH (Y button)")
                             else:
                                 logger.info(
-                                    "View -> CAMERA [%s] (B button)",
+                                    "View -> CAMERA [%s] (Y button)",
                                     self._active_camera.upper(),
                                 )
 

@@ -184,6 +184,11 @@ class VRMocap(Teleoperator):
             action[f"{side}_gripper.pos"] = gripper_m_to_deg(self._grip_m[side])
         return action
 
+    def drain_recording_controls(self) -> list[str]:
+        """Pending recording controls from the pose source (VR B/A/X buttons)."""
+        drain = getattr(self._source, "drain_recording_controls", None)
+        return drain() if callable(drain) else []
+
     def send_feedback(self, feedback: dict) -> None:
         """Forward robot observation images to the OpenXR headset view."""
         source = self._source
