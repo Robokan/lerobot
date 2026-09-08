@@ -742,12 +742,54 @@ def _cmd_seed(robot: MujocoBiOpenArm, side: str) -> np.ndarray:
     return _arm_q_from_obs(robot.get_observation(), side)
 
 
+# Debug overlay: when set to a cube position, every commanded tick draws the
+# wrist->cube line (green) and the gripper's approach ray (red) of the same
+# length into the viewer. When the arm is aimed, the red ray lies on the green
+# line. None disables and clears the overlay.
+_AIM_OVERLAY: dict[str, np.ndarray | None] = {"cube": None}
+
+
+def _draw_aim_overlay(robot: MujocoBiOpenArm, ik: PositionOnlyIK) -> None:
+    viewer = getattr(robot, "_viewer", None)
+    if viewer is None:
+        return
+    import mujoco
+
+    scn = viewer.user_scn
+    cube = _AIM_OVERLAY["cube"]
+    if cube is None:
+        scn.ngeom = 0
+        return
+    wrist = robot._data.xpos[ik.body].copy()
+    approach = robot._data.xmat[ik.body].reshape(3, 3)[:, 2]
+    length = float(np.linalg.norm(cube - wrist))
+    rays = [
+        (cube, np.array([0.1, 0.9, 0.2, 0.9])),                       # wrist -> cube
+        (wrist + approach * length, np.array([0.95, 0.2, 0.15, 0.9])),  # gripper approach
+    ]
+    scn.ngeom = 0
+    for end, rgba in rays:
+        g = scn.geoms[scn.ngeom]
+        mujoco.mjv_initGeom(
+            g, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3), np.eye(3).flatten(), rgba
+        )
+        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, 0.004, wrist, np.asarray(end, dtype=float))
+        scn.ngeom += 1
+    g = scn.geoms[scn.ngeom]
+    mujoco.mjv_initGeom(
+        g, mujoco.mjtGeom.mjGEOM_SPHERE, np.full(3, 0.012), np.asarray(cube, dtype=float),
+        np.eye(3).flatten(), np.array([0.1, 0.9, 0.2, 0.6]),
+    )
+    scn.ngeom += 1
+
+
 def send_q(
     robot: MujocoBiOpenArm,
     ik: PositionOnlyIK,
     grip_m: float,
 ) -> None:
     """Command active arm from IK; keep the other arm parked."""
+    _draw_aim_overlay(robot, ik)
     q = ik.q()
     _LAST_CMD[ik.arm.side] = np.asarray(q, dtype=float).copy()
     action = _park_action(ik.arm.other)
@@ -1796,6 +1838,227 @@ def place_reachable_cube(
     raise RuntimeError("could not sample a cube reachable by either arm")
 
 
+def aim_error_deg(ik: PositionOnlyIK, cube: np.ndarray) -> float:
+    """Angle between the gripper approach axis (TCP z) and the wrist -> cube line."""
+    d = np.asarray(cube, dtype=float) - ik.ee()
+    d /= max(float(np.linalg.norm(d)), 1e-9)
+    approach = ik.rot()[:, 2]
+    return math.degrees(math.acos(float(np.clip(np.dot(approach, d), -1.0, 1.0))))
+
+
+def aim_yaw_pitch_from_dir(aim_dir: np.ndarray) -> tuple[float, float]:
+    """grasp_rot() parameters whose approach axis points along aim_dir."""
+    d = np.asarray(aim_dir, dtype=float)
+    return math.atan2(d[1], d[0]), math.atan2(-d[2], math.hypot(d[0], d[1]))
+
+
+def pinch_tilt_deg(ik: PositionOnlyIK) -> float:
+    """How far the finger-opening axis (TCP y) is from table-parallel."""
+    return math.degrees(math.asin(float(np.clip(abs(ik.rot()[2, 1]), 0.0, 1.0))))
+
+
+def shoulder_pos(ik: PositionOnlyIK) -> np.ndarray:
+    return ik.data.xpos[ik.model.jnt_bodyid[ik.jids[0]]].copy()
+
+
+# Pre-aim standoff: wrist this far from the cube, on the shoulder->cube line,
+# looking down at this angle. A human aims from behind the object, not from
+# wherever the hand happened to be.
+AIM_STANDOFF_M = 0.22
+AIM_PITCH_RAD = math.radians(35.0)
+
+
+def aim_standoff_candidates(ik: PositionOnlyIK, cube: np.ndarray) -> list[np.ndarray]:
+    """Standoff points at AIM_STANDOFF_M from the cube, preferred first.
+
+    First choice is behind the cube on the shoulder->cube line looking down
+    35 deg. Cubes close to the shoulder leave no room behind them (the wrist
+    would sit on the shoulder), so the list steepens toward looking straight
+    down and swings the azimuth up to 60 deg off the shoulder line; the planner
+    takes the first reachable one.
+    """
+    sh = shoulder_pos(ik)
+    h = np.asarray(cube[:2], dtype=float) - sh[:2]
+    base_az = math.atan2(h[1], h[0])
+    out = []
+    for pitch_deg in (35.0, 50.0, 65.0, 80.0):
+        pitch = math.radians(pitch_deg)
+        for daz_deg in (0.0, 30.0, -30.0, 60.0, -60.0):
+            az = base_az + math.radians(daz_deg)
+            horiz = AIM_STANDOFF_M * math.cos(pitch)
+            p = np.asarray(cube, dtype=float) - np.array([math.cos(az), math.sin(az), 0.0]) * horiz
+            p[2] = float(cube[2]) + AIM_STANDOFF_M * math.sin(pitch)
+            out.append(p)
+    return out
+
+
+def plan_aim_axis(
+    ik: PositionOnlyIK,
+    q_start: np.ndarray,
+    wrist_target: np.ndarray,
+    aim_dir: np.ndarray,
+    rng: np.random.Generator | None = None,
+    iters: int = 400,
+) -> tuple[np.ndarray | None, float, float]:
+    """DLS IK: wrist (TCP) to wrist_target, approach axis along aim_dir, and the
+    pinch (finger-opening axis) table-parallel — i.e. the full grasp_rot()
+    orientation whose approach axis is the aim line. Six constraints on seven
+    joints; the standoff-candidate search supplies the reachability slack.
+    Returns (q or None, wrist_err_m, aim_err_deg); q is set on ``ik``.
+    """
+    import mujoco
+
+    aim_dir = np.asarray(aim_dir, dtype=float)
+    aim_dir = aim_dir / max(float(np.linalg.norm(aim_dir)), 1e-9)
+    yaw, pitch = aim_yaw_pitch_from_dir(aim_dir)
+    seeds = [q_start.copy(), np.deg2rad(ik.arm.idle_deg)]
+    if rng is not None:
+        seeds += [np.clip(q_start + rng.normal(0.0, 0.15, 7), ik.lo, ik.hi) for _ in range(4)]
+    best = None
+    best_score = float("inf")
+    for seed in seeds:
+        ik.set_q(seed.copy())
+        for _ in range(iters):
+            perr = wrist_target - ik.ee()
+            pn = float(np.linalg.norm(perr))
+            if pn > 1e-9:
+                perr = perr * min(1.0, 0.03 / pn)
+            oerr = ik.ori_err(yaw, pitch)
+            on = float(np.linalg.norm(oerr))
+            if on > 1e-9:
+                oerr = oerr * min(1.0, 0.25 / on)
+            jacp = np.zeros((3, ik.model.nv))
+            jacr = np.zeros((3, ik.model.nv))
+            mujoco.mj_jacBody(ik.model, ik.data, jacp, jacr, ik.body)
+            j = np.vstack([jacp[:, ik.dadr], 0.6 * jacr[:, ik.dadr]])
+            dx = np.concatenate([perr, 0.6 * oerr])
+            dq = j.T @ np.linalg.solve(j @ j.T + 1e-4 * np.eye(6), dx)
+            dq = np.clip(dq, -math.radians(4.0), math.radians(4.0))
+            q = np.clip(ik.q() + dq, ik.lo, ik.hi)
+            q[3] = max(q[3], math.radians(8.0))
+            ik.set_q(q)
+        pe = float(np.linalg.norm(wrist_target - ik.ee()))
+        ae = math.degrees(math.acos(float(np.clip(np.dot(ik.rot()[:, 2], aim_dir), -1.0, 1.0))))
+        score = pe + 0.01 * ae
+        if score < best_score:
+            best_score = score
+            best = (ik.q().copy(), pe, ae)
+        if pe < 0.015 and ae < 5.0:
+            break
+    q, pe, ae = best
+    ik.set_q(q)
+    return (q if (pe < 0.04 and ae < 10.0) else None), pe, ae
+
+
+def plan_aim_at_cube(
+    ik: PositionOnlyIK, q_start: np.ndarray, cube: np.ndarray, rng: np.random.Generator
+) -> np.ndarray | None:
+    """Wrist to the pre-aim standoff, approach axis along the TRUE wrist->cube line.
+
+    Pass 1 heads for the standoff point; the wrist rarely lands exactly there,
+    so two more passes hold the achieved wrist and re-aim along the line from
+    where it actually is. Retried from the idle pose if the start seed diverges.
+    """
+    for standoff in aim_standoff_candidates(ik, cube):
+        for seed in (q_start.copy(), np.deg2rad(ik.arm.idle_deg)):
+            plan_aim_axis(ik, seed, standoff, cube - standoff, rng=None, iters=300)
+            for _ in range(3):
+                q = ik.q().copy()
+                wrist = ik.ee().copy()
+                plan_aim_axis(ik, q, wrist, cube - wrist, rng=None, iters=150)
+            wrist = ik.ee()
+            dist = float(np.linalg.norm(cube - wrist))
+            ok = (
+                aim_error_deg(ik, cube) < 8.0
+                and pinch_tilt_deg(ik) < 6.0
+                and dist > 0.12
+                and float(wrist[2]) > TABLE_TOP_Z + 0.08
+                and float(np.linalg.norm(wrist - standoff)) < 0.12
+            )
+            if ok:
+                return ik.q().copy()
+    return None
+
+
+def joint_path_clear(ik: PositionOnlyIK, q_a: np.ndarray, q_b: np.ndarray, steps: int = 40) -> bool:
+    """Kinematic sweep of the straight joint interpolation: fingertips must stay
+    above the table the whole way (the executed path is this interpolation)."""
+    for k in range(steps + 1):
+        ik.set_q((1.0 - k / steps) * q_a + (k / steps) * q_b)
+        tips = finger_tips_from_data(ik.model, ik.data, ik.arm)
+        if float(tips[:, 2].min()) < TABLE_TOP_Z + 0.035:
+            return False
+    return True
+
+
+def plan_via_lift(ik: PositionOnlyIK, q_from: np.ndarray, q_to: np.ndarray) -> list[np.ndarray] | None:
+    """Joint waypoints from q_from to q_to that don't sweep through the table:
+    direct if clear, else via a straight lift of the wrist (orientation held)."""
+    if joint_path_clear(ik, q_from, q_to):
+        return [q_to]
+    ik.set_q(q_from)
+    wrist, approach = ik.ee().copy(), ik.rot()[:, 2].copy()
+    for lift in (0.10, 0.16, 0.22):
+        q_lift, _, _ = plan_aim_axis(ik, q_from, wrist + np.array([0.0, 0.0, lift]), approach, iters=250)
+        if q_lift is None:
+            continue
+        if joint_path_clear(ik, q_from, q_lift) and joint_path_clear(ik, q_lift, q_to):
+            return [q_lift, q_to]
+    return None
+
+
+def run_aim_trial(
+    robot: MujocoBiOpenArm,
+    ik: PositionOnlyIK,
+    fps: int,
+    cube0: np.ndarray,
+    rng: np.random.Generator,
+    hold_s: float = 3.0,
+) -> bool:
+    """Stage 1 of the natural-motion pick: bring the wrist to a pre-aim standoff
+    behind the cube and point the gripper straight at it, hold, done. Later
+    stages extend this with the reach along the aim line."""
+    q_now = _cmd_seed(robot, ik.arm.side)
+    ik.set_q(q_now)
+    cube = cube_pos(robot)
+    print(f"  aim: before={aim_error_deg(ik, cube):.0f}° off the wrist->cube line")
+    _AIM_OVERLAY["cube"] = cube.copy()
+    try:
+        return _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s)
+    finally:
+        _AIM_OVERLAY["cube"] = None
+        _draw_aim_overlay(robot, ik)
+
+
+def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
+    q_aim = plan_aim_at_cube(ik, q_now, cube, rng)
+    if q_aim is None:
+        print("  fail: no reachable aim pose for this cube")
+        return False
+    waypoints = plan_via_lift(ik, q_now, q_aim)
+    if waypoints is None:
+        print("  fail: every path to the aim pose sweeps the fingers through the table")
+        return False
+    q_prev = q_now
+    for i, q_wp in enumerate(waypoints):
+        dq = float(np.max(np.abs(q_wp - q_prev)))
+        # play_joint_path rate-limits to 0.8 deg/tick; size the move so the
+        # interpolation never outruns it (else the pose is truncated).
+        dur = max(1.0, dq / (math.radians(0.8) * fps * 0.9))
+        label = "lift clear of table" if (len(waypoints) > 1 and i == 0) else "aim at cube"
+        if not play_joint_path(robot, ik, q_prev, q_wp, FINGER_OPEN_M, fps, dur, label):
+            return False
+        q_prev = q_wp
+
+    ik.set_q(_cmd_seed(robot, ik.arm.side))
+    print(
+        f"  aim: after={aim_error_deg(ik, cube_pos(robot)):.1f}° off the line, "
+        f"pinch tilt={pinch_tilt_deg(ik):.1f}° from table-parallel"
+    )
+    play_joint_path(robot, ik, q_aim, q_aim, FINGER_OPEN_M, fps, hold_s, f"hold aim {hold_s:.0f}s")
+    return True
+
+
 def run_trial(
     robot: MujocoBiOpenArm,
     ik: PositionOnlyIK,
@@ -1992,6 +2255,13 @@ def main() -> None:
         help="Task string stored with every recorded frame (VLA language conditioning).",
     )
     parser.add_argument(
+        "--motion",
+        choices=["legacy", "aim"],
+        default="legacy",
+        help="legacy: the original over-the-top grasp. aim: natural-motion rebuild, "
+        "stage 1 — turn the gripper to aim along the wrist->cube line, hold 3s, next cube.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Verbose per-trial output (cube pose, IK plans, phase logs). "
@@ -2085,7 +2355,10 @@ def main() -> None:
 
                 if _RECORDER is not None:
                     _RECORDER.start()
-                ok = run_trial(robot, ik, args.fps, cube0)
+                if args.motion == "aim":
+                    ok = run_aim_trial(robot, ik, args.fps, cube0, rng)
+                else:
+                    ok = run_trial(robot, ik, args.fps, cube0)
                 if ok:
                     if _RECORDER is not None:
                         if _RECORDER.save():
@@ -2123,4 +2396,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        if _RECORDER is not None:
+            _RECORDER.finalize()
+        import os as _os
+
+        _os._exit(0)
