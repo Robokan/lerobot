@@ -287,6 +287,10 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
     held_since = None
     cmd = None  # slew-limited command state
     slew = 2.5  # deg per tick — spreads chunk-seam jumps (measured up to 28 deg)
+    # Slew must NOT touch the gripper: 0->44 at 2.5/tick takes 17 ticks
+    # (0.6 s), long enough for a fast policy to start lifting before the
+    # fingers close — the grasp silently misses.
+    grip_idx = _np.array([i for i, k in enumerate(pol.action_keys) if "gripper" in k])
     while _time.perf_counter() < t_end:
         t0 = _time.perf_counter()
         obs = robot.get_observation()
@@ -299,6 +303,7 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
                 cmd = target.copy()
             else:
                 cmd = cmd + _np.clip(target - cmd, -slew, slew)
+                cmd[grip_idx] = target[grip_idx]
             robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
         elif cmd is not None:
             # queue priming/gap: hold the last command so the sim keeps stepping
@@ -331,6 +336,7 @@ def run_jit_trial(robot, pol, fps: int, time_limit_s: float = 30.0, slew: float 
     pol.reset()
     pool = ThreadPoolExecutor(max_workers=1)
     prefetch_at = max(2, int(0.25 * fps) + 2)  # ticks-left threshold to prefetch
+    grip_idx = np.array([i for i, k in enumerate(pol.action_keys) if "gripper" in k])
 
     # direct chunk computation without the act() side effects
     def chunk_from(obs) -> list:
@@ -368,7 +374,11 @@ def run_jit_trial(robot, pol, fps: int, time_limit_s: float = 30.0, slew: float 
                 queue = chunk_from(obs)  # first chunk of the episode (blocking)
         target = queue.pop(0)
         pops_since_submit += 1
-        cmd = target.copy() if cmd is None else cmd + np.clip(target - cmd, -slew, slew)
+        if cmd is None:
+            cmd = target.copy()
+        else:
+            cmd = cmd + np.clip(target - cmd, -slew, slew)
+            cmd[grip_idx] = target[grip_idx]  # gripper unslewed (see run_rtc_trial)
         robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
         z = float(rcp.cube_pos(robot)[2])
         if z >= rcp.SUCCESS_CUBE_Z:
@@ -431,6 +441,13 @@ def main() -> None:
              "on the TRT server). 16 markedly reduces chunk wiggle vs the default 4.",
     )
     args = parser.parse_args()
+    if args.trt_socket:
+        # The RTC engine calls policy.predict_action_chunk directly, which
+        # routes to TRT via this env var — the connect_trt socket only covers
+        # the sync act() path. Without it, RTC silently runs eager inference
+        # (~800 ms/chunk here), every merge discards the whole 16-row chunk
+        # (real_delay >= chunk length) and the arm never receives an action.
+        os.environ["GROOT_TRT_SOCKET"] = args.trt_socket
     if args.smooth_chunk:
         os.environ["GROOT_SMOOTH_CHUNK"] = "1"
     if args.denoise_steps:
