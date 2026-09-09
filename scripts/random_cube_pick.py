@@ -708,7 +708,7 @@ def tips_straddle_cube(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -
     imbalance = abs(s0 + s1)
     opposite = s0 * s1 < 0.0
     wide_enough = abs(s0) > 0.012 and abs(s1) > 0.012
-    ok = opposite and wide_enough and mid_err_xy < 0.022 and imbalance < 0.022
+    ok = opposite and wide_enough and mid_err_xy < 0.025 and imbalance < 0.025
     msg = (
         f"tip-mid xy_err={mid_err_xy * 100:.1f} cm, "
         f"side offsets=({s0 * 100:.1f}, {s1 * 100:.1f}) cm, "
@@ -1215,20 +1215,43 @@ def setup_start_pose(
     (see _park_action); the active arm levels its gripper before approaching."""
     import mujoco
 
-    q_active = _random_start_q(ik, ik.arm, rng)
+    # Half the time the grabbing arm starts from its tucked pose too
+    # (jittered) — the reach then begins from rest, like a fresh pick.
+    active_tucked = rng.uniform() < 0.5
+    if active_tucked:
+        q_active = np.deg2rad(ik.arm.tuck_deg) + np.deg2rad(rng.normal(0.0, 2.0, size=7))
+        q_active = np.clip(q_active, ik.lo, ik.hi)
+    else:
+        q_active = _random_start_q(ik, ik.arm, rng)
     ik.set_q(q_active)
     tip = ik.tip_mid().copy()
-    print(f"  {ik.arm.side} start tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f})")
+    print(
+        f"  {ik.arm.side} start {'TUCKED (jittered)' if active_tucked else 'random'} "
+        f"tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f})"
+    )
 
     other = ARMS_BY_SIDE[ik.arm.other]
     other_ik = PositionOnlyIK(ik.model, ik.data, other)
-    q_other = _random_start_q(other_ik, other, rng)
+
+    # Half the time the idle arm starts already tucked (a human who
+    # just finished with that hand leaves it resting), with a little jitter so
+    # the pose is never identical. Skipped when the cube sits near that arm's
+    # tuck spot — the arm would be parked on top of the workspace.
+    cube_now = cube_pos(robot)
+    d_tuck = float(np.linalg.norm(cube_now[:2] - _TUCK_TIP_XY[other.side]))
+    tucked_start = d_tuck >= _TUCK_CLEARANCE_M and rng.uniform() < 0.5
+    if tucked_start:
+        q_other = np.deg2rad(other.tuck_deg) + np.deg2rad(rng.normal(0.0, 2.0, size=7))
+        q_other = np.clip(q_other, other_ik.lo, other_ik.hi)
+    else:
+        q_other = _random_start_q(other_ik, other, rng)
 
     # Grippers start in a random state too (anywhere from closed to fully
     # open). The active arm ramps open as its first act of the episode; the
-    # idle arm's gripper ramps closed during its tuck.
-    g_active = float(rng.uniform(0.0, FINGER_OPEN_M))
-    g_other = float(rng.uniform(0.0, FINGER_OPEN_M))
+    # idle arm's gripper ramps closed during its tuck (a tucked start is
+    # already nearly closed).
+    g_active = float(rng.uniform(0.0, 0.006)) if active_tucked else float(rng.uniform(0.0, FINGER_OPEN_M))
+    g_other = float(rng.uniform(0.0, 0.006)) if tucked_start else float(rng.uniform(0.0, FINGER_OPEN_M))
 
     _set_arm_qpos(robot, ik.arm.side, q_active)
     _set_gripper_qpos(robot, ik.arm.side, g_active)
@@ -1240,8 +1263,6 @@ def setup_start_pose(
     _LAST_CMD[ik.arm.side] = q_active.copy()
     _LAST_CMD[other.side] = q_other.copy()
     _OTHER_GRIP[other.side] = g_other
-    cube_now = cube_pos(robot)
-    d_tuck = float(np.linalg.norm(cube_now[:2] - _TUCK_TIP_XY[other.side]))
     if d_tuck < _TUCK_CLEARANCE_M:
         _RETREAT_TARGET[other.side] = np.deg2rad(other.park_deg)
         print(
@@ -1250,10 +1271,13 @@ def setup_start_pose(
         )
     else:
         _RETREAT_TARGET[other.side] = np.deg2rad(other.tuck_deg)
-    print(
-        f"  {other.side} starts random too (grip {g_other * 1000:.0f} mm); "
-        f"will half-tuck over the table edge during the pick"
-    )
+    if tucked_start:
+        print(f"  {other.side} starts TUCKED (jittered, grip {g_other * 1000:.0f} mm)")
+    else:
+        print(
+            f"  {other.side} starts random too (grip {g_other * 1000:.0f} mm); "
+            f"will half-tuck over the table edge during the pick"
+        )
     settle_pose(robot, ik, g_active, fps, hold_s=0.2)
     return tip
 
@@ -1898,7 +1922,7 @@ def aim_standoff_candidates(ik: PositionOnlyIK, cube: np.ndarray) -> list[np.nda
     """Standoff points at AIM_STANDOFF_M from the cube, preferred first.
 
     First choice is behind the cube on the shoulder->cube line looking down
-    35 deg. Cubes close to the shoulder leave no room behind them (the wrist
+    22 deg. Cubes close to the shoulder leave no room behind them (the wrist
     would sit on the shoulder), so the list steepens toward looking straight
     down and swings the azimuth up to 60 deg off the shoulder line; the planner
     takes the first reachable one.
@@ -1977,8 +2001,11 @@ def plan_aim_axis(
 
 
 def plan_aim_at_cube(
-    ik: PositionOnlyIK, q_start: np.ndarray, cube: np.ndarray, rng: np.random.Generator
-) -> tuple[np.ndarray, np.ndarray] | None:
+    ik: PositionOnlyIK,
+    q_start: np.ndarray,
+    cube: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, list[np.ndarray]] | None:
     """Wrist to the pre-aim standoff, approach axis along the TRUE wrist->cube line.
 
     Pass 1 heads for the standoff point; the wrist rarely lands exactly there,
@@ -2019,8 +2046,16 @@ def plan_aim_at_cube(
             chain = plan_approach_chain(ik, q_standoff, goal_in)
             if chain is not None:
                 _AIM_OVERLAY["goal"] = goal_in.copy()
+                _AIM_PLAN["cube"] = np.asarray(cube, dtype=float).copy()
+                _AIM_PLAN["in_offset"] = (goal_in - goal).copy()
                 return q_standoff, chain
     return None
+
+
+# What the current approach chain was planned against, so a bumped cube can be
+# detected and the chain re-planned toward where the cube actually is.
+_AIM_PLAN: dict[str, np.ndarray | None] = {"cube": None, "in_offset": None}
+AIM_REPLAN_BUMP_M = 0.008
 
 
 # Physical arm sags ~1.5 cm below the commanded pose under PD tracking; keep
@@ -2056,7 +2091,7 @@ def plan_approach_chain(
             return None
         for k in range(1, 12):
             ik.set_q((1.0 - k / 12) * q_prev + (k / 12) * q_f)
-            if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_PAD_CLEARANCE_M - 0.005:
+            if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
                 return None
         chain.append(q_f)
         q_prev = q_f
@@ -2090,68 +2125,207 @@ def plan_via_lift(ik: PositionOnlyIK, q_from: np.ndarray, q_to: np.ndarray) -> l
     return None
 
 
-# When to start closing in depends on how far away the hand is. Far out there
-# is plenty of travel left to keep correcting the aim while moving, so a rough
-# aim is fine; close in there is little travel left, so the aim must already be
-# accurate. Linear in hand->goal distance between these two anchors.
-AIM_START_FAR_M, AIM_START_DEG_AT_FAR = 0.30, 25.0
-AIM_START_NEAR_M, AIM_START_DEG_AT_NEAR = 0.08, 4.0
-AIM_APPROACH_SPEED_MPS = 0.06
+# Closing speed is a smooth function of aim error AND distance — no gate.
+# Aim penalty: badly aimed -> slow. Its weight shrinks with distance: far out
+# there is travel left to keep correcting, so a poor aim still approaches at a
+# good fraction of full speed; close in, a poor aim brings it to a creep. A
+# good aim is full speed at any range. The turn toward the aim runs at its own
+# steady joint rate underneath, so the two blend into one motion.
+AIM_SPEED_MAX_MPS = 0.08
+AIM_SPEED_FLOOR = 0.08           # fraction of max at worst
+AIM_SLOW_ANGLE_DEG = 30.0        # aim error at/above which the penalty saturates
+AIM_NEAR_M, AIM_FAR_M = 0.08, 0.30
+AIM_FAR_PENALTY_WEIGHT = 0.35    # at AIM_FAR_M a saturated aim penalty still leaves 65% speed
+AIM_TURN_RATE_DEG_S = 45.0       # joint rate for the turn toward the aim
 
 
-def aim_start_threshold_deg(dist_m: float) -> float:
-    t = (dist_m - AIM_START_NEAR_M) / (AIM_START_FAR_M - AIM_START_NEAR_M)
-    t = min(1.0, max(0.0, t))
-    return AIM_START_DEG_AT_NEAR + t * (AIM_START_DEG_AT_FAR - AIM_START_DEG_AT_NEAR)
+def approach_speed_mps(aim_err_deg: float, dist_m: float) -> float:
+    aim_pen = min(1.0, max(0.0, aim_err_deg / AIM_SLOW_ANGLE_DEG))
+    far = min(1.0, max(0.0, (dist_m - AIM_NEAR_M) / (AIM_FAR_M - AIM_NEAR_M)))
+    weight = 1.0 - far * (1.0 - AIM_FAR_PENALTY_WEIGHT)
+    return AIM_SPEED_MAX_MPS * max(AIM_SPEED_FLOOR, 1.0 - weight * aim_pen)
 
 
-def approach_along_aim(
-    robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int, chain: list[np.ndarray]
+def _polyline_at(points: list[np.ndarray], cum: np.ndarray, x: float) -> np.ndarray:
+    i = int(np.searchsorted(cum, x, side="right") - 1)
+    i = max(0, min(i, len(points) - 2))
+    seg = cum[i + 1] - cum[i]
+    f = 0.0 if seg < 1e-9 else min(1.0, max(0.0, (x - cum[i]) / seg))
+    return (1.0 - f) * points[i] + f * points[i + 1]
+
+
+def execute_aim_and_approach(
+    robot: MujocoBiOpenArm,
+    ik: PositionOnlyIK,
+    fps: int,
+    turn_path: list[np.ndarray],
+    chain: list[np.ndarray],
+    rng: np.random.Generator,
+    timeout_s: float = 20.0,
 ) -> bool:
-    """Stage 2: close in along the aim line through the pre-verified aimed
-    waypoints until the fingers straddle the cube. Aiming is continuous — every
-    waypoint is aimed and they are spaced closely enough that the interpolation
-    stays within a few degrees of the line (the overlay shows it).
+    """One continuous motion: turn toward the aim while closing in along the
+    aim line, the closing speed following the current aim error and distance.
 
-    The chain is streamed as ONE trajectory: a polyline through the waypoints
-    parametrised by fingertip arc length under a single ease-in/out profile.
-    Playing the waypoints as separate moves made the arm stop at each one.
+    ``turn_path`` runs from the current pose to the aimed standoff pose (with
+    any lift via-point); ``chain`` runs from the standoff to the goal through
+    aimed waypoints. The command is the chain pose at the current approach
+    progress plus the *remaining turn offset* (turn pose minus standoff pose),
+    which decays to zero at the turn's own rate. Approach progress advances at
+    approach_speed_mps(aim error of the commanded pose): while the turn is far
+    from done the aim is poor and the tip creeps; as the arm comes onto the
+    line the approach speeds up. Nothing switches.
     """
     arm = ik.arm
-    q_start = _cmd_seed(robot, arm.side)
-    pts = [q_start] + list(chain)
+    q_aim = turn_path[-1]
+    ref = [q_aim] + list(chain)
     tips = []
-    for q in pts:
+    for q in ref:
         ik.set_q(q)
         tips.append(ik.tip_mid().copy())
-    seg = [float(np.linalg.norm(tips[i + 1] - tips[i])) for i in range(len(pts) - 1)]
-    total = sum(seg)
-    cum = np.concatenate([[0.0], np.cumsum(seg)])
-    dur = max(0.8, total / AIM_APPROACH_SPEED_MPS)
-    n = max(2, int(dur * fps))
-    print(f"  approach: {total * 100:.0f} cm along the aim line in one move ({dur:.1f}s)…")
+    arc = np.concatenate([[0.0], np.cumsum([np.linalg.norm(tips[i + 1] - tips[i]) for i in range(len(ref) - 1)])])
+    total = float(arc[-1])
+    tcum = np.concatenate([[0.0], np.cumsum([float(np.max(np.abs(turn_path[i + 1] - turn_path[i]))) for i in range(len(turn_path) - 1)])])
+    turn_total = float(tcum[-1])
+    print(f"  aim+approach: turn {math.degrees(turn_total):.0f}° while closing {total * 100:.0f} cm along the line…")
 
-    def q_at(arc: float) -> np.ndarray:
-        i = int(np.searchsorted(cum, arc, side="right") - 1)
-        i = max(0, min(i, len(seg) - 1))
-        f = 0.0 if seg[i] < 1e-9 else (arc - cum[i]) / seg[i]
-        return (1.0 - f) * pts[i] + f * pts[i + 1]
+    # Human-like variation: each reach has its own overall pace (approach and
+    # turn scaled independently by +-15%) and a slow, gentle wobble within the
+    # motion (+-6% at 0.3-0.7 Hz) — never two identical reaches.
+    speed_scale = float(rng.uniform(0.85, 1.15))
+    turn_scale = float(rng.uniform(0.85, 1.15))
+    wob_hz = float(rng.uniform(0.3, 0.7))
+    wob_phase = rng.uniform(0.0, 2.0 * math.pi, size=2)
+    print(f"  pace: approach x{speed_scale:.2f}, turn x{turn_scale:.2f}, wobble {wob_hz:.2f} Hz")
 
-    q_prev = q_start.copy()
-    for k in range(n + int(0.5 * fps)):  # + settle: the physical arm trails the command
-        u = min(1.0, (k + 1) / n)
-        s_ = u * u * (3.0 - 2.0 * u)
-        q = _rate_limit_q(q_at(s_ * total), q_prev, math.radians(1.4))
-        _command_q(robot, ik, q, FINGER_OPEN_M, fps)
-        q_prev = q
+    q_cmd = turn_path[0].copy()
+    s_arc = 0.0
+    tau = 0.0
+    held = 0
+    replans = 0
+    dt = 1.0 / fps
+    last_log = -1.0
+    for k in range(int(timeout_s * fps)):
+        ik.set_q(q_cmd)
+        cube_now = cube_pos(robot)
+        # Bumped cube: once the turn is done, re-plan the rest of the approach
+        # from the current pose toward where the cube actually is now.
+        planned = _AIM_PLAN["cube"]
+        if (
+            tau >= turn_total
+            and planned is not None
+            and float(np.linalg.norm(cube_now[:2] - planned[:2])) > AIM_REPLAN_BUMP_M
+        ):
+            goal_new = aim_point(cube_now) + _AIM_PLAN["in_offset"]
+            new_chain = plan_approach_chain(ik, q_cmd, goal_new)
+            ik.set_q(q_cmd)
+            if new_chain is not None:
+                q_aim = q_cmd.copy()
+                ref = [q_aim] + list(new_chain)
+                tips = []
+                for q in ref:
+                    ik.set_q(q)
+                    tips.append(ik.tip_mid().copy())
+                arc = np.concatenate(
+                    [[0.0], np.cumsum([np.linalg.norm(tips[i + 1] - tips[i]) for i in range(len(ref) - 1)])]
+                )
+                total = float(arc[-1])
+                s_arc = 0.0
+                turn_path = [q_aim, q_aim]  # turn already complete
+                tcum = np.array([0.0, 0.0])
+                turn_total = 0.0
+                tau = 0.0
+                _AIM_PLAN["cube"] = cube_now.copy()
+                _AIM_OVERLAY["goal"] = goal_new.copy()
+                replans += 1
+                print(f"    cube moved {np.linalg.norm(cube_now[:2] - planned[:2]) * 100:.1f} cm — re-planned approach ({total * 100:.0f} cm to go)")
+            else:
+                _AIM_PLAN["cube"] = cube_now.copy()  # unreachable now; keep going, don't spam
+            ik.set_q(q_cmd)
+        aim_err = aim_error_deg(ik, cube_now)
+        dist = float(np.linalg.norm(aim_point(cube_now) - ik.hand()))
+        t_now = k * dt
+        v = approach_speed_mps(aim_err, dist) * speed_scale * (
+            1.0 + 0.06 * math.sin(2.0 * math.pi * wob_hz * t_now + wob_phase[0])
+        )
+        turn_rate = math.radians(AIM_TURN_RATE_DEG_S) * turn_scale * (
+            1.0 + 0.06 * math.sin(2.0 * math.pi * wob_hz * t_now + wob_phase[1])
+        )
+        tau_prev = tau
+        tau = min(turn_total, tau + turn_rate * dt)
+        turn_off = _polyline_at(turn_path, tcum, tau) - q_aim
+        # The turn path and the chain are each swept for pad clearance, but
+        # their superposition is not: before advancing the approach, check the
+        # candidate pose in the kinematic model. If it would dip the pads, hold
+        # the approach this tick and let the turn continue — once the turn is
+        # done the blend IS the verified chain pose, so progress always resumes.
+        s_try = min(total, s_arc + v * dt)
+
+        def step_toward(q_goal: np.ndarray) -> np.ndarray:
+            # One scaled step toward q_goal: the command stays on the straight
+            # joint-space line to it. Per-joint clipping bent that line and put
+            # the commanded pose somewhere no sweep had checked (traced: target
+            # 3.5 cm clear, commanded 0.7 cm, pads into the table).
+            dq = q_goal - q_cmd
+            big = float(np.max(np.abs(dq)))
+            return q_cmd + dq * min(1.0, math.radians(1.6) / max(big, 1e-9))
+
+        def clear(q: np.ndarray) -> bool:
+            ik.set_q(q)
+            return min(finger_lowest_z_model(ik.model, ik.data, arm)) >= TABLE_TOP_Z + AIM_PAD_CLEARANCE_M
+
+        # Check the pose that will actually be COMMANDED. If advancing the
+        # approach would dip the pads, hold the approach this tick; if even the
+        # turn alone would, hold the turn too (the arm pauses a tick).
+        q_target = _polyline_at(ref, arc, s_try) + turn_off
+        q_next = step_toward(q_target)
+        if clear(q_next):
+            s_arc = s_try
+        else:
+            held += 1
+            q_target = _polyline_at(ref, arc, s_arc) + turn_off
+            q_next = step_toward(q_target)
+            if not clear(q_next):
+                tau = tau_prev
+                turn_off = _polyline_at(turn_path, tcum, tau) - q_aim
+                q_target = _polyline_at(ref, arc, s_arc) + turn_off
+                q_next = step_toward(q_target)
+        q_cmd = q_next
+        _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
         if grasp_table_fault(robot, arm) is not None:
-            print(f"  approach: TABLE HIT {grasp_table_fault(robot, arm)} — aborting")
+            ik.set_q(q_cmd)
+            cmd_low = min(finger_lowest_z_model(ik.model, ik.data, arm)) - TABLE_TOP_Z
+            ik.set_q(q_target)
+            tgt_low = min(finger_lowest_z_model(ik.model, ik.data, arm)) - TABLE_TOP_Z
+            phys_low = min(finger_lowest_z(robot, arm)) - TABLE_TOP_Z
+            print(
+                f"  aim+approach: TABLE HIT {grasp_table_fault(robot, arm)} — aborting "
+                f"[planned pad clearance: target {tgt_low * 100:.1f} cm, commanded {cmd_low * 100:.1f} cm; "
+                f"physical {phys_low * 100:.1f} cm | turn {100 * tau / max(turn_total, 1e-9):.0f}% "
+                f"approach {100 * s_arc / max(total, 1e-9):.0f}% aim {aim_err:.0f}°]"
+            )
             return False
+        t = k * dt
+        if t - last_log >= 1.0:
+            print(
+                f"    t={t:4.1f}s aim={aim_err:5.1f}° dist={dist * 100:3.0f}cm "
+                f"speed={v * 100:4.1f} cm/s progress={100 * s_arc / max(total, 1e-9):3.0f}%"
+            )
+            last_log = t
+        if s_arc >= total and tau >= turn_total and float(np.max(np.abs(q_cmd - q_target))) < 1e-4:
+            break
+    else:
+        print("  fail: aim+approach timed out")
+        return False
+    if held:
+        print(f"  aim+approach: held the approach {held} ticks for pad clearance while turning")
+    if replans:
+        print(f"  aim+approach: re-planned {replans}x for a bumped cube")
+    play_joint_path(robot, ik, q_cmd, q_cmd, FINGER_OPEN_M, fps, 0.5, "settle")  # physical arm trails
     ok, msg = tips_straddle_cube(robot, arm, cube_pos(robot))
     if ok:
-        print(f"  approach: fingers around the cube ({msg})")
+        print(f"  fingers around the cube ({msg})")
         return True
-    print(f"  fail: approach ended without the fingers around the cube ({msg})")
+    print(f"  fail: ended without the fingers around the cube ({msg})")
     return False
 
 
@@ -2189,42 +2363,133 @@ def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
     if waypoints is None:
         print("  fail: every path to the aim pose sweeps the fingers through the table")
         return False
-    def aimed_enough() -> bool:
-        cube_now = cube_pos(robot)
-        dist = float(np.linalg.norm(aim_point(cube_now) - ik.hand()))
-        return aim_error_deg(ik, cube_now) < aim_start_threshold_deg(dist)
-
-    q_prev = q_now
-    for i, q_wp in enumerate(waypoints):
-        dq = float(np.max(np.abs(q_wp - q_prev)))
-        # play_joint_path rate-limits to 0.8 deg/tick; size the move so the
-        # interpolation never outruns it (else the pose is truncated).
-        dur = max(1.0, dq / (math.radians(0.8) * fps * 0.9))
-        label = "lift clear of table" if (len(waypoints) > 1 and i == 0) else "aim at cube"
-        if not play_joint_path(
-            robot, ik, q_prev, q_wp, FINGER_OPEN_M, fps, dur, label, stop_when=aimed_enough
-        ):
-            return False
-        q_prev = q_wp
-        if aimed_enough():
-            break
-
-    ik.set_q(_cmd_seed(robot, ik.arm.side))
-    dist_now = float(np.linalg.norm(aim_point(cube_pos(robot)) - ik.hand()))
-    print(
-        f"  aim: {aim_error_deg(ik, cube_pos(robot)):.1f}° off the line at {dist_now * 100:.0f} cm "
-        f"(start threshold {aim_start_threshold_deg(dist_now):.0f}°, pinch tilt {pinch_tilt_deg(ik):.1f}°) — closing in"
-    )
-    if not approach_along_aim(robot, ik, fps, chain):
+    if not execute_aim_and_approach(robot, ik, fps, [q_now] + waypoints, chain, rng):
         return False
     ik.set_q(_cmd_seed(robot, ik.arm.side))
     print(
         f"  around cube: aim {aim_error_deg(ik, cube_pos(robot)):.1f}° off the line, "
         f"pinch tilt {pinch_tilt_deg(ik):.1f}°"
     )
+    return grasp_and_lift(robot, ik, fps, rng)
+
+
+# Squeeze this far past where the pads block on the cube. The aim approach does
+# not align the pads to the cube faces, so the cube may sit diagonally between
+# them; a firm squeeze holds it regardless (legacy used 13 mm ~ 10 N/finger).
+AIM_SQUEEZE_PAST_BLOCK_M = 0.018
+
+
+def close_on_cube(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int) -> float:
+    """Close until the pads block on the cube, then squeeze a fixed distance
+    past the block point. Unlike set_gripper() this does not require the
+    opening to reach a preset width — a diagonally-held cube blocks wider.
+    Returns the commanded hold opening, or -1.0 (with a printed reason)."""
+    arm = ik.arm
+    ik.set_q(_cmd_seed(robot, arm.side))
     q_hold = ik.q().copy()
-    play_joint_path(robot, ik, q_hold, q_hold, FINGER_OPEN_M, fps, hold_s, f"hold {hold_s:.0f}s")
-    return True
+    cmd = float(np.clip(_finger_opening_m(robot, arm.side), 0.0, FINGER_OPEN_M))
+    step = GRIP_RAMP_MPS / fps
+    history: list[float] = []
+    deadline = time.perf_counter() + 4.0
+    while time.perf_counter() < deadline:
+        t0 = time.perf_counter()
+        ik.set_q(q_hold)
+        cmd = max(0.0, cmd - step)
+        _hold_fingers(robot, ik, cmd)
+        precise_sleep(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+        opened = _finger_opening_m(robot, arm.side)
+        history.append(opened)
+        stalled = len(history) >= 10 and (history[-10] - opened) < 0.0005
+        if stalled:
+            summary = grasp_contact_summary(robot, arm)
+            if summary["pinching"]:
+                hold = max(0.0, opened - AIM_SQUEEZE_PAST_BLOCK_M)
+                # ramp the last bit of squeeze on, then confirm force
+                while cmd > hold:
+                    ik.set_q(q_hold)
+                    cmd = max(hold, cmd - step)
+                    _hold_fingers(robot, ik, cmd)
+                    precise_sleep(1.0 / fps)
+                for _ in range(max(8, fps // 3)):
+                    ik.set_q(q_hold)
+                    _hold_fingers(robot, ik, hold)
+                    precise_sleep(1.0 / fps)
+                summary = grasp_contact_summary(robot, arm)
+                print(
+                    f"  gripper[{arm.side}]: blocked at {opened * 1000:.1f} mm, squeezing to "
+                    f"{hold * 1000:.1f} mm — pinch {summary['cube_force_n']:.1f} N"
+                )
+                if summary["pinching"] and float(summary["cube_force_n"]) >= 6.0:
+                    return hold
+                print("  fail: weak or one-sided pinch after squeeze — not lifting")
+                return -1.0
+            if cmd <= 0.0:
+                print(f"  fail: gripper closed to {opened * 1000:.1f} mm without the cube between the pads")
+                return -1.0
+    print(f"  fail: gripper still moving at {_finger_opening_m(robot, arm.side) * 1000:.1f} mm after 4 s")
+    return -1.0
+
+
+AIM_LIFT_M = 2.0 * CUBE_HALF        # lift the cube its own height off the table
+AIM_LIFT_SPEED_MPS = 0.05
+
+
+def grasp_and_lift(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int, rng: np.random.Generator) -> bool:
+    """Stage 3: close on the cube, then lift it its own height straight up.
+
+    Close and lift reuse what the legacy grasp learned the hard way: do not
+    lift until the fingers have actually closed on the cube, and keep the
+    wrist frozen while the cube can still touch the table — any orientation
+    correction there pries it out of the pads.
+    """
+    arm = ik.arm
+    ik.set_q(_cmd_seed(robot, arm.side))
+    print(f"  close {arm.side}…")
+    hold_grip = close_on_cube(robot, ik, fps)
+    if hold_grip < 0.0:
+        return False
+
+    q_now = _cmd_seed(robot, arm.side)
+    ik.set_q(q_now)
+    tip0 = tip_mid_world(robot, arm)
+    wrist_hold = q_now[4:7].copy()
+    cube0 = cube_pos(robot)
+    pace = float(rng.uniform(0.85, 1.15))  # same human-like variation as the reach
+    n = max(2, int(AIM_LIFT_M / (AIM_LIFT_SPEED_MPS * pace) * fps))
+    print(f"  lift {AIM_LIFT_M * 100:.0f} cm ({n / fps:.1f}s, wrist frozen)…")
+    q_prev = q_now.copy()
+    # Closed-loop on the MEASURED cube height: the PD-tracked arm sags under
+    # load (tips reach ~3.5 of a commanded 5 cm), so after the nominal profile
+    # keep raising the command until the cube has actually risen its height.
+    extra = 0.0
+    for k in range(n + int(2.0 * fps)):
+        u = min(1.0, (k + 1) / n)
+        s_u = u * u * (3.0 - 2.0 * u)
+        if u >= 1.0:
+            if float(cube_pos(robot)[2] - cube0[2]) >= AIM_LIFT_M:
+                break
+            extra = min(extra + 0.04 / fps, 0.05)  # 4 cm/s, at most 5 cm over
+        tip_t = tip0 + np.array([0.0, 0.0, s_u * AIM_LIFT_M + extra])
+        for _ in range(3):
+            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), freeze_wrist=wrist_hold)
+        q = _rate_limit_q(ik.q(), q_prev, math.radians(1.4))
+        ik.set_q(q)
+        _hold_fingers(robot, ik, hold_grip)
+        precise_sleep(1.0 / fps)
+        q_prev = q.copy()
+    # hold aloft briefly, then judge
+    for _ in range(int(1.0 * fps)):
+        ik.set_q(q_prev)
+        _hold_fingers(robot, ik, hold_grip)
+        precise_sleep(1.0 / fps)
+    rise = float(cube_pos(robot)[2] - cube0[2])
+    tip_rise = float(tip_mid_world(robot, arm)[2] - tip0[2])
+    print(f"  lift: tips rose {tip_rise * 100:.1f} cm, cube rose {rise * 100:.1f} cm, grip {_finger_opening_m(robot, arm.side) * 1000:.1f} mm")
+    if rise >= 0.8 * AIM_LIFT_M:
+        print(f"  lifted the cube {rise * 100:.1f} cm — success")
+        return True
+    print(f"  fail: cube only rose {rise * 100:.1f} cm (dropped or slipped)")
+    return False
 
 
 def run_trial(
