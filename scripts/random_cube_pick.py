@@ -693,6 +693,11 @@ def grasp_tip_target(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -> 
     return clamp_tip_target(target)
 
 
+# Centring tolerances for the straddle test (cube defaults). A wider-open
+# gripper around a narrow bar can be judged more loosely — close+lift decides.
+_STRADDLE_TOL = {"xy": 0.025, "imbalance": 0.025}
+
+
 def tips_straddle_cube(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -> tuple[bool, str]:
     tips = finger_tips_world(robot, arm)
     mid = tips.mean(axis=0)
@@ -708,7 +713,8 @@ def tips_straddle_cube(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -
     imbalance = abs(s0 + s1)
     opposite = s0 * s1 < 0.0
     wide_enough = abs(s0) > 0.012 and abs(s1) > 0.012
-    ok = opposite and wide_enough and mid_err_xy < 0.025 and imbalance < 0.025
+    tol = _STRADDLE_TOL["xy"]
+    ok = opposite and wide_enough and mid_err_xy < tol and imbalance < _STRADDLE_TOL["imbalance"]
     msg = (
         f"tip-mid xy_err={mid_err_xy * 100:.1f} cm, "
         f"side offsets=({s0 * 100:.1f}, {s1 * 100:.1f}) cm, "
@@ -1044,7 +1050,7 @@ def teleport_to_tip(
 
 
 def make_robot(
-    model_path: str, fps: int, viewer: bool, cameras: str = "none"
+    model_path: str, fps: int, viewer: bool, cameras: str = "none", arm_gain_scale: float = 1.0
 ) -> MujocoBiOpenArm:
     from lerobot.cameras.mujoco import MujocoCameraConfig
 
@@ -1060,15 +1066,21 @@ def make_robot(
         cam_cfg["right_wrist"] = MujocoCameraConfig(
             mujoco_name="right_wrist_camera", fps=fps, width=640, height=480
         )
-    robot = MujocoBiOpenArm(
-        MujocoBiOpenArmConfig(
-            viewer=viewer,
-            cameras=cam_cfg,
-            model_path=model_path,
-            fps=fps,
-            start_elbow_bend_deg=90.0,
-        )
+    cfg = MujocoBiOpenArmConfig(
+        viewer=viewer,
+        cameras=cam_cfg,
+        model_path=model_path,
+        fps=fps,
+        start_elbow_bend_deg=90.0,
     )
+    if arm_gain_scale != 1.0:
+        # Stiffer position servos: the default gains let the arm sag ~1.5 cm
+        # under gravity at mid reach (measured), which is more than the pad
+        # clearance a 2.5 cm bar allows. kd scales as sqrt(kp) to keep the
+        # damping ratio. Measured x3: 0.5 cm sag, no oscillation.
+        cfg.arm_kp = [k * arm_gain_scale for k in cfg.arm_kp]
+        cfg.arm_kd = [k * math.sqrt(arm_gain_scale) for k in cfg.arm_kd]
+    robot = MujocoBiOpenArm(cfg)
     robot.connect(calibrate=False)
     return robot
 
@@ -1878,13 +1890,103 @@ def place_reachable_cube(
 
 AIM_TIP_ABOVE_CUBE_M = 0.035
 
+# The aim machinery grasps whatever body set_target_body() points at. These two
+# describe that target: how far above its centre the tips stop (the pads then
+# straddle its upper part) and the surface beneath it that the pads must clear
+# (the table, or the bar below in a stack). Cube defaults; set_aim_target()
+# switches them for other objects.
+_AIM_TARGET = {
+    "tip_above": AIM_TIP_ABOVE_CUBE_M,
+    "support_z": TABLE_TOP_Z,
+    "pad_clearance": None,
+    "xy": None,          # where the support surface is (None = everywhere, i.e. the table)
+    "azimuth": None,     # preferred approach azimuth (rad); None = from the shoulder line
+    "obstacles": [],     # (xyz, radius) keep-outs for fingertips and hand
+    "in_extra": None,    # reach this far past the aim point (None = half a cube: pads centre on it)
+    "max_pitch_deg": None,  # cap on the approach pitch (None = all candidates up to 70 deg)
+    "squeeze_m": None,      # squeeze past the block point (None = AIM_SQUEEZE_PAST_BLOCK_M, sized for the cube)
+}
+_AIM_LAST_HOLD = {"m": 0.0}  # grip commanded by the last grasp_and_lift (for carrying on)
+AIM_SUPPORT_FOOTPRINT_M = 0.08  # the raised support floor applies within this xy radius
+
+
+def set_aim_target(
+    tip_above_m: float,
+    support_z: float,
+    pad_clearance_m: float | None = None,
+    xy: np.ndarray | None = None,
+    azimuth: float | None = None,
+    obstacles: list[tuple[np.ndarray, float]] | None = None,
+    in_extra_m: float | None = None,
+    max_pitch_deg: float | None = None,
+    squeeze_m: float | None = None,
+) -> None:
+    """Describe the grasp target for the aim machinery. ``support_z`` is the
+    surface the pads must clear over the target (the table, or the object
+    below it in a stack); with ``xy`` given it only applies within
+    AIM_SUPPORT_FOOTPRINT_M of that point and the table floor applies
+    elsewhere. ``azimuth`` pins the approach direction (an elongated object
+    must be approached along its length); ``obstacles`` are other objects the
+    fingertips and hand must stay out of on the way."""
+    _AIM_TARGET["tip_above"] = float(tip_above_m)
+    _AIM_TARGET["support_z"] = float(support_z)
+    _AIM_TARGET["pad_clearance"] = None if pad_clearance_m is None else float(pad_clearance_m)
+    _AIM_TARGET["xy"] = None if xy is None else np.asarray(xy, dtype=float)[:2].copy()
+    _AIM_TARGET["azimuth"] = azimuth
+    _AIM_TARGET["obstacles"] = list(obstacles or [])
+    _AIM_TARGET["in_extra"] = None if in_extra_m is None else float(in_extra_m)
+    _AIM_TARGET["max_pitch_deg"] = max_pitch_deg
+    _AIM_TARGET["squeeze_m"] = None if squeeze_m is None else float(squeeze_m)
+
+
+def aim_pad_clearance() -> float:
+    c = _AIM_TARGET["pad_clearance"]
+    return AIM_PAD_CLEARANCE_M if c is None else c
+
+
+def arm_probe_points(ik: PositionOnlyIK) -> list[tuple[np.ndarray, float]]:
+    """(point, extra keep-out) along the arm beyond the fingertips: the hand and
+    the wrist/forearm joints. The forearm sweeping through the pile or a
+    neighbouring stack knocked bars flying while the fingertips were clear."""
+    joints = [ik.hand()] + [ik.data.xpos[ik.model.jnt_bodyid[ik.jids[j]]].copy() for j in (6, 5, 4, 3)]
+    pts = [(joints[0], 0.03)]
+    # the link BETWEEN joints is what rests across a pile: sample it too
+    for a, b in zip(joints[:-1], joints[1:], strict=True):
+        pts.append((0.5 * (a + b), 0.05))
+        pts.append((b, 0.05))
+    return pts
+
+
+def obstacles_clear(ik: PositionOnlyIK, tips: np.ndarray) -> bool:
+    for pos, radius in _AIM_TARGET["obstacles"]:
+        if float(np.linalg.norm(tips - pos, axis=1).min()) < radius:
+            return False
+        for pt, extra in arm_probe_points(ik):
+            if float(np.linalg.norm(pt - pos)) < radius + extra:
+                return False
+    return True
+
+
+def aim_pads_clear(ik: PositionOnlyIK) -> bool:
+    """Pads above the local floor and fingertips/hand/forearm outside every
+    obstacle, for the pose currently set on ``ik``."""
+    tips = finger_tips_from_data(ik.model, ik.data, ik.arm)
+    low = min(finger_lowest_z_model(ik.model, ik.data, ik.arm))
+    floor = TABLE_TOP_Z + aim_pad_clearance()
+    xy = _AIM_TARGET["xy"]
+    if xy is None or float(np.linalg.norm(tips.mean(axis=0)[:2] - xy)) < AIM_SUPPORT_FOOTPRINT_M:
+        floor = max(floor, _AIM_TARGET["support_z"] + aim_pad_clearance())
+    if low < floor:
+        return False
+    return obstacles_clear(ik, tips)
+
 
 def aim_point(cube: np.ndarray) -> np.ndarray:
-    """The point on the cube the gripper aims at and the tips travel to: the
+    """The point on the target the gripper aims at and the tips travel to: the
     grasp point between the pads when straddling. Aiming at the geometric
     centre while sending the tips above it is a built-in conflict for the IK."""
     goal = np.asarray(cube, dtype=float).copy()
-    goal[2] += AIM_TIP_ABOVE_CUBE_M
+    goal[2] += _AIM_TARGET["tip_above"]
     return goal
 
 
@@ -1930,10 +2032,18 @@ def aim_standoff_candidates(ik: PositionOnlyIK, cube: np.ndarray) -> list[np.nda
     sh = shoulder_pos(ik)
     h = np.asarray(cube[:2], dtype=float) - sh[:2]
     base_az = math.atan2(h[1], h[0])
+    daz_set = (0.0, 30.0, -30.0, 60.0, -60.0)
+    if _AIM_TARGET["azimuth"] is not None:
+        # elongated target: approach along its length, small deviations only
+        base_az = float(_AIM_TARGET["azimuth"])
+        daz_set = (0.0, 10.0, -10.0, 20.0, -20.0, 30.0, -30.0)
     out = []
+    max_pitch = _AIM_TARGET["max_pitch_deg"]
     for pitch_deg in (22.0, 30.0, 40.0, 55.0, 70.0):
+        if max_pitch is not None and pitch_deg > max_pitch:
+            break
         pitch = math.radians(pitch_deg)
-        for daz_deg in (0.0, 30.0, -30.0, 60.0, -60.0):
+        for daz_deg in daz_set:
             az = base_az + math.radians(daz_deg)
             horiz = AIM_STANDOFF_M * math.cos(pitch)
             p = np.asarray(cube, dtype=float) - np.array([math.cos(az), math.sin(az), 0.0]) * horiz
@@ -2030,7 +2140,7 @@ def plan_aim_at_cube(
                 aim_error_deg(ik, cube) < 8.0
                 and pinch_tilt_deg(ik) < 6.0
                 and dist > 0.15
-                and float(ik.tip_mid()[2]) > TABLE_TOP_Z + 0.06
+                and float(ik.tip_mid()[2]) > _AIM_TARGET["support_z"] + 0.06
                 and float(np.linalg.norm(hand - standoff)) < 0.12
             )
             if not ok:
@@ -2042,7 +2152,8 @@ def plan_aim_at_cube(
             dir_h = goal - ik.hand()
             dir_h[2] = 0.0
             dir_h /= max(float(np.linalg.norm(dir_h)), 1e-9)
-            goal_in = goal + dir_h * CUBE_HALF
+            in_extra = _AIM_TARGET["in_extra"]
+            goal_in = goal + dir_h * (CUBE_HALF if in_extra is None else in_extra)
             chain = plan_approach_chain(ik, q_standoff, goal_in)
             if chain is not None:
                 _AIM_OVERLAY["goal"] = goal_in.copy()
@@ -2087,11 +2198,11 @@ def plan_approach_chain(
         ik.set_q(q_f)
         if pinch_tilt_deg(ik) > 6.0:
             return None
-        if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
+        if not aim_pads_clear(ik):
             return None
         for k in range(1, 12):
             ik.set_q((1.0 - k / 12) * q_prev + (k / 12) * q_f)
-            if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
+            if not aim_pads_clear(ik):
                 return None
         chain.append(q_f)
         q_prev = q_f
@@ -2106,6 +2217,8 @@ def joint_path_clear(ik: PositionOnlyIK, q_a: np.ndarray, q_b: np.ndarray, steps
         tips = finger_tips_from_data(ik.model, ik.data, ik.arm)
         if float(tips[:, 2].min()) < TABLE_TOP_Z + 0.035:
             return False
+        if not obstacles_clear(ik, tips):
+            return False
     return True
 
 
@@ -2116,8 +2229,14 @@ def plan_via_lift(ik: PositionOnlyIK, q_from: np.ndarray, q_to: np.ndarray) -> l
         return [q_to]
     ik.set_q(q_from)
     wrist, approach = ik.ee().copy(), ik.rot()[:, 2].copy()
-    for lift in (0.10, 0.16, 0.22):
-        q_lift, _, _ = plan_aim_axis(ik, q_from, wrist + np.array([0.0, 0.0, lift]), approach, iters=250)
+    back = -approach.copy()
+    back[2] = 0.0
+    back /= max(float(np.linalg.norm(back)), 1e-9)
+    # via-points: straight up, and up-and-back (retreating along the approach
+    # line clears an obstacle the wrist is already over)
+    for lift, retreat in ((0.10, 0.0), (0.16, 0.0), (0.22, 0.0), (0.12, 0.08), (0.18, 0.10)):
+        target = wrist + np.array([0.0, 0.0, lift]) + back * retreat
+        q_lift, _, _ = plan_aim_axis(ik, q_from, target, approach, iters=250)
         if q_lift is None:
             continue
         if joint_path_clear(ik, q_from, q_lift) and joint_path_clear(ik, q_lift, q_to):
@@ -2201,6 +2320,8 @@ def execute_aim_and_approach(
     s_arc = 0.0
     tau = 0.0
     held = 0
+    stalled = 0
+    yielding = False
     replans = 0
     dt = 1.0 / fps
     last_log = -1.0
@@ -2258,6 +2379,11 @@ def execute_aim_and_approach(
         # candidate pose in the kinematic model. If it would dip the pads, hold
         # the approach this tick and let the turn continue — once the turn is
         # done the blend IS the verified chain pose, so progress always resumes.
+        if yielding:
+            if tau < turn_total:
+                v = 0.0  # approach waits for the turn
+            else:
+                yielding = False
         s_try = min(total, s_arc + v * dt)
 
         def step_toward(q_goal: np.ndarray) -> np.ndarray:
@@ -2271,7 +2397,7 @@ def execute_aim_and_approach(
 
         def clear(q: np.ndarray) -> bool:
             ik.set_q(q)
-            return min(finger_lowest_z_model(ik.model, ik.data, arm)) >= TABLE_TOP_Z + AIM_PAD_CLEARANCE_M
+            return aim_pads_clear(ik)
 
         # Check the pose that will actually be COMMANDED. If advancing the
         # approach would dip the pads, hold the approach this tick; if even the
@@ -2280,15 +2406,32 @@ def execute_aim_and_approach(
         q_next = step_toward(q_target)
         if clear(q_next):
             s_arc = s_try
+            stalled = 0
         else:
             held += 1
             q_target = _polyline_at(ref, arc, s_arc) + turn_off
             q_next = step_toward(q_target)
             if not clear(q_next):
-                tau = tau_prev
-                turn_off = _polyline_at(turn_path, tcum, tau) - q_aim
+                stalled += 1
+                # Both vetoed: the blend is stuck between two paths that were
+                # each verified on their own. Yield: back the approach off
+                # (toward s=0, where the blend IS the verified turn path) until
+                # the turn has completed, then approach along the verified chain.
+                yielding = True
+                s_arc = max(0.0, s_arc - AIM_SPEED_MAX_MPS * dt)  # fixed rate: v is 0 while yielding
                 q_target = _polyline_at(ref, arc, s_arc) + turn_off
                 q_next = step_toward(q_target)
+                if not clear(q_next) and stalled < int(1.5 * fps):
+                    tau = tau_prev
+                    turn_off = _polyline_at(turn_path, tcum, tau) - q_aim
+                    q_target = _polyline_at(ref, arc, s_arc) + turn_off
+                    q_next = step_toward(q_target)
+                if stalled == 1:
+                    print("    clearance hold: yielding the approach until the turn completes")
+                elif stalled == int(1.5 * fps):
+                    # still stuck with the approach backed off: the verified turn
+                    # path itself is being vetoed by the transient blend — let it go
+                    print("    clearance hold: forcing the verified turn through")
         q_cmd = q_next
         _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
         if grasp_table_fault(robot, arm) is not None:
@@ -2316,6 +2459,11 @@ def execute_aim_and_approach(
     else:
         print("  fail: aim+approach timed out")
         return False
+    ik.set_q(ref[-1])
+    planned_dz = float(ik.tip_mid()[2] - aim_point(cube_pos(robot))[2])
+    ik.set_q(q_cmd)
+    got_dz = float(tip_mid_world(robot, arm)[2] - aim_point(cube_pos(robot))[2])
+    print(f"  aim+approach: grasp height vs aim point — planned {planned_dz * 100:+.1f} cm, physical {got_dz * 100:+.1f} cm")
     if held:
         print(f"  aim+approach: held the approach {held} ticks for pad clearance while turning")
     if replans:
@@ -2402,8 +2550,11 @@ def close_on_cube(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int) -> float
         stalled = len(history) >= 10 and (history[-10] - opened) < 0.0005
         if stalled:
             summary = grasp_contact_summary(robot, arm)
-            if summary["pinching"]:
-                hold = max(0.0, opened - AIM_SQUEEZE_PAST_BLOCK_M)
+            # blocked on the target: both pad faces touching, or a firm
+            # contact on the finger bodies (a bar held low on the plates)
+            if summary["pinching"] or float(summary["cube_force_n"]) >= 3.0:
+                squeeze = _AIM_TARGET["squeeze_m"]
+                hold = max(0.0, opened - (AIM_SQUEEZE_PAST_BLOCK_M if squeeze is None else squeeze))
                 # ramp the last bit of squeeze on, then confirm force
                 while cmd > hold:
                     ik.set_q(q_hold)
@@ -2424,7 +2575,14 @@ def close_on_cube(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int) -> float
                 print("  fail: weak or one-sided pinch after squeeze — not lifting")
                 return -1.0
             if cmd <= 0.0:
-                print(f"  fail: gripper closed to {opened * 1000:.1f} mm without the cube between the pads")
+                tgt = cube_pos(robot)
+                tips = finger_tips_world(robot, arm)
+                mid = tips.mean(axis=0)
+                print(
+                    f"  fail: gripper closed to {opened * 1000:.1f} mm without the target between the pads "
+                    f"[target-vs-tips: dxy={np.linalg.norm(mid[:2] - tgt[:2]) * 100:.1f} cm, "
+                    f"tips z-above-target={(mid[2] - tgt[2]) * 100:.1f} cm, sep={np.linalg.norm(tips[0] - tips[1]) * 100:.1f} cm]"
+                )
                 return -1.0
     print(f"  fail: gripper still moving at {_finger_opening_m(robot, arm.side) * 1000:.1f} mm after 4 s")
     return -1.0
@@ -2434,7 +2592,9 @@ AIM_LIFT_M = 2.0 * CUBE_HALF        # lift the cube its own height off the table
 AIM_LIFT_SPEED_MPS = 0.05
 
 
-def grasp_and_lift(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int, rng: np.random.Generator) -> bool:
+def grasp_and_lift(
+    robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int, rng: np.random.Generator, hold_s: float = 1.0
+) -> bool:
     """Stage 3: close on the cube, then lift it its own height straight up.
 
     Close and lift reuse what the legacy grasp learned the hard way: do not
@@ -2448,6 +2608,7 @@ def grasp_and_lift(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int, rng: np
     hold_grip = close_on_cube(robot, ik, fps)
     if hold_grip < 0.0:
         return False
+    _AIM_LAST_HOLD["m"] = hold_grip
 
     q_now = _cmd_seed(robot, arm.side)
     ik.set_q(q_now)
@@ -2477,8 +2638,8 @@ def grasp_and_lift(robot: MujocoBiOpenArm, ik: PositionOnlyIK, fps: int, rng: np
         _hold_fingers(robot, ik, hold_grip)
         precise_sleep(1.0 / fps)
         q_prev = q.copy()
-    # hold aloft briefly, then judge
-    for _ in range(int(1.0 * fps)):
+    # hold aloft briefly (the cube demo ends here; a carry that follows passes 0), then judge
+    for _ in range(int(hold_s * fps)):
         ik.set_q(q_prev)
         _hold_fingers(robot, ik, hold_grip)
         precise_sleep(1.0 / fps)
