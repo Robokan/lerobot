@@ -207,8 +207,11 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
 
     n_max = int(time_limit_s * fps)
     held = 0
+    held_demo = 0
     success = False
+    lifted_demo = False  # the demonstrations' own success bar (aim generator): cube up >= 80% of its height
     t_success = None
+    demo_z = rcp.CUBE_Z + 0.8 * rcp.AIM_LIFT_M
     for k in range(n_max):
         t0 = time.perf_counter()
         obs = robot.get_observation()
@@ -222,6 +225,12 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
             prev_q[s] = q
 
         cz = float(rcp.cube_pos(robot)[2])
+        if cz >= demo_z:
+            held_demo += 1
+            if held_demo >= fps // 2:
+                lifted_demo = True
+        else:
+            held_demo = 0
         if cz >= rcp.SUCCESS_CUBE_Z:
             held += 1
             if held >= fps // 2:  # held up for 0.5 s
@@ -236,6 +245,7 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
     committed = max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none"
     return {
         "success": success,
+        "lifted_demo": lifted_demo or success,
         "t_success": t_success,
         "cube_y": float(cube0[1]),
         "intended_arm": arm.side,
@@ -520,6 +530,11 @@ def main() -> None:
             ok = [r for r in results if r["success"]]
             print(f"\n==== {args.policy} ====")
             print(f"success: {len(ok)}/{n} ({100.0 * len(ok) / n:.0f}%)")
+            demo_ok = sum(1 for r in results if r.get("lifted_demo"))
+            print(
+                f"  lifted >= {0.8 * rcp.AIM_LIFT_M * 100:.0f} cm (the demonstrations' own success bar): "
+                f"{demo_ok}/{n}"
+            )
             for side, pred in (("left", lambda r: r["cube_y"] > 0), ("right", lambda r: r["cube_y"] <= 0)):
                 grp = [r for r in results if pred(r)]
                 if grp:
