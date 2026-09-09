@@ -2090,8 +2090,19 @@ def plan_via_lift(ik: PositionOnlyIK, q_from: np.ndarray, q_to: np.ndarray) -> l
     return None
 
 
-AIM_APPROACH_START_DEG = 10.0   # begin closing in once the aim is this good
+# When to start closing in depends on how far away the hand is. Far out there
+# is plenty of travel left to keep correcting the aim while moving, so a rough
+# aim is fine; close in there is little travel left, so the aim must already be
+# accurate. Linear in hand->goal distance between these two anchors.
+AIM_START_FAR_M, AIM_START_DEG_AT_FAR = 0.30, 25.0
+AIM_START_NEAR_M, AIM_START_DEG_AT_NEAR = 0.08, 4.0
 AIM_APPROACH_SPEED_MPS = 0.06
+
+
+def aim_start_threshold_deg(dist_m: float) -> float:
+    t = (dist_m - AIM_START_NEAR_M) / (AIM_START_FAR_M - AIM_START_NEAR_M)
+    t = min(1.0, max(0.0, t))
+    return AIM_START_DEG_AT_NEAR + t * (AIM_START_DEG_AT_FAR - AIM_START_DEG_AT_NEAR)
 
 
 def approach_along_aim(
@@ -2179,7 +2190,9 @@ def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
         print("  fail: every path to the aim pose sweeps the fingers through the table")
         return False
     def aimed_enough() -> bool:
-        return aim_error_deg(ik, cube_pos(robot)) < AIM_APPROACH_START_DEG
+        cube_now = cube_pos(robot)
+        dist = float(np.linalg.norm(aim_point(cube_now) - ik.hand()))
+        return aim_error_deg(ik, cube_now) < aim_start_threshold_deg(dist)
 
     q_prev = q_now
     for i, q_wp in enumerate(waypoints):
@@ -2197,9 +2210,10 @@ def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
             break
 
     ik.set_q(_cmd_seed(robot, ik.arm.side))
+    dist_now = float(np.linalg.norm(aim_point(cube_pos(robot)) - ik.hand()))
     print(
-        f"  aim: {aim_error_deg(ik, cube_pos(robot)):.1f}° off the line "
-        f"(pinch tilt {pinch_tilt_deg(ik):.1f}°) — closing in"
+        f"  aim: {aim_error_deg(ik, cube_pos(robot)):.1f}° off the line at {dist_now * 100:.0f} cm "
+        f"(start threshold {aim_start_threshold_deg(dist_now):.0f}°, pinch tilt {pinch_tilt_deg(ik):.1f}°) — closing in"
     )
     if not approach_along_aim(robot, ik, fps, chain):
         return False
