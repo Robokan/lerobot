@@ -195,6 +195,16 @@ class CheckpointPolicy:
         return {k: float(v) for k, v in zip(self.action_keys, vals, strict=True)}
 
 
+def reset_requested() -> bool:
+    """True if R was pressed in the MuJoCo viewer window since the last check:
+    abandon the current trial and set up a fresh cube and arm poses."""
+    try:
+        from lerobot.robots.mujoco_bi_openarm.viewer_keys import drain_keys
+    except Exception:  # noqa: BLE001
+        return False
+    return "r" in drain_keys()
+
+
 def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
     cube0, arm = rcp.place_reachable_cube(robot, iks, rng)
     ik = iks[arm.side]
@@ -212,8 +222,12 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
     lifted_demo = False  # the demonstrations' own success bar (aim generator): cube up >= 80% of its height
     t_success = None
     demo_z = rcp.CUBE_Z + 0.8 * rcp.AIM_LIFT_M
+    reset = False
     for k in range(n_max):
         t0 = time.perf_counter()
+        if reset_requested():
+            reset = True
+            break
         obs = robot.get_observation()
         action = policy.act(obs)
         robot.send_action(action)
@@ -244,6 +258,7 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
 
     committed = max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none"
     return {
+        "reset": reset,
         "success": success,
         "lifted_demo": lifted_demo or success,
         "t_success": t_success,
@@ -303,6 +318,8 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
     grip_idx = _np.array([i for i, k in enumerate(pol.action_keys) if "gripper" in k])
     while _time.perf_counter() < t_end:
         t0 = _time.perf_counter()
+        if reset_requested():
+            return None, _time.perf_counter() - (t_end - time_limit_s)
         obs = robot.get_observation()
         engine.notify_observation(obs)
         frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
@@ -365,6 +382,9 @@ def run_jit_trial(robot, pol, fps: int, time_limit_s: float = 30.0, slew: float 
     pops_since_submit = 0
     while _time.perf_counter() < t_end:
         t0 = _time.perf_counter()
+        if reset_requested():
+            pool.shutdown(wait=False)
+            return None, _time.perf_counter() - (t_end - time_limit_s)
         obs = robot.get_observation()
         if len(queue) <= prefetch_at and future is None:
             future = pool.submit(chunk_from, dict(obs))
@@ -482,8 +502,12 @@ def main() -> None:
         engine = build_rtc_engine(policy, robot, args.fps, args.rtc_horizon, args.task)
 
     results = []
+    if not args.no_viewer:
+        print("Press R in the MuJoCo window to abandon the current trial and reset the cube and arms.")
     try:
-        for t in range(args.trials):
+        t = 0
+        while t < args.trials:
+            reset_requested()  # clear stale key presses from the previous trial
             if args.jit:
                 cube0, arm = rcp.place_reachable_cube(robot, iks, rng)
                 rcp.setup_start_pose(robot, iks[arm.side], rng, args.fps)
@@ -492,9 +516,10 @@ def main() -> None:
                 r = {"success": ok, "t_success": t_used if ok else None,
                      "cube_y": float(cube0[1]), "intended_arm": arm.side,
                      "committed_arm": arm.side, "final_cube_z": cz}
-                print(f"trial {t + 1:>3}/{args.trials}: "
-                      f"{'SUCCESS' if ok else 'fail   '} cube_y={cube0[1]:+.2f} "
-                      f"jit t={t_used:.1f}s cube_z={cz:.3f}")
+                if ok is not None:
+                    print(f"trial {t + 1:>3}/{args.trials}: "
+                          f"{'SUCCESS' if ok else 'fail   '} cube_y={cube0[1]:+.2f} "
+                          f"jit t={t_used:.1f}s cube_z={cz:.3f}")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
             elif engine is not None:
@@ -506,13 +531,20 @@ def main() -> None:
                 r = {"success": ok, "t_success": t_used if ok else None,
                      "cube_y": float(cube0[1]), "intended_arm": arm.side,
                      "committed_arm": arm.side, "final_cube_z": cz}
-                print(f"trial {t + 1:>3}/{args.trials}: "
-                      f"{'SUCCESS' if ok else 'fail   '} cube_y={cube0[1]:+.2f} "
-                      f"rtc t={t_used:.1f}s cube_z={cz:.3f}")
+                if ok is not None:
+                    print(f"trial {t + 1:>3}/{args.trials}: "
+                          f"{'SUCCESS' if ok else 'fail   '} cube_y={cube0[1]:+.2f} "
+                          f"rtc t={t_used:.1f}s cube_z={cz:.3f}")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
             else:
                 r = run_trial(robot, iks, rng, policy, args.fps, args.time_limit)
+            if r.get("reset") or r["success"] is None:
+                print("  R pressed — resetting cube and arms (trial not counted)")
+                rcp.park_both_arms(robot, iks)
+                rcp.settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.15)
+                continue
+            t += 1
             results.append(r)
             print(
                 f"trial {t + 1:>3}/{args.trials}: {'SUCCESS' if r['success'] else 'fail   '} "
