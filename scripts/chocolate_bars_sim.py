@@ -449,7 +449,7 @@ def main() -> None:
         rcp._RECORDER = recorder
 
     # park the cube out of the scene (it shares the table otherwise)
-    rcp.set_cube_xy(robot, -0.55, 0.55)
+    rcp.set_cube_xy(robot, -0.90, -0.90)  # clear of the bar warehouse column
 
     target_eps = args.episodes if (args.record and args.episodes > 0) else 0
     max_trials = args.trials if not target_eps else max(args.trials, target_eps * 3)

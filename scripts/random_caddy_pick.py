@@ -124,13 +124,23 @@ class Trial:
 
         for i in range(MAX_BARS):
             set_bar_pose(robot, i, *WAREHOUSE[i])
+            # no two bars exactly alike: identical boxes stacked face-to-face
+            # hit a MuJoCo box-box edge case (9 contacts for a pair, fatal).
+            # Real bars differ by a fraction of a millimetre anyway.
+            import mujoco as _mj
+            gid = _mj.mj_name2id(robot._model, _mj.mjtObj.mjOBJ_GEOM, f"bar_{i}")
+            robot._model.geom_size[gid] = BAR_HALF * (1.0 + rng.uniform(-0.03, 0.03, size=3))
         self.stack_bars: list[list[int]] = []
         bar_i = 0
         for s_idx, (x, y) in enumerate(self.stack_xy):
             bars = []
             for level in range(self.sizes[s_idx]):
                 z = TABLE_TOP_Z + BAR_HALF[2] * (2 * level + 1)
-                set_bar_pose(robot, bar_i, x, y, z, yaw=self.stack_yaw[s_idx])
+                # never stack two identical boxes perfectly face-to-face: the
+                # coplanar contact overflows MuJoCo's per-pair contact buffer
+                jx, jy = rng.uniform(-0.0015, 0.0015, size=2)
+                jyaw = float(rng.uniform(-0.03, 0.03))
+                set_bar_pose(robot, bar_i, x + jx, y + jy, z, yaw=self.stack_yaw[s_idx] + jyaw)
                 set_bar_color(robot, bar_i, self.flavors[s_idx][1])
                 bars.append(bar_i)
                 bar_i += 1
@@ -545,7 +555,9 @@ def main() -> None:
     iks = {a.side: rcp.build_ik(robot, a) for a in rcp.ARMS}
     rcp.park_both_arms(robot, iks)
     rcp.settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.2)
-    rcp.set_cube_xy(robot, -0.55, 0.55)  # the cube shares the table otherwise
+    # Park the cube well clear of the bar warehouse column (x = -0.55, bars
+    # every 12 cm in y): parked on top of a bar it got launched onto the table.
+    rcp.set_cube_xy(robot, -0.90, -0.90)
 
     recorder = None
     if args.record:
