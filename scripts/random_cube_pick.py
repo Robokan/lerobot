@@ -1219,6 +1219,28 @@ def _random_start_q(
     return np.clip(np.deg2rad(arm.idle_deg), ik.lo, ik.hi)
 
 
+TUCKED_START_PROB = 0.75
+# Variation of a "tucked" start: every joint jittered, the elbow/shoulder more
+# than the wrist (a resting arm settles differently each time), so the policy
+# never sees one canonical rest pose.
+TUCK_JITTER_DEG = np.array([5.0, 5.0, 4.0, 6.0, 3.0, 3.0, 3.0])
+
+
+def jittered_tuck(arm: ArmSpec, rng: np.random.Generator, ik: PositionOnlyIK | None = None) -> np.ndarray:
+    """A varied tucked pose. With ``ik`` given, draws whose fingertips would
+    end up within 3 cm of the table are resampled (the elbow jitter can drop
+    the resting hand onto the table edge)."""
+    for _ in range(12):
+        q = np.deg2rad(arm.tuck_deg) + np.deg2rad(rng.normal(0.0, 1.0, size=7) * TUCK_JITTER_DEG)
+        if ik is None:
+            return q
+        q = np.clip(q, ik.lo, ik.hi)
+        ik.set_q(q)
+        if float(ik.tip_mid()[2]) > TABLE_TOP_Z + 0.03:
+            return q
+    return np.deg2rad(arm.tuck_deg)
+
+
 def setup_start_pose(
     robot: MujocoBiOpenArm, ik: PositionOnlyIK, rng: np.random.Generator, fps: int
 ) -> np.ndarray:
@@ -1227,12 +1249,11 @@ def setup_start_pose(
     (see _park_action); the active arm levels its gripper before approaching."""
     import mujoco
 
-    # Half the time the grabbing arm starts from its tucked pose too
-    # (jittered) — the reach then begins from rest, like a fresh pick.
-    active_tucked = rng.uniform() < 0.5
+    # Three quarters of the time the grabbing arm starts from its tucked pose
+    # (varied) — the reach then begins from rest, like a fresh pick.
+    active_tucked = rng.uniform() < TUCKED_START_PROB
     if active_tucked:
-        q_active = np.deg2rad(ik.arm.tuck_deg) + np.deg2rad(rng.normal(0.0, 2.0, size=7))
-        q_active = np.clip(q_active, ik.lo, ik.hi)
+        q_active = np.clip(jittered_tuck(ik.arm, rng, ik), ik.lo, ik.hi)
     else:
         q_active = _random_start_q(ik, ik.arm, rng)
     ik.set_q(q_active)
@@ -1245,16 +1266,15 @@ def setup_start_pose(
     other = ARMS_BY_SIDE[ik.arm.other]
     other_ik = PositionOnlyIK(ik.model, ik.data, other)
 
-    # Half the time the idle arm starts already tucked (a human who
-    # just finished with that hand leaves it resting), with a little jitter so
-    # the pose is never identical. Skipped when the cube sits near that arm's
-    # tuck spot — the arm would be parked on top of the workspace.
+    # Three quarters of the time the idle arm starts already tucked (a human
+    # who just finished with that hand leaves it resting), varied so the pose
+    # is never identical. Skipped when the cube sits near that arm's tuck
+    # spot — the arm would be parked on top of the workspace.
     cube_now = cube_pos(robot)
     d_tuck = float(np.linalg.norm(cube_now[:2] - _TUCK_TIP_XY[other.side]))
-    tucked_start = d_tuck >= _TUCK_CLEARANCE_M and rng.uniform() < 0.5
+    tucked_start = d_tuck >= _TUCK_CLEARANCE_M and rng.uniform() < TUCKED_START_PROB
     if tucked_start:
-        q_other = np.deg2rad(other.tuck_deg) + np.deg2rad(rng.normal(0.0, 2.0, size=7))
-        q_other = np.clip(q_other, other_ik.lo, other_ik.hi)
+        q_other = np.clip(jittered_tuck(other, rng, other_ik), other_ik.lo, other_ik.hi)
     else:
         q_other = _random_start_q(other_ik, other, rng)
 
