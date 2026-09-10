@@ -60,6 +60,12 @@ def push_glfw_key(keycode: int) -> None:
     ch = glfw_key_to_char(int(keycode))
     if ch is None:
         return
+    if ch == "c":
+        # Viewer camera cycling works in every script that opens the viewer
+        # (teleop, eval, data generators): handled here, not by whoever happens
+        # to drain the key queue.
+        request_cycle_camera()
+        return
     with _lock:
         _queue.append(ch)
 
