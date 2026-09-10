@@ -1972,10 +1972,16 @@ def aim_pads_clear(ik: PositionOnlyIK) -> bool:
     obstacle, for the pose currently set on ``ik``."""
     tips = finger_tips_from_data(ik.model, ik.data, ik.arm)
     low = min(finger_lowest_z_model(ik.model, ik.data, ik.arm))
-    floor = TABLE_TOP_Z + aim_pad_clearance()
     xy = _AIM_TARGET["xy"]
-    if xy is None or float(np.linalg.norm(tips.mean(axis=0)[:2] - xy)) < AIM_SUPPORT_FOOTPRINT_M:
-        floor = max(floor, _AIM_TARGET["support_z"] + aim_pad_clearance())
+    if xy is None:
+        floor = TABLE_TOP_Z + aim_pad_clearance()
+    elif float(np.linalg.norm(tips.mean(axis=0)[:2] - xy)) < AIM_SUPPORT_FOOTPRINT_M:
+        # over the target: the (possibly tight) clearance above its support
+        floor = _AIM_TARGET["support_z"] + aim_pad_clearance()
+    else:
+        # anywhere else the tight target clearance does not apply — keep the
+        # normal safe margin above the table (a 2 mm floor let the turn dip)
+        floor = TABLE_TOP_Z + max(aim_pad_clearance(), AIM_PAD_CLEARANCE_M)
     if low < floor:
         return False
     return obstacles_clear(ik, tips)
@@ -2036,7 +2042,7 @@ def aim_standoff_candidates(ik: PositionOnlyIK, cube: np.ndarray) -> list[np.nda
     if _AIM_TARGET["azimuth"] is not None:
         # elongated target: approach along its length, small deviations only
         base_az = float(_AIM_TARGET["azimuth"])
-        daz_set = (0.0, 10.0, -10.0, 20.0, -20.0, 30.0, -30.0)
+        daz_set = (0.0, 5.0, -5.0, 10.0, -10.0)  # pads must land flat on a thin bar's faces
     out = []
     max_pitch = _AIM_TARGET["max_pitch_deg"]
     for pitch_deg in (22.0, 30.0, 40.0, 55.0, 70.0):
@@ -2434,6 +2440,12 @@ def execute_aim_and_approach(
                     print("    clearance hold: forcing the verified turn through")
         q_cmd = q_next
         _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
+        if s_arc >= 0.85 * total and finger_table_graze(robot, arm, min_force_n=2.0):
+            # Pads already brushing the table on the last stretch: the target
+            # is as low as it gets (thin bars). Stop here before the servo
+            # drives the contact up to a hard fault.
+            print("    approach: pads touching the table near the target — stopping here")
+            break
         if grasp_table_fault(robot, arm) is not None:
             ik.set_q(q_cmd)
             cmd_low = min(finger_lowest_z_model(ik.model, ik.data, arm)) - TABLE_TOP_Z

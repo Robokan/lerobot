@@ -41,7 +41,7 @@ rcp.TRANSIT_CLEARANCE = 0.15
 rcp.HOVER_CLEARANCE = 0.11
 
 MAX_BARS = 12
-BAR_HALF = np.array([0.045, 0.0175, 0.0125])  # 90 x 35 x 25 mm
+BAR_HALF = np.array([0.045, 0.0175, 0.00625])  # 90 x 35 x 12.5 mm
 TABLE_TOP_Z = rcp.TABLE_TOP_Z
 
 # Row of stacks at the far edge of the table (robot at x=0; far = large x).
@@ -66,7 +66,7 @@ FLAVORS = [
     ("caramel", (0.80, 0.55, 0.25, 1)),
 ]
 
-WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.013) for i in range(MAX_BARS)]
+WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.0065) for i in range(MAX_BARS)]
 
 
 def paint_sign(robot, i: int, text: str) -> None:

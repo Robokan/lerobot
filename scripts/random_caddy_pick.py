@@ -2,7 +2,7 @@
 """Caddy picking: 7 stacks of chocolate bars on an arc; "select N bars from stack K".
 
 Each trial:
-  1. Arrange 7 stacks (1-3 bars each) on an arc in front of the arms. Stack 1
+  1. Arrange 7 stacks (1-3 bars each, 90 x 35 x 12.5 mm) on an arc in front of the arms. Stack 1
      is the left-most, stack 7 the right-most; the slots are fixed, so a stack
      number always means the same place on the table (no placards needed).
      Bar colours are shuffled per trial so colour cannot stand in for number.
@@ -49,14 +49,17 @@ from chocolate_bars_sim import (  # noqa: E402
 
 # Grasp geometry for a bar with the natural-motion (aim) machinery. The pad
 # plates are ~7.2 cm tall centred on the "tip" point, so with the tips this far
-# above the bar's centre the plate bottoms reach ~0.4 cm below it — holding the
-# bar's top ~1.65 cm — while clearing whatever it rests on (the table, or the
-# bar below in a stack) by BAR_PAD_CLEARANCE_M. Tight; hence the stiff servos.
-BAR_TIP_ABOVE_M = 0.032
-BAR_PAD_CLEARANCE_M = 0.008
+# above a 12.5 mm bar's centre the plate bottoms reach ~2 mm below it — holding
+# the bar's top ~8 mm — while clearing whatever it rests on (the table, or the
+# bar below in a stack) by BAR_PAD_CLEARANCE_M. Very tight; hence the stiff servos.
+# The physical fingertips land ~0.7 cm below the planned height, so plan the
+# tips a little higher than the depth we want; the pads then hold the bar's
+# top ~9 mm. Grip force, not depth, is what stops a thin bar slipping.
+BAR_TIP_ABOVE_M = 0.033
+BAR_PAD_CLEARANCE_M = 0.002
 # Bars leave ~1.2 cm under the pads; the default servo gains sag more than
 # that at reach, so this scene runs the arms 3x stiffer (see make_robot).
-ARM_GAIN_SCALE = 3.0
+ARM_GAIN_SCALE = 5.0
 
 N_STACKS = 7
 MAX_PER_STACK = 3
@@ -78,7 +81,7 @@ MIDDLE = np.array([0.31, 0.0])
 MIDDLE_JITTER = 0.015
 PLACE_TOL = 0.06             # bar counts as on the pile within this radius
 
-WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.013) for i in range(MAX_BARS)]
+WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.0065) for i in range(MAX_BARS)]
 PALETTE = FLAVORS + [("hazelnut", (0.62, 0.42, 0.22, 1))]
 
 
@@ -193,26 +196,61 @@ def bar_tilt_signed(robot, ik, bar: int) -> float:
     return math.atan2(-float(u[2]), float(np.hypot(u[0], u[1])))
 
 
-def level_bar_in_hand(robot, ik, fps: int, bar: int, grip_m: float) -> None:
-    """Pitch the wrist so the held bar is level before it is set down. Gripped
-    a quarter of the way in, the far end hangs ~8 deg low; released like that
-    it lands on one end and slides off the pile."""
-    tilt = bar_tilt_signed(robot, ik, bar)
-    if abs(tilt) < math.radians(2.0):
-        return
-    q0 = rcp._cmd_seed(robot, ik.arm.side)
+def _wrist_pitch_joint(ik, q0: np.ndarray) -> tuple[int, float] | None:
+    """(joint index, sign) of the single wrist joint whose +rotation pitches the
+    approach axis down the most, evaluated at q0."""
+    def approach_pitch(q: np.ndarray) -> float:
+        ik.set_q(q)
+        a = ik.rot()[:, 2]
+        return math.atan2(-float(a[2]), float(np.hypot(a[0], a[1])))
+
+    pitch0 = approach_pitch(q0)
+    best = None
+    for j in (4, 5, 6):
+        q = q0.copy()
+        q[j] = float(np.clip(q[j] + math.radians(5.0), ik.lo[j], ik.hi[j]))
+        gain = (approach_pitch(q) - pitch0) / math.radians(5.0)
+        if best is None or abs(gain) > abs(best[1]):
+            best = (j, gain)
     ik.set_q(q0)
-    a = ik.rot()[:, 2]
-    yaw = math.atan2(float(a[1]), float(a[0]))
-    pitch = math.atan2(-float(a[2]), float(np.hypot(a[0], a[1])))
-    tip = ik.tip_mid().copy()
-    for _ in range(150):
-        ik.step_tip_mid(tip, max_dq=math.radians(2.0), yaw=yaw, pitch=pitch - tilt, level=True)
-    q1 = ik.q().copy()
-    dq = float(np.max(np.abs(q1 - q0)))
-    print(f"  level bar: tilt {math.degrees(tilt):+.0f}° -> pitching wrist by {math.degrees(-tilt):+.0f}°")
-    rcp.play_joint_path(robot, ik, q0, q1, grip_m, fps, max(0.4, dq / math.radians(30.0)), "level bar",
-                        abort_on_table=False)
+    if best is None or abs(best[1]) < 0.3:
+        return None
+    return best[0], 1.0 if best[1] > 0 else -1.0
+
+
+def level_bar_in_hand(robot, ik, fps: int, bar: int, grip_m: float) -> None:
+    """Pitch the wrist so the held bar is level before it is set down (gripped
+    off-centre, the bar hangs 10-15 deg; released like that it lands on one end
+    and slides off the pile).
+
+    Iterative: rotate the wrist-pitch joint by half the measured tilt, re-measure,
+    repeat; if a step makes the tilt worse, flip direction. One full IK solve for
+    this once re-configured the whole arm and flung the bar; a single-shot joint
+    rotation over-corrected (the bar also shifts in the grip as it comes level).
+    """
+    direction = 1.0
+    prev = None
+    for _ in range(4):
+        tilt = bar_tilt_signed(robot, ik, bar)
+        if abs(tilt) < math.radians(2.5):
+            break
+        if prev is not None and abs(tilt) > abs(prev) + math.radians(1.0):
+            direction = -direction  # went the wrong way
+        prev = tilt
+        q0 = rcp._cmd_seed(robot, ik.arm.side)
+        found = _wrist_pitch_joint(ik, q0)
+        if found is None:
+            print("  level bar: no wrist joint pitches the gripper here — leaving it")
+            return
+        j, sign = found
+        # to raise the drooping end (tilt>0) pitch the approach axis UP: -tilt
+        step = -0.5 * tilt * direction
+        q1 = q0.copy()
+        q1[j] = float(np.clip(q1[j] + sign * step, ik.lo[j], ik.hi[j]))
+        dq = float(np.max(np.abs(q1 - q0)))
+        print(f"  level bar: tilt {math.degrees(tilt):+.0f}° -> wrist joint {j + 1} by {math.degrees(sign * step):+.0f}°")
+        rcp.play_joint_path(robot, ik, q0, q1, grip_m, fps, max(0.3, dq / math.radians(20.0)), "level bar",
+                            abort_on_table=False)
 
 
 def carry_and_place(
@@ -225,6 +263,11 @@ def carry_and_place(
     the BAR lands centred on the pile (the carry translates only)."""
     # carry high enough that the hanging bar (its bottom ~4.5 cm below the
     # tips) clears a pile that is already `level` bars tall
+    def in_hand(stage: str) -> None:
+        d = float(np.linalg.norm(bar_pos(robot, bar) - rcp.tip_mid_world(robot, ik.arm)))
+        print(f"    [{stage}] bar-to-tips {d * 100:.1f} cm{'  <-- LOST' if d > 0.06 else ''}")
+
+    in_hand("after lift")
     transit_z = TABLE_TOP_Z + 0.18 + 2 * BAR_HALF[2] * level
     place_z = pile_tip_z(level)
     tip = rcp.tip_mid_world(robot, ik.arm)
@@ -234,44 +277,49 @@ def carry_and_place(
     if rcp.play_tip_cartesian(robot, ik, hop, grip_m, fps, 0.0,
                               label="carry: rise", freeze_wrist=True) is None:
         return False
+    in_hand("after rise")
     over = np.array([target_xy[0], target_xy[1], transit_z])
     if rcp.play_tip_cartesian(robot, ik, over, grip_m, fps, 0.0,
                               label="carry: over pile", lock_z=transit_z,
-                              freeze_wrist=True, min_z=transit_z - 0.01) is None:
+                              freeze_wrist=True, min_z=transit_z - 0.01,
+                              speed_mps=0.15) is None:  # thin bars fling at the default 24 cm/s
         return False
+    in_hand("over pile")
     level_bar_in_hand(robot, ik, fps, bar, grip_m)
-    # Lower closed-loop on the BAR's measured height (the tip-to-bar offset
-    # varies with the grasp): descend at 6 cm/s until the bar is ~3 mm above its
-    # resting height on the pile, keeping it centred and re-levelling on the way.
+    in_hand("after leveling")
+    # One direct lower to the bar's resting height on the pile, using the
+    # measured tip-to-bar offset (it varies with the grasp), at carry speed —
+    # holding the gripper's ORIENTATION (yaw and pitch). Freezing the wrist
+    # joints instead let the descending shoulder/elbow re-pitch the gripper
+    # ~15 deg and the just-levelled bar arrived tilted again.
     rest_z = TABLE_TOP_Z + BAR_HALF[2] * (2 * level + 1)
     q_prev = rcp._cmd_seed(robot, ik.arm.side)
     ik.set_q(q_prev)
-    wrist_hold = q_prev[4:7].copy()
-    # Integrate the COMMANDED tip height (targets relative to the measured,
-    # lagging tip never get ahead of the arm and the descent stalls).
-    z_cmd = float(ik.tip_mid()[2])
-    for k in range(int(5.0 * fps)):
-        bz = float(bar_pos(robot, bar)[2])
-        if bz <= rest_z + 0.003:
-            break
-        z_cmd -= min(0.06 / fps, max(0.0, bz - rest_z - 0.002))
-        tip_t = ik.tip_mid().copy()
-        tip_t[:2] = np.asarray(pile_xy, dtype=float) + (rcp.tip_mid_world(robot, ik.arm)[:2] - bar_pos(robot, bar)[:2])
-        tip_t[2] = z_cmd
-        for _ in range(3):
-            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), freeze_wrist=wrist_hold)
+    a = ik.rot()[:, 2]
+    yaw_hold = math.atan2(float(a[1]), float(a[0]))
+    pitch_hold = math.atan2(-float(a[2]), float(np.hypot(a[0], a[1])))
+    tip = rcp.tip_mid_world(robot, ik.arm)
+    bar_now = bar_pos(robot, bar)
+    target_xy = np.asarray(pile_xy, dtype=float) + (tip[:2] - bar_now[:2])
+    place_tip_z = rest_z + float(tip[2] - bar_now[2]) + 0.004
+    tip0 = ik.tip_mid().copy()
+    tip_end = np.array([target_xy[0], target_xy[1], place_tip_z])
+    dist = float(np.linalg.norm(tip_end - tip0))
+    n = max(2, int(max(0.4, dist / 0.12) * fps))
+    print(f"  carry: lower onto level {level}: orientation-held tip move ({n / fps:.1f}s, {dist * 100:.0f} cm)…")
+    for k in range(n):
+        u = (k + 1) / n
+        s_u = u * u * (3.0 - 2.0 * u)
+        tip_t = (1.0 - s_u) * tip0 + s_u * tip_end
+        for _ in range(2):
+            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), yaw=yaw_hold, pitch=pitch_hold, level=True)
         q = rcp._rate_limit_q(ik.q(), q_prev, math.radians(1.4))
         ik.set_q(q)
         rcp._hold_fingers(robot, ik, grip_m)
         rcp.precise_sleep(1.0 / fps)
         q_prev = q.copy()
-        if k % fps == fps - 1 and abs(bar_tilt_signed(robot, ik, bar)) > math.radians(4.0):
-            level_bar_in_hand(robot, ik, fps, bar, grip_m)
-            q_prev = rcp._cmd_seed(robot, ik.arm.side)
-            ik.set_q(q_prev)
-            wrist_hold = q_prev[4:7].copy()
-            z_cmd = float(ik.tip_mid()[2])
-    level_bar_in_hand(robot, ik, fps, bar, grip_m)
+        if float(bar_pos(robot, bar)[2]) <= rest_z + 0.002:
+            break  # the bar has touched down
     print(f"  before release: bar tilt {math.degrees(bar_tilt_signed(robot, ik, bar)):+.0f}°, "
           f"bar z-above-rest {(bar_pos(robot, bar)[2] - rest_z) * 100:+.1f} cm, "
           f"off-centre {np.linalg.norm(bar_pos(robot, bar)[:2] - pile_xy) * 100:.1f} cm")
@@ -297,7 +345,7 @@ def stacks_disturbed(robot, trial: Trial, exclude: set[int]) -> list[str]:
         p0, p1 = trial.initial_pos[i], bar_pos(robot, i)
         dxy = float(np.linalg.norm(p1[:2] - p0[:2]))
         dz = abs(float(p1[2] - p0[2]))
-        if dxy > 0.03 or dz > 0.012:
+        if dxy > 0.03 or dz > 0.006:
             bad.append(f"bar_{i} moved {dxy * 100:.1f}cm xy / {dz * 1000:.0f}mm z")
     return bad
 
@@ -330,7 +378,7 @@ def aim_target_for_bar(robot, trial: Trial, s_idx: int, level: int) -> None:
         max_pitch_deg=40.0,
         # a thin bar needs less squeeze than the cube; 18 mm crushed bars into
         # each other hard enough to overflow MuJoCo's contact buffer
-        squeeze_m=0.013,
+        squeeze_m=0.019,  # ~30 N on a thin bar (13 mm gave ~21 N and slips)
     )
 
 
