@@ -2333,14 +2333,15 @@ def execute_aim_and_approach(
     turn_total = float(tcum[-1])
     print(f"  aim+approach: turn {math.degrees(turn_total):.0f}° while closing {total * 100:.0f} cm along the line…")
 
-    # Human-like variation: each reach has its own overall pace (approach and
-    # turn scaled independently by +-15%) and a slow, gentle wobble within the
-    # motion (+-6% at 0.3-0.7 Hz) — never two identical reaches.
-    speed_scale = float(rng.uniform(0.85, 1.15))
-    turn_scale = float(rng.uniform(0.85, 1.15))
-    wob_hz = float(rng.uniform(0.3, 0.7))
-    wob_phase = rng.uniform(0.0, 2.0 * math.pi, size=2)
-    print(f"  pace: approach x{speed_scale:.2f}, turn x{turn_scale:.2f}, wobble {wob_hz:.2f} Hz")
+    # No per-episode pace randomness. A random pace scale / wobble is invisible
+    # in the observation, so identical situations demanded different actions
+    # and the policy learned to hesitate (aim dataset v1: 17% at 50k steps with
+    # the lowest training loss of any run). Variety belongs in what the policy
+    # can SEE: cube pose, start poses, disturbances and their recoveries.
+    speed_scale = 1.0
+    turn_scale = 1.0
+    wob_hz = 0.0
+    wob_phase = np.zeros(2)
 
     q_cmd = turn_path[0].copy()
     s_arc = 0.0
@@ -2353,6 +2354,21 @@ def execute_aim_and_approach(
     last_log = -1.0
     for k in range(int(timeout_s * fps)):
         ik.set_q(q_cmd)
+        if (
+            _DISTURB["nudge_at"] is not None
+            and not _DISTURB["done"]
+            and tau >= turn_total
+            and s_arc >= _DISTURB["nudge_at"] * total
+        ):
+            # Injected disturbance (recovery data): shove the cube a few cm
+            # sideways mid-approach. The bump re-plan below then corrects.
+            c = cube_pos(robot)
+            ang = float(_DISTURB["angle"])
+            set_cube_xy(robot, float(c[0] + _DISTURB["dist"] * math.cos(ang)),
+                        float(c[1] + _DISTURB["dist"] * math.sin(ang)), yaw=cube_yaw(robot))
+            zero_sim_velocity(robot)
+            _DISTURB["done"] = True
+            print(f"    DISTURBANCE: cube nudged {_DISTURB['dist'] * 100:.0f} cm at {100 * s_arc / max(total, 1e-9):.0f}% of the approach")
         cube_now = cube_pos(robot)
         # Bumped cube: once the turn is done, re-plan the rest of the approach
         # from the current pose toward where the cube actually is now.
@@ -2391,12 +2407,8 @@ def execute_aim_and_approach(
         aim_err = aim_error_deg(ik, cube_now)
         dist = float(np.linalg.norm(aim_point(cube_now) - ik.hand()))
         t_now = k * dt
-        v = approach_speed_mps(aim_err, dist) * speed_scale * (
-            1.0 + 0.06 * math.sin(2.0 * math.pi * wob_hz * t_now + wob_phase[0])
-        )
-        turn_rate = math.radians(AIM_TURN_RATE_DEG_S) * turn_scale * (
-            1.0 + 0.06 * math.sin(2.0 * math.pi * wob_hz * t_now + wob_phase[1])
-        )
+        v = approach_speed_mps(aim_err, dist) * speed_scale
+        turn_rate = math.radians(AIM_TURN_RATE_DEG_S) * turn_scale
         tau_prev = tau
         tau = min(turn_total, tau + turn_rate * dt)
         turn_off = _polyline_at(turn_path, tcum, tau) - q_aim
@@ -2515,7 +2527,7 @@ def run_aim_trial(
     fps: int,
     cube0: np.ndarray,
     rng: np.random.Generator,
-    hold_s: float = 3.0,
+    hold_s: float = 1.0,
 ) -> bool:
     """Stage 1 of the natural-motion pick: bring the wrist to a pre-aim standoff
     behind the cube and point the gripper straight at it, hold, done. Later
@@ -2533,24 +2545,77 @@ def run_aim_trial(
         _draw_aim_overlay(robot, ik)
 
 
+# Recovery data: a share of episodes gets a deliberate disturbance, and a
+# failed grasp is retried instead of ending the episode. The recorded
+# demonstration then contains the miss AND the correction — the states a
+# policy ends up in when things go slightly wrong, and how to get back.
+RECOVERY_PROB = 0.30
+RECOVERY_MAX_ATTEMPTS = 3
+_DISTURB: dict = {"nudge_at": None, "dist": 0.0, "angle": 0.0, "done": False}
+
+
 def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
-    planned = plan_aim_at_cube(ik, q_now, cube, rng)
-    if planned is None:
-        print("  fail: no reachable aim pose + approach for this cube")
-        return False
-    q_aim, chain = planned
-    waypoints = plan_via_lift(ik, q_now, q_aim)
-    if waypoints is None:
-        print("  fail: every path to the aim pose sweeps the fingers through the table")
-        return False
-    if not execute_aim_and_approach(robot, ik, fps, [q_now] + waypoints, chain, rng):
-        return False
-    ik.set_q(_cmd_seed(robot, ik.arm.side))
-    print(
-        f"  around cube: aim {aim_error_deg(ik, cube_pos(robot)):.1f}° off the line, "
-        f"pinch tilt {pinch_tilt_deg(ik):.1f}°"
-    )
-    return grasp_and_lift(robot, ik, fps, rng)
+    disturbance = None
+    if rng.uniform() < RECOVERY_PROB:
+        disturbance = "nudge" if rng.uniform() < 0.5 else "drop"
+    _DISTURB.update(nudge_at=None, done=False)
+    if disturbance == "nudge":
+        _DISTURB.update(
+            nudge_at=float(rng.uniform(0.25, 0.7)),
+            dist=float(rng.uniform(0.025, 0.05)),
+            angle=float(rng.uniform(0.0, 2.0 * math.pi)),
+        )
+    drop_pending = disturbance == "drop"
+    if disturbance:
+        print(f"  recovery episode: {disturbance}")
+
+    for attempt in range(RECOVERY_MAX_ATTEMPTS):
+        if attempt > 0:
+            print(f"  RETRY {attempt}: re-aiming at the cube from here")
+            set_gripper(robot, ik, FINGER_OPEN_M, fps, hold_s=0.6)
+            q_now = _cmd_seed(robot, ik.arm.side)
+            ik.set_q(q_now)
+            cube = cube_pos(robot)
+            _AIM_OVERLAY["cube"] = cube.copy()
+        planned = plan_aim_at_cube(ik, q_now, cube, rng)
+        if planned is None:
+            print("  fail: no reachable aim pose + approach for this cube")
+            return False
+        q_aim, chain = planned
+        waypoints = plan_via_lift(ik, q_now, q_aim)
+        if waypoints is None:
+            print("  fail: every path to the aim pose sweeps the fingers through the table")
+            return False
+        if not execute_aim_and_approach(robot, ik, fps, [q_now] + waypoints, chain, rng):
+            if grasp_table_fault(robot, ik.arm) is not None:
+                return False  # a hard table strike is not something to demonstrate
+            continue  # fingers not around the cube: back off and try again
+        ik.set_q(_cmd_seed(robot, ik.arm.side))
+        print(
+            f"  around cube: aim {aim_error_deg(ik, cube_pos(robot)):.1f}° off the line, "
+            f"pinch tilt {pinch_tilt_deg(ik):.1f}°"
+        )
+        if not grasp_and_lift(robot, ik, fps, rng, hold_s=0.0):
+            continue  # slipped or missed: retry
+        if drop_pending:
+            # Injected disturbance: let go of the lifted cube, then pick it up again.
+            drop_pending = False
+            print("    DISTURBANCE: releasing the lifted cube — re-pick")
+            set_gripper(robot, ik, FINGER_OPEN_M, fps, hold_s=0.6)
+            for _ in range(int(0.5 * fps)):
+                send_q(robot, ik, FINGER_OPEN_M)
+                precise_sleep(1.0 / fps)
+            _DISTURB["done"] = True
+            continue
+        # hold aloft; the episode ends here
+        q_hold = _cmd_seed(robot, ik.arm.side)
+        ik.set_q(q_hold)
+        for _ in range(int(hold_s * fps)):
+            _hold_fingers(robot, ik, _AIM_LAST_HOLD["m"])
+            precise_sleep(1.0 / fps)
+        return True
+    print("  fail: out of attempts")
+    return False
 
 
 # Squeeze this far past where the pads block on the cube. The aim approach does
@@ -2647,8 +2712,7 @@ def grasp_and_lift(
     tip0 = tip_mid_world(robot, arm)
     wrist_hold = q_now[4:7].copy()
     cube0 = cube_pos(robot)
-    pace = float(rng.uniform(0.85, 1.15))  # same human-like variation as the reach
-    n = max(2, int(AIM_LIFT_M / (AIM_LIFT_SPEED_MPS * pace) * fps))
+    n = max(2, int(AIM_LIFT_M / AIM_LIFT_SPEED_MPS * fps))
     print(f"  lift {AIM_LIFT_M * 100:.0f} cm ({n / fps:.1f}s, wrist frozen)…")
     q_prev = q_now.copy()
     # Closed-loop on the MEASURED cube height: the PD-tracked arm sags under
