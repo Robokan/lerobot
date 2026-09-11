@@ -11,8 +11,9 @@ Each trial:
         "select 2 bars from stack 1, 1 bar from stack 4 and 2 bars from stack 7"
      (a part never asks for more bars than its stack holds).
   3. Work through the parts in order. Each bar is picked from the top of its
-     stack by the arm on that stack's side of the robot centre (left of centre
-     -> left arm) and set down on a growing pile in the middle of the table.
+     stack — stacks 1-4 with the left arm, 5-7 with the right (fixed per slot,
+     so the choice is learnable) — and set down on a growing pile in the middle
+     of the table.
   4. Success: every requested bar is on the pile, in order, and no other stack
      was disturbed (knocking a stack over is a failure).
 
@@ -169,8 +170,10 @@ class Trial:
         self.moved: list[int] = []  # bars already carried to the pile, in order
 
     def arm_for(self, stack_idx: int) -> str:
-        """Side rule: left of the robot centre (y >= 0) -> left arm."""
-        return "left" if self.stack_xy[stack_idx][1] >= 0.0 else "right"
+        """Per-slot rule: stacks 1-4 left arm, 5-7 right arm. Stack 4 sits on
+        the centreline, so a y-sign rule flipped its arm with the jitter from
+        episode to episode — unlearnable. Slots are fixed, so slot -> arm is."""
+        return "left" if stack_idx < 4 else "right"
 
     def top_bar(self, stack_idx: int) -> int:
         """Highest bar still IN the stack (a bar already carried to the pile

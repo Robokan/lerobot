@@ -39,6 +39,7 @@ CUBE_Z = TABLE_TOP_Z + CUBE_HALF
 # Full table workspace (keep a margin for the 5 cm cube). Neg-y = body right.
 CUBE_X_RANGE = (0.26, 0.48)
 CUBE_Y_RANGE = (-0.32, 0.32)
+CUBE_Y_DEADBAND = 0.04  # no cubes within this of the centreline (see place_reachable_cube)
 
 HOVER_CLEARANCE = 0.08
 # Tip-mid height above cube center. Measured at the pitched grasp pose: the pad
@@ -1893,6 +1894,12 @@ def place_reachable_cube(
     for _ in range(max_tries):
         x = float(rng.uniform(*CUBE_X_RANGE))
         y = float(rng.uniform(*CUBE_Y_RANGE))
+        if abs(y) < CUBE_Y_DEADBAND:
+            # A cube on the centreline is an either-arm case: the side rule is
+            # a hard step there, and two cubes a centimetre apart would demand
+            # opposite arms while looking identical to the camera. Every
+            # trained checkpoint's arm mismatches were exactly these cubes.
+            continue
         yaw = float(rng.uniform(-0.6, 0.6))
         cube0 = set_cube_xy(robot, x, y, yaw=yaw)
         gy = cube_yaw(robot)
