@@ -544,6 +544,38 @@ def _park_action(side: str) -> dict[str, float]:
     }
 
 
+AIM_NUDGE_SPEED_MPS = 0.05  # how fast a disturbed cube slides
+
+
+def start_cube_slide(dist_m: float, angle_rad: float) -> None:
+    """Begin sliding the cube dist_m in the given direction, a step per tick."""
+    _DISTURB["slide"] = np.array(
+        [float(dist_m) * math.cos(angle_rad), float(dist_m) * math.sin(angle_rad)]
+    )
+
+
+def step_cube_slide(robot: MujocoBiOpenArm, fps: int) -> None:
+    """Advance a pending cube slide by one tick (no-op when none is pending).
+
+    A velocity impulse was the first attempt: the cube tumbles rather than
+    sliding cleanly, so the same impulse moved it anywhere from 0.2 to 5.8 cm.
+    A teleport before that just made it vanish and reappear. This moves it at a
+    fixed speed over ~1 s — controlled, and it looks like a push.
+    """
+    slide = _DISTURB.get("slide")
+    if slide is None:
+        return
+    remaining = float(np.linalg.norm(slide))
+    if remaining < 1e-4:
+        _DISTURB["slide"] = None
+        return
+    step = min(AIM_NUDGE_SPEED_MPS / fps, remaining)
+    d = slide / remaining * step
+    c = cube_pos(robot)
+    set_cube_xy(robot, float(c[0] + d[0]), float(c[1] + d[1]), yaw=cube_yaw(robot))
+    _DISTURB["slide"] = slide - d
+
+
 def set_cube_xy(robot: MujocoBiOpenArm, x: float, y: float, yaw: float = 0.0) -> np.ndarray:
     import mujoco
 
@@ -2050,38 +2082,57 @@ def shoulder_pos(ik: PositionOnlyIK) -> np.ndarray:
 # looking down at this angle. A human aims from behind the object, not from
 # wherever the hand happened to be.
 AIM_STANDOFF_M = 0.22
-AIM_PITCH_RAD = math.radians(22.0)
+AIM_PITCH_RAD = math.radians(30.0)  # measured: 30 deg plans in every scene, 22-26 deg in none
+
+
+# Stereotyped strategy (default). A data generator must map similar-looking
+# scenes to similar-looking motions: if it picks between discrete strategies
+# (candidate standoffs, detour-or-not, yield-or-not), two scenes a centimetre
+# apart can get visibly different motions, and from the policy's side that is
+# indistinguishable from randomness. Everything below is a CONTINUOUS function
+# of the geometry; when the single strategy does not plan, the caller resamples
+# the scene instead of trying a different one.
+AIM_STEREOTYPED = True
+AIM_MIN_SHOULDER_CLEAR_M = 0.14  # standoff never closer than this to the shoulder
 
 
 def aim_standoff_candidates(ik: PositionOnlyIK, cube: np.ndarray) -> list[np.ndarray]:
-    """Standoff points at AIM_STANDOFF_M from the cube, preferred first.
+    """Standoff point(s) at AIM_STANDOFF_M from the cube, preferred first.
 
-    First choice is behind the cube on the shoulder->cube line looking down
-    22 deg. Cubes close to the shoulder leave no room behind them (the wrist
-    would sit on the shoulder), so the list steepens toward looking straight
-    down and swings the azimuth up to 60 deg off the shoulder line; the planner
-    takes the first reachable one.
+    Stereotyped: exactly one, behind the cube on the shoulder->cube line (or on
+    the target's own axis when one is set), looking down at a pitch that varies
+    CONTINUOUSLY with how much room there is behind the cube — shallow when the
+    cube is far from the shoulder, steepening smoothly as it gets closer.
     """
     sh = shoulder_pos(ik)
     h = np.asarray(cube[:2], dtype=float) - sh[:2]
+    hd = float(np.linalg.norm(h))
     base_az = math.atan2(h[1], h[0])
-    daz_set = (0.0, 30.0, -30.0, 60.0, -60.0)
     if _AIM_TARGET["azimuth"] is not None:
-        # elongated target: approach along its length, small deviations only
-        base_az = float(_AIM_TARGET["azimuth"])
-        daz_set = (0.0, 5.0, -5.0, 10.0, -10.0)  # pads must land flat on a thin bar's faces
-    out = []
+        base_az = float(_AIM_TARGET["azimuth"])  # elongated target: along its length
+
+    # Shallowest pitch whose standoff still clears the shoulder, floored at the
+    # nominal 22 deg and capped by any per-target limit.
+    cos_max = (hd - AIM_MIN_SHOULDER_CLEAR_M) / AIM_STANDOFF_M
+    pitch = max(AIM_PITCH_RAD, math.acos(float(np.clip(cos_max, -1.0, 1.0))))
     max_pitch = _AIM_TARGET["max_pitch_deg"]
-    for pitch_deg in (22.0, 30.0, 40.0, 55.0, 70.0):
-        if max_pitch is not None and pitch_deg > max_pitch:
+    if max_pitch is not None:
+        pitch = min(pitch, math.radians(float(max_pitch)))
+
+    def at(pitch_rad: float, az: float) -> np.ndarray:
+        horiz = AIM_STANDOFF_M * math.cos(pitch_rad)
+        p = np.asarray(cube, dtype=float) - np.array([math.cos(az), math.sin(az), 0.0]) * horiz
+        p[2] = float(cube[2]) + AIM_STANDOFF_M * math.sin(pitch_rad)
+        return p
+
+    if AIM_STEREOTYPED:
+        return [at(pitch, base_az)]
+    out = []
+    for pd in (22.0, 30.0, 40.0, 55.0, 70.0):
+        if max_pitch is not None and pd > max_pitch:
             break
-        pitch = math.radians(pitch_deg)
-        for daz_deg in daz_set:
-            az = base_az + math.radians(daz_deg)
-            horiz = AIM_STANDOFF_M * math.cos(pitch)
-            p = np.asarray(cube, dtype=float) - np.array([math.cos(az), math.sin(az), 0.0]) * horiz
-            p[2] = float(cube[2]) + AIM_STANDOFF_M * math.sin(pitch)
-            out.append(p)
+        for daz in (0.0, 30.0, -30.0, 60.0, -60.0):
+            out.append(at(math.radians(pd), base_az + math.radians(daz)))
     return out
 
 
@@ -2161,7 +2212,8 @@ def plan_aim_at_cube(
     for standoff in aim_standoff_candidates(ik, cube):
         aim0 = goal - standoff
         tcp_target = standoff + aim0 / np.linalg.norm(aim0) * hand_to_tcp
-        for seed in (q_start.copy(), np.deg2rad(ik.arm.idle_deg)):
+        seeds = [q_start.copy()] if AIM_STEREOTYPED else [q_start.copy(), np.deg2rad(ik.arm.idle_deg)]
+        for seed in seeds:
             plan_aim_axis(ik, seed, tcp_target, aim0, rng=None, iters=300)
             for _ in range(3):
                 q = ik.q().copy()
@@ -2260,6 +2312,8 @@ def plan_via_lift(ik: PositionOnlyIK, q_from: np.ndarray, q_to: np.ndarray) -> l
     direct if clear, else via a straight lift of the wrist (orientation held)."""
     if joint_path_clear(ik, q_from, q_to):
         return [q_to]
+    if AIM_STEREOTYPED:
+        return None  # no detour variant: the caller resamples the scene
     ik.set_q(q_from)
     wrist, approach = ik.ee().copy(), ik.rot()[:, 2].copy()
     back = -approach.copy()
@@ -2369,11 +2423,7 @@ def execute_aim_and_approach(
         ):
             # Injected disturbance (recovery data): shove the cube a few cm
             # sideways mid-approach. The bump re-plan below then corrects.
-            c = cube_pos(robot)
-            ang = float(_DISTURB["angle"])
-            set_cube_xy(robot, float(c[0] + _DISTURB["dist"] * math.cos(ang)),
-                        float(c[1] + _DISTURB["dist"] * math.sin(ang)), yaw=cube_yaw(robot))
-            zero_sim_velocity(robot)
+            start_cube_slide(float(_DISTURB["dist"]), float(_DISTURB["angle"]))
             _DISTURB["done"] = True
             print(f"    DISTURBANCE: cube nudged {_DISTURB['dist'] * 100:.0f} cm at {100 * s_arc / max(total, 1e-9):.0f}% of the approach")
         cube_now = cube_pos(robot)
@@ -2449,7 +2499,12 @@ def execute_aim_and_approach(
         # turn alone would, hold the turn too (the arm pauses a tick).
         q_target = _polyline_at(ref, arc, s_try) + turn_off
         q_next = step_toward(q_target)
-        if clear(q_next):
+        if clear(q_next) or AIM_STEREOTYPED:
+            # Stereotyped: no per-tick vetoes. Holding or yielding the approach
+            # inserts pauses that depend on fine geometry, so two near-identical
+            # scenes get visibly different motion. The turn path and the chain
+            # are each verified before execution; a blend that still clips the
+            # table aborts the episode below (and the episode is dropped).
             s_arc = s_try
             stalled = 0
         else:
@@ -2478,6 +2533,7 @@ def execute_aim_and_approach(
                     # path itself is being vetoed by the transient blend — let it go
                     print("    clearance hold: forcing the verified turn through")
         q_cmd = q_next
+        step_cube_slide(robot, fps)
         _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
         if s_arc >= 0.85 * total and finger_table_graze(robot, arm, min_force_n=2.0):
             # Pads already brushing the table on the last stretch: the target
@@ -2558,21 +2614,23 @@ def run_aim_trial(
 # policy ends up in when things go slightly wrong, and how to get back.
 RECOVERY_PROB = 0.30
 RECOVERY_MAX_ATTEMPTS = 3
-_DISTURB: dict = {"nudge_at": None, "dist": 0.0, "angle": 0.0, "done": False}
+_DISTURB: dict = {"nudge_at": None, "dist": 0.0, "angle": 0.0, "done": False, "slide": None}
 
 
 def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
-    disturbance = None
-    if rng.uniform() < RECOVERY_PROB:
-        disturbance = "nudge" if rng.uniform() < 0.5 else "drop"
-    _DISTURB.update(nudge_at=None, done=False)
+    # Only the nudge: a cube that visibly slides EXPLAINS the correction that
+    # follows. The "drop" disturbance (release the lifted cube, re-pick) was
+    # removed — the release had no visible cause, so it taught the policy that
+    # letting go after a lift is sometimes right, keyed on a random number it
+    # cannot see.
+    disturbance = "nudge" if rng.uniform() < RECOVERY_PROB else None
+    _DISTURB.update(nudge_at=None, done=False, slide=None)
     if disturbance == "nudge":
         _DISTURB.update(
             nudge_at=float(rng.uniform(0.25, 0.7)),
             dist=float(rng.uniform(0.025, 0.05)),
             angle=float(rng.uniform(0.0, 2.0 * math.pi)),
         )
-    drop_pending = disturbance == "drop"
     if disturbance:
         print(f"  recovery episode: {disturbance}")
 
@@ -2604,16 +2662,6 @@ def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
         )
         if not grasp_and_lift(robot, ik, fps, rng, hold_s=0.0):
             continue  # slipped or missed: retry
-        if drop_pending:
-            # Injected disturbance: let go of the lifted cube, then pick it up again.
-            drop_pending = False
-            print("    DISTURBANCE: releasing the lifted cube — re-pick")
-            set_gripper(robot, ik, FINGER_OPEN_M, fps, hold_s=0.6)
-            for _ in range(int(0.5 * fps)):
-                send_q(robot, ik, FINGER_OPEN_M)
-                precise_sleep(1.0 / fps)
-            _DISTURB["done"] = True
-            continue
         # hold aloft; the episode ends here
         q_hold = _cmd_seed(robot, ik.arm.side)
         ik.set_q(q_hold)
