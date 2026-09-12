@@ -52,8 +52,6 @@ COLOURS = {
 }
 PAD_TOL = 0.06          # cube counts as on the pad within this of its centre
 PAD_KEEPOUT = 0.11      # cubes never spawn this close to a pad
-# Spawn band per arm: its own half plus the shared middle (cross-body picks).
-SPAWN_Y = {"left": (-0.10, 0.32), "right": (-0.32, 0.10)}
 CARRY_TRANSIT_Z = TABLE_TOP_Z + 0.18
 PLACE_MAX_ATTEMPTS = 3
 
@@ -66,20 +64,39 @@ def set_cube_colour(robot, rgba) -> None:
     m.mat_rgba[mid] = rgba
 
 
-def place_cube_for(robot, iks, rng: np.random.Generator, colour: str, max_tries: int = 60):
-    """Drop the cube somewhere its colour's arm can reach; return cube pose."""
+CROSS_BODY_PROB = 0.4  # how often to try the far side of the table
+
+
+def place_cube_for(robot, iks, rng: np.random.Generator, colour: str, max_tries: int = 40):
+    """Drop the cube anywhere its colour's arm can actually plan a pick.
+
+    Reachability is tested with the AIM planner (the machinery that does the
+    pick), not the legacy grasp pose: the arm reaches noticeably further
+    across the table than that pose suggests. Cross-body placements — a green
+    cube on the LEFT, fetched by the right arm reaching over — are
+    deliberately over-sampled, so which side a cube sits on says nothing about
+    which arm will take it and the colour is the only usable cue.
+    """
     _, side, _ = COLOURS[colour]
     ik = iks[side]
-    for _ in range(max_tries):
+    own = (0.0, 0.32) if side == "left" else (-0.32, 0.0)
+    far = (-0.32, 0.0) if side == "left" else (0.0, 0.32)
+    for attempt in range(max_tries):
+        # early attempts honour the cross-body draw; later ones fall back to
+        # the arm's own side so a trial is never lost to an unreachable draw
+        band = far if (rng.uniform() < CROSS_BODY_PROB and attempt < max_tries // 2) else own
         x = float(rng.uniform(*rcp.CUBE_X_RANGE))
-        y = float(rng.uniform(*SPAWN_Y[side]))
+        y = float(rng.uniform(*band))
         if any(np.hypot(x - pad[0], y - pad[1]) < PAD_KEEPOUT for _, _, pad in COLOURS.values()):
             continue
         yaw = float(rng.uniform(-0.6, 0.6))
         cube0 = rcp.set_cube_xy(robot, x, y, yaw=yaw)
-        if rcp.arm_can_reach_cube(ik, cube0, rcp.cube_yaw(robot)):
-            print(f"  {colour} cube @ xy=({x:.3f}, {y:.3f}) yaw={math.degrees(yaw):.0f}° -> {side} arm, {side} pad")
-            return cube0
+        if rcp.plan_aim_at_cube(ik, np.deg2rad(ik.arm.idle_deg), rcp.cube_pos(robot), rng) is None:
+            continue
+        cross = (y > 0) != (side == "left")
+        print(f"  {colour} cube @ xy=({x:.3f}, {y:.3f}) yaw={math.degrees(yaw):.0f}° -> {side} arm"
+              f"{' (CROSS-BODY)' if cross else ''}, {side} pad")
+        return cube0
     raise RuntimeError(f"could not place a {colour} cube reachable by the {side} arm")
 
 
