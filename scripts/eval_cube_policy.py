@@ -269,6 +269,66 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
     }
 
 
+def run_color_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
+    """Colour-sorting task (random_color_pick): red cube -> left arm -> red pad,
+    green -> right -> green pad. Success = cube resting on the matching pad for
+    0.5 s. Same scene setup as the generator, policy drives."""
+    import random_color_pick as rcol
+
+    colour = "red" if rng.uniform() < 0.5 else "green"
+    rgba, side, pad_xy = rcol.COLOURS[colour]
+    other_pad = rcol.COLOURS["green" if colour == "red" else "red"][2]
+    rcol.set_cube_colour(robot, rgba)
+    cube0 = rcol.place_cube_for(robot, iks, rng, colour)
+    rcp.setup_start_pose(robot, iks[side], rng, fps)
+    policy.reset()
+
+    q_start = {s_: rcp._arm_q_real(robot, iks[s_]) for s_ in ("left", "right")}
+    travel = {"left": 0.0, "right": 0.0}
+    prev_q = dict(q_start)
+    held = 0
+    success = False
+    t_success = None
+    reset = False
+    for k in range(int(time_limit_s * fps)):
+        t0 = time.perf_counter()
+        if reset_requested():
+            reset = True
+            break
+        obs = robot.get_observation()
+        robot.send_action(policy.act(obs))
+        precise_sleep(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+        for s_ in ("left", "right"):
+            q = rcp._arm_q_real(robot, iks[s_])
+            travel[s_] += float(np.abs(q - prev_q[s_]).sum())
+            prev_q[s_] = q
+        ok, _ = rcol.on_pad(robot, pad_xy)
+        if ok:
+            held += 1
+            if held >= fps // 2:
+                success = True
+                t_success = (k + 1) / fps
+                break
+        else:
+            held = 0
+        if float(rcp.cube_pos(robot)[2]) < 0.2:
+            break
+    committed = max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none"
+    wrong_pad, _ = rcol.on_pad(robot, other_pad)
+    return {
+        "reset": reset,
+        "success": success,
+        "lifted_demo": success,
+        "t_success": t_success,
+        "cube_y": float(cube0[1]),
+        "colour": colour,
+        "intended_arm": side,
+        "committed_arm": committed,
+        "wrong_pad": bool(wrong_pad),
+        "final_cube_z": float(rcp.cube_pos(robot)[2]),
+    }
+
+
 def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str):
     """Construct lerobot's real RTC engine around our policy + processors."""
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -435,7 +495,10 @@ def main() -> None:
                         help="use a seed NOT used for training data")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--time-limit", type=float, default=25.0)
-    parser.add_argument("--task", default="pick up the red cube and lift it")
+    parser.add_argument("--task", default=None,
+                        help="task prompt given to the policy (default: the generator's string for --task-mode)")
+    parser.add_argument("--task-mode", choices=["lift", "color"], default="lift",
+                        help="lift: pick up the cube (random_cube_pick); color: red/green cube onto its pad (random_color_pick)")
     parser.add_argument("--model-path", default=str(Path.home() / "sparkpack/openarm_mujoco/v1/scene.xml"))
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument(
@@ -471,6 +534,15 @@ def main() -> None:
              "on the TRT server). 16 markedly reduces chunk wiggle vs the default 4.",
     )
     args = parser.parse_args()
+    if args.task is None:
+        if args.task_mode == "color":
+            import random_color_pick as rcol
+
+            args.task = rcol.TASK
+        else:
+            args.task = "pick up the red cube and lift it"
+    if args.task_mode == "color" and (args.rtc or args.jit):
+        parser.error("--task-mode color is implemented for the synchronous path only")
     if args.trt_socket:
         # The RTC engine calls policy.predict_action_chunk directly, which
         # routes to TRT via this env var — the connect_trt socket only covers
@@ -537,6 +609,8 @@ def main() -> None:
                           f"rtc t={t_used:.1f}s cube_z={cz:.3f}")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
+            elif args.task_mode == "color":
+                r = run_color_trial(robot, iks, rng, policy, args.fps, args.time_limit)
             else:
                 r = run_trial(robot, iks, rng, policy, args.fps, args.time_limit)
             if r.get("reset") or r["success"] is None:
@@ -576,6 +650,12 @@ def main() -> None:
                 1 for r in results if r["committed_arm"] not in (r["intended_arm"], "none")
             )
             print(f"  arm-selection mismatches (committed != scripted choice): {wrong}/{n}")
+            if args.task_mode == "color":
+                for colour in ("red", "green"):
+                    grp = [r for r in results if r.get("colour") == colour]
+                    if grp:
+                        print(f"  {colour:5s} cubes: {sum(r['success'] for r in grp)}/{len(grp)}")
+                print(f"  cube ended on the WRONG pad: {sum(1 for r in results if r.get('wrong_pad'))}/{n}")
             if ok:
                 print(f"  mean time to success: {np.mean([r['t_success'] for r in ok]):.1f}s")
         robot.disconnect()
