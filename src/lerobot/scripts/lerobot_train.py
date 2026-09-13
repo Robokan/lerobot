@@ -30,7 +30,9 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 
 import dataclasses
 import logging
+import shutil
 import sys
+from pathlib import Path
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -715,7 +717,18 @@ def train(cfg: TrainPipelineConfig):
             # writes are gated inside save_checkpoint — no rank branches at the call site.
             if is_main_process():
                 logging.info(f"Checkpoint policy after step {step}")
-            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            keep_every = getattr(cfg, "checkpoint_keep_every", 0) or 0
+            permanent = keep_every <= 0 or step % keep_every == 0 or step == cfg.steps
+            if permanent:
+                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            else:
+                # Rolling checkpoint: overwrite one directory instead of adding
+                # another full copy of the model for every intermediate save.
+                checkpoint_dir = Path(cfg.output_dir) / "checkpoints" / "rolling"
+                if is_main_process() and checkpoint_dir.exists():
+                    shutil.rmtree(checkpoint_dir)
+                if accelerator is not None:
+                    accelerator.wait_for_everyone()
             save_checkpoint(
                 checkpoint_dir=checkpoint_dir,
                 step=step,

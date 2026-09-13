@@ -515,7 +515,27 @@ def _arm_q_from_obs(obs: dict, side: str) -> np.ndarray:
 # Per-tick retreat rate for the arm that is NOT picking: it starts at a random
 # pose like the active arm and drifts back to its tucked side pose while the
 # pick happens (12 deg/s at 30 fps — deliberate, unhurried).
-_RETREAT_STEP_RAD = math.radians(0.8)
+# Retreat rate of the idle arm. 0.8 deg/tick (24 deg/s) was slow enough that
+# the working arm could catch up with it mid-tuck and collide.
+_RETREAT_STEP_RAD = math.radians(2.5)
+
+# Where the idle arm parks: a wrist target BEHIND the table's near edge
+# (the top spans x 0.055..0.555), so the tucked arm is off the table
+# altogether. The IK solves the arm configuration; hand-picked joint angles
+# kept the hand out over the table no matter how far the shoulder was pulled.
+TUCK_TIP_TARGET = {"right": np.array([0.02, -0.26, 0.50]), "left": np.array([0.02, 0.26, 0.50])}
+_TUCK_Q_CACHE: dict[str, np.ndarray] = {}
+
+
+def tuck_q(ik: PositionOnlyIK) -> np.ndarray:
+    """Joint angles that put this arm's wrist at its off-table park target."""
+    side = ik.arm.side
+    if side not in _TUCK_Q_CACHE:
+        q = plan_q_to_tip_mid_robust(
+            ik, np.deg2rad(ik.arm.tuck_deg), TUCK_TIP_TARGET[side], yaw=0.0, pitch=0.0
+        )
+        _TUCK_Q_CACHE[side] = np.deg2rad(ik.arm.tuck_deg) if q is None else q
+    return _TUCK_Q_CACHE[side].copy()
 _OTHER_GRIP: dict[str, float] = {}
 # Where the idle arm retreats this trial: its half-tuck by default, or the full
 # park when the cube spawned too close to the half-tuck spot to be safe.
@@ -1237,7 +1257,8 @@ def jittered_tuck(arm: ArmSpec, rng: np.random.Generator, ik: PositionOnlyIK | N
     end up within 3 cm of the table are resampled (the elbow jitter can drop
     the resting hand onto the table edge)."""
     for _ in range(12):
-        q = np.deg2rad(arm.tuck_deg) + np.deg2rad(rng.normal(0.0, 1.0, size=7) * TUCK_JITTER_DEG)
+        base = tuck_q(ik) if ik is not None else np.deg2rad(arm.tuck_deg)
+        q = base + np.deg2rad(rng.normal(0.0, 1.0, size=7) * TUCK_JITTER_DEG)
         if ik is None:
             return q
         q = np.clip(q, ik.lo, ik.hi)
@@ -1247,7 +1268,7 @@ def jittered_tuck(arm: ArmSpec, rng: np.random.Generator, ik: PositionOnlyIK | N
         # episode faulted on its first move.
         if min(finger_lowest_z_model(ik.model, ik.data, arm)) > TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
             return q
-    return np.deg2rad(arm.tuck_deg)
+    return tuck_q(ik) if ik is not None else np.deg2rad(arm.tuck_deg)
 
 
 def setup_start_pose(

@@ -64,21 +64,39 @@ def main() -> None:
                 help="how many of the newest checkpoints to keep besides the --keep-every ones. "
                      "1 gives a rolling latest at save_freq granularity.")
     ap.add_argument("--interval", type=float, default=120.0, help="seconds between sweeps")
+    ap.add_argument("--startup-timeout", type=float, default=8 * 3600,
+                    help="give up if training never starts within this many seconds")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
     root = Path(args.output_dir).expanduser() / "checkpoints"
     print(f"[janitor] watching {root}: keeping every {args.keep_every} steps, "
           f"the {args.keep_recent} most recent, and one optimizer state", flush=True)
+    # The janitor is normally started BEFORE training (the chain launches it,
+    # then lerobot-train). Exiting the moment pgrep finds nothing would kill it
+    # instantly and let the disk fill, so wait until training has been SEEN
+    # running before treating its absence as "finished".
+    seen_training = False
+    waited = 0.0
     while True:
         if root.exists():
             sweep(root, args.keep_every, args.keep_recent, not args.quiet)
-        if subprocess.run(["pgrep", "-f", "lerobot-trai[n]"], capture_output=True).returncode != 0:
-            # training gone: sweep once more so the run leaves a tidy directory
+        running = subprocess.run(["pgrep", "-f", "lerobot-trai[n]"], capture_output=True).returncode == 0
+        if running:
+            if not seen_training:
+                print("[janitor] training is up — monitoring", flush=True)
+            seen_training = True
+        elif seen_training:
             if root.exists():
                 sweep(root, args.keep_every, args.keep_recent, not args.quiet)
             print("[janitor] training finished — done", flush=True)
             return
+        else:
+            waited += args.interval
+            if waited > args.startup_timeout:
+                print(f"[janitor] no training started within {args.startup_timeout / 3600:.1f} h — exiting",
+                      flush=True)
+                return
         time.sleep(args.interval)
 
 

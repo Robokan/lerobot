@@ -152,6 +152,11 @@ class TrainPipelineConfig(HubMixin):
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     # A non-positive value disables periodic saving, keeping only the final checkpoint.
     save_freq: int = 20_000
+    # When > 0, only steps at a multiple of this get their own numbered
+    # checkpoint directory; the other `save_freq` saves overwrite a single
+    # rolling one. Lets a run keep a recent checkpoint at fine granularity
+    # without every save costing another full copy of the model on disk.
+    checkpoint_keep_every: int = 0
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
