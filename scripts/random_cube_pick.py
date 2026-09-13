@@ -544,38 +544,6 @@ def _park_action(side: str) -> dict[str, float]:
     }
 
 
-AIM_NUDGE_SPEED_MPS = 0.05  # how fast a disturbed cube slides
-
-
-def start_cube_slide(dist_m: float, angle_rad: float) -> None:
-    """Begin sliding the cube dist_m in the given direction, a step per tick."""
-    _DISTURB["slide"] = np.array(
-        [float(dist_m) * math.cos(angle_rad), float(dist_m) * math.sin(angle_rad)]
-    )
-
-
-def step_cube_slide(robot: MujocoBiOpenArm, fps: int) -> None:
-    """Advance a pending cube slide by one tick (no-op when none is pending).
-
-    A velocity impulse was the first attempt: the cube tumbles rather than
-    sliding cleanly, so the same impulse moved it anywhere from 0.2 to 5.8 cm.
-    A teleport before that just made it vanish and reappear. This moves it at a
-    fixed speed over ~1 s — controlled, and it looks like a push.
-    """
-    slide = _DISTURB.get("slide")
-    if slide is None:
-        return
-    remaining = float(np.linalg.norm(slide))
-    if remaining < 1e-4:
-        _DISTURB["slide"] = None
-        return
-    step = min(AIM_NUDGE_SPEED_MPS / fps, remaining)
-    d = slide / remaining * step
-    c = cube_pos(robot)
-    set_cube_xy(robot, float(c[0] + d[0]), float(c[1] + d[1]), yaw=cube_yaw(robot))
-    _DISTURB["slide"] = slide - d
-
-
 def set_cube_xy(robot: MujocoBiOpenArm, x: float, y: float, yaw: float = 0.0) -> np.ndarray:
     import mujoco
 
@@ -2260,7 +2228,6 @@ def plan_aim_at_cube(
 # detected and the chain re-planned toward where the cube actually is.
 _AIM_PLAN: dict[str, np.ndarray | None] = {"cube": None, "in_offset": None}
 AIM_REPLAN_BUMP_M = 0.008
-AIM_REPLAN_TRACK_M = 0.004  # tighter while the cube is still moving
 
 
 # Physical arm sags ~1.5 cm below the commanded pose under PD tracking; keep
@@ -2427,32 +2394,17 @@ def execute_aim_and_approach(
     last_log = -1.0
     for k in range(int(timeout_s * fps)):
         ik.set_q(q_cmd)
-        if (
-            _DISTURB["nudge_at"] is not None
-            and not _DISTURB["done"]
-            and tau >= turn_total
-            and s_arc >= _DISTURB["nudge_at"] * total
-        ):
-            # Injected disturbance (recovery data): shove the cube a few cm
-            # sideways mid-approach. The bump re-plan below then corrects.
-            start_cube_slide(float(_DISTURB["dist"]), float(_DISTURB["angle"]))
-            _DISTURB["done"] = True
-            print(f"    DISTURBANCE: cube nudged {_DISTURB['dist'] * 100:.0f} cm at {100 * s_arc / max(total, 1e-9):.0f}% of the approach")
         cube_now = cube_pos(robot)
         # Bumped cube: once the turn is done, re-plan the rest of the approach
         # from the current pose toward where the cube actually is now.
         planned = _AIM_PLAN["cube"]
         moved = 0.0 if planned is None else float(np.linalg.norm(cube_now[:2] - planned[:2]))
-        sliding = _DISTURB.get("slide") is not None
-        just_stopped = _DISTURB.get("was_sliding", False) and not sliding
-        _DISTURB["was_sliding"] = sliding
         if (
             tau >= turn_total
             and planned is not None
-            # while the cube is being pushed, track it closely; re-plan once
-            # more the moment it stops so the final approach goes to where it
-            # actually came to rest
-            and (moved > (AIM_REPLAN_TRACK_M if sliding else AIM_REPLAN_BUMP_M) or just_stopped)
+            # the cube is not deliberately disturbed any more, but if the arm
+            # brushes it the approach still re-plans toward where it now is
+            and moved > AIM_REPLAN_BUMP_M
         ):
             goal_new = aim_point(cube_now) + _AIM_PLAN["in_offset"]
             new_chain = plan_approach_chain(ik, q_cmd, goal_new)
@@ -2595,7 +2547,6 @@ def execute_aim_and_approach(
                     # path itself is being vetoed by the transient blend — let it go
                     print("    clearance hold: forcing the verified turn through")
         q_cmd = q_next
-        step_cube_slide(robot, fps)
         _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
         if s_arc >= 0.85 * total and finger_table_graze(robot, arm, min_force_n=2.0):
             # Pads already brushing the table on the last stretch: the target
@@ -2670,13 +2621,12 @@ def run_aim_trial(
         _draw_aim_overlay(robot, ik)
 
 
-# Recovery data: a share of episodes gets a deliberate disturbance, and a
-# failed grasp is retried instead of ending the episode. The recorded
-# demonstration then contains the miss AND the correction — the states a
-# policy ends up in when things go slightly wrong, and how to get back.
-RECOVERY_PROB = 0.30
+# Recovery data comes from REAL misses only: a failed grasp is retried from
+# wherever the arm ended up, instead of ending the episode. Injected
+# disturbances (shoving the cube mid-approach) were removed — they muddied the
+# demonstrations more than they taught recovery.
 RECOVERY_MAX_ATTEMPTS = 3
-_DISTURB: dict = {"nudge_at": None, "dist": 0.0, "angle": 0.0, "done": False, "slide": None, "was_sliding": False}
+_DISTURB: dict = {}
 
 
 def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
@@ -2685,17 +2635,6 @@ def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
     # removed — the release had no visible cause, so it taught the policy that
     # letting go after a lift is sometimes right, keyed on a random number it
     # cannot see.
-    disturbance = "nudge" if rng.uniform() < RECOVERY_PROB else None
-    _DISTURB.update(nudge_at=None, done=False, slide=None, was_sliding=False)
-    if disturbance == "nudge":
-        _DISTURB.update(
-            nudge_at=float(rng.uniform(0.25, 0.7)),
-            dist=float(rng.uniform(0.025, 0.05)),
-            angle=float(rng.uniform(0.0, 2.0 * math.pi)),
-        )
-    if disturbance:
-        print(f"  recovery episode: {disturbance}")
-
     for attempt in range(RECOVERY_MAX_ATTEMPTS):
         if attempt > 0:
             print(f"  RETRY {attempt}: re-aiming at the cube from here")
