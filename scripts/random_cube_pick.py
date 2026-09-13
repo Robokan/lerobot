@@ -803,17 +803,18 @@ def _draw_aim_overlay(robot: MujocoBiOpenArm, ik: PositionOnlyIK) -> None:
     import mujoco
 
     scn = viewer.user_scn
-    cube = _AIM_OVERLAY["cube"] if _AIM_OVERLAY_ENABLED else None
-    if cube is None:
+    if not _AIM_OVERLAY_ENABLED or _AIM_OVERLAY["cube"] is None:
         scn.ngeom = 0
         return
     wrist = robot._data.geom_xpos[ik.hand_gid].copy()
     approach = robot._data.xmat[ik.body].reshape(3, 3)[:, 2]
-    # The aim point follows the LIVE cube: store the plan's reach-past offset,
-    # not a frozen target, or the line keeps pointing where the cube used to be
-    # while it is being pushed.
+    # Draw to where the target IS, read live every tick. _AIM_OVERLAY["cube"]
+    # is only an on/off flag: it used to hold a snapshot taken when the trial
+    # started, so the line kept pointing at the cube's old position while it
+    # was being pushed. cube_pos() follows set_target_body(), so this is the
+    # bar in the caddy scene and the cube everywhere else.
     off = _AIM_OVERLAY["goal_offset"]
-    cube = aim_point(cube) + (off if off is not None else 0.0)
+    cube = aim_point(cube_pos(robot)) + (off if off is not None else 0.0)
     length = float(np.linalg.norm(cube - wrist))
     rays = [
         (cube, np.array([0.1, 0.9, 0.2, 0.9])),                       # wrist -> cube
@@ -1276,7 +1277,7 @@ def jittered_tuck(arm: ArmSpec, rng: np.random.Generator, ik: PositionOnlyIK | N
         # Check the REAL finger geometry, not the tip point: the pads hang
         # ~3.6 cm below it, so a tip 3 cm up put them through the table and the
         # episode faulted on its first move.
-        if min(finger_lowest_z_model(ik.model, ik.data, arm)) > TABLE_TOP_Z + 0.015:
+        if min(finger_lowest_z_model(ik.model, ik.data, arm)) > TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
             return q
     return np.deg2rad(arm.tuck_deg)
 
@@ -2308,7 +2309,10 @@ def joint_path_clear(ik: PositionOnlyIK, q_a: np.ndarray, q_b: np.ndarray, steps
     for k in range(steps + 1):
         ik.set_q((1.0 - k / steps) * q_a + (k / steps) * q_b)
         tips = finger_tips_from_data(ik.model, ik.data, ik.arm)
-        if float(tips[:, 2].min()) < TABLE_TOP_Z + 0.035:
+        # Real pad geometry, not the tip points: the pads hang ~3.6 cm below
+        # them, so the old 3.5 cm tip margin approved paths whose pads were
+        # already through the table (seed 11, mid-turn).
+        if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
             return False
         if not obstacles_clear(ik, tips):
             return False
@@ -2554,14 +2558,17 @@ def execute_aim_and_approach(
         # turn alone would, hold the turn too (the arm pauses a tick).
         q_target = _polyline_at(ref, arc, s_try) + turn_off
         q_next = step_toward(q_target)
-        if clear(q_next) or AIM_STEREOTYPED:
-            # Stereotyped: no per-tick vetoes. Holding or yielding the approach
-            # inserts pauses that depend on fine geometry, so two near-identical
-            # scenes get visibly different motion. The turn path and the chain
-            # are each verified before execution; a blend that still clips the
-            # table aborts the episode below (and the episode is dropped).
+        if clear(q_next):
             s_arc = s_try
             stalled = 0
+        elif AIM_STEREOTYPED:
+            # The turn path and the chain are each verified, but their BLEND is
+            # not, and it can dip the pads into the table. Hold the approach for
+            # this tick and let the turn continue: a pause caused by the arm's
+            # own geometry is a deterministic function of the scene (unlike the
+            # yield/back-off this replaces, which searched and was erratic).
+            held += 1
+            q_next = step_toward(_polyline_at(ref, arc, s_arc) + turn_off)
         else:
             held += 1
             q_target = _polyline_at(ref, arc, s_arc) + turn_off
