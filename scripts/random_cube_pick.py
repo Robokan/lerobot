@@ -728,7 +728,7 @@ def grasp_tip_target(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -> 
 
 # Centring tolerances for the straddle test (cube defaults). A wider-open
 # gripper around a narrow bar can be judged more loosely — close+lift decides.
-_STRADDLE_TOL = {"xy": 0.025, "imbalance": 0.025}
+_STRADDLE_TOL = {"xy": 0.035, "imbalance": 0.035}
 
 
 def tips_straddle_cube(robot: MujocoBiOpenArm, arm: ArmSpec, cube: np.ndarray) -> tuple[bool, str]:
@@ -792,7 +792,7 @@ def _cmd_seed(robot: MujocoBiOpenArm, side: str) -> np.ndarray:
 # wrist->cube line (green) and the gripper's approach ray (red) of the same
 # length into the viewer. When the arm is aimed, the red ray lies on the green
 # line. None disables and clears the overlay.
-_AIM_OVERLAY: dict[str, np.ndarray | None] = {"cube": None, "goal": None}
+_AIM_OVERLAY: dict[str, np.ndarray | None] = {"cube": None, "goal_offset": None}
 _AIM_OVERLAY_ENABLED = False  # set by --debug; the overlay is a diagnostic
 
 
@@ -809,7 +809,11 @@ def _draw_aim_overlay(robot: MujocoBiOpenArm, ik: PositionOnlyIK) -> None:
         return
     wrist = robot._data.geom_xpos[ik.hand_gid].copy()
     approach = robot._data.xmat[ik.body].reshape(3, 3)[:, 2]
-    cube = _AIM_OVERLAY["goal"] if _AIM_OVERLAY["goal"] is not None else aim_point(cube)
+    # The aim point follows the LIVE cube: store the plan's reach-past offset,
+    # not a frozen target, or the line keeps pointing where the cube used to be
+    # while it is being pushed.
+    off = _AIM_OVERLAY["goal_offset"]
+    cube = aim_point(cube) + (off if off is not None else 0.0)
     length = float(np.linalg.norm(cube - wrist))
     rays = [
         (cube, np.array([0.1, 0.9, 0.2, 0.9])),                       # wrist -> cube
@@ -1269,7 +1273,10 @@ def jittered_tuck(arm: ArmSpec, rng: np.random.Generator, ik: PositionOnlyIK | N
             return q
         q = np.clip(q, ik.lo, ik.hi)
         ik.set_q(q)
-        if float(ik.tip_mid()[2]) > TABLE_TOP_Z + 0.03:
+        # Check the REAL finger geometry, not the tip point: the pads hang
+        # ~3.6 cm below it, so a tip 3 cm up put them through the table and the
+        # episode faulted on its first move.
+        if min(finger_lowest_z_model(ik.model, ik.data, arm)) > TABLE_TOP_Z + 0.015:
             return q
     return np.deg2rad(arm.tuck_deg)
 
@@ -2241,7 +2248,7 @@ def plan_aim_at_cube(
             goal_in = goal + dir_h * (CUBE_HALF if in_extra is None else in_extra)
             chain = plan_approach_chain(ik, q_standoff, goal_in)
             if chain is not None:
-                _AIM_OVERLAY["goal"] = goal_in.copy()
+                _AIM_OVERLAY["goal_offset"] = (goal_in - aim_point(cube)).copy()
                 _AIM_PLAN["cube"] = np.asarray(cube, dtype=float).copy()
                 _AIM_PLAN["in_offset"] = (goal_in - goal).copy()
                 return q_standoff, chain
@@ -2252,6 +2259,7 @@ def plan_aim_at_cube(
 # detected and the chain re-planned toward where the cube actually is.
 _AIM_PLAN: dict[str, np.ndarray | None] = {"cube": None, "in_offset": None}
 AIM_REPLAN_BUMP_M = 0.008
+AIM_REPLAN_TRACK_M = 0.004  # tighter while the cube is still moving
 
 
 # Physical arm sags ~1.5 cm below the commanded pose under PD tracking; keep
@@ -2430,10 +2438,17 @@ def execute_aim_and_approach(
         # Bumped cube: once the turn is done, re-plan the rest of the approach
         # from the current pose toward where the cube actually is now.
         planned = _AIM_PLAN["cube"]
+        moved = 0.0 if planned is None else float(np.linalg.norm(cube_now[:2] - planned[:2]))
+        sliding = _DISTURB.get("slide") is not None
+        just_stopped = _DISTURB.get("was_sliding", False) and not sliding
+        _DISTURB["was_sliding"] = sliding
         if (
             tau >= turn_total
             and planned is not None
-            and float(np.linalg.norm(cube_now[:2] - planned[:2])) > AIM_REPLAN_BUMP_M
+            # while the cube is being pushed, track it closely; re-plan once
+            # more the moment it stops so the final approach goes to where it
+            # actually came to rest
+            and (moved > (AIM_REPLAN_TRACK_M if sliding else AIM_REPLAN_BUMP_M) or just_stopped)
         ):
             goal_new = aim_point(cube_now) + _AIM_PLAN["in_offset"]
             new_chain = plan_approach_chain(ik, q_cmd, goal_new)
@@ -2455,11 +2470,51 @@ def execute_aim_and_approach(
                 turn_total = 0.0
                 tau = 0.0
                 _AIM_PLAN["cube"] = cube_now.copy()
-                _AIM_OVERLAY["goal"] = goal_new.copy()
+                _AIM_OVERLAY["goal_offset"] = (goal_new - aim_point(cube_now)).copy()
                 replans += 1
                 print(f"    cube moved {np.linalg.norm(cube_now[:2] - planned[:2]) * 100:.1f} cm — re-planned approach ({total * 100:.0f} cm to go)")
             else:
-                _AIM_PLAN["cube"] = cube_now.copy()  # unreachable now; keep going, don't spam
+                # The full chain planner wants a standoff geometry it no longer
+                # has mid-approach. Track the moved cube the cheap way instead:
+                # shift the remaining tip targets by the cube's displacement,
+                # re-solving each with the low-level axis IK.
+                shift = cube_now - planned
+                tail = []
+                ik.set_q(q_cmd)
+                tcp_off = ik.ee() - ik.tip_mid()
+                q_prev_wp = q_cmd
+                for q_wp in ref[1:]:
+                    ik.set_q(q_wp)
+                    tip_t = ik.tip_mid() + shift
+                    q_new, pe, ae = plan_aim_axis(
+                        ik, q_prev_wp, tip_t + tcp_off, aim_point(cube_now) - ik.hand(),
+                        rng=None, iters=150,
+                    )
+                    if q_new is None or pe > 0.015 or ae > 8.0:
+                        break
+                    ik.set_q(q_new)
+                    if not aim_pads_clear(ik):
+                        break  # a shifted waypoint that dips is no plan at all
+                    tail.append(q_new)
+                    q_prev_wp = q_new
+                if len(tail) == len(ref) - 1:
+                    q_aim = q_cmd.copy()
+                    ref = [q_aim] + tail
+                    tips = []
+                    for q in ref:
+                        ik.set_q(q)
+                        tips.append(ik.tip_mid().copy())
+                    arc = np.concatenate([[0.0], np.cumsum(
+                        [np.linalg.norm(tips[i + 1] - tips[i]) for i in range(len(ref) - 1)])])
+                    total = float(arc[-1])
+                    s_arc = min(s_arc, total)
+                    turn_path = [q_aim, q_aim]
+                    tcum = np.array([0.0, 0.0])
+                    turn_total = 0.0
+                    tau = 0.0
+                    replans += 1
+                _AIM_PLAN["cube"] = cube_now.copy()
+                _AIM_OVERLAY["goal_offset"] = _AIM_PLAN["in_offset"].copy()
             ik.set_q(q_cmd)
         aim_err = aim_error_deg(ik, cube_now)
         dist = float(np.linalg.norm(aim_point(cube_now) - ik.hand()))
@@ -2604,7 +2659,7 @@ def run_aim_trial(
         return _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s)
     finally:
         _AIM_OVERLAY["cube"] = None
-        _AIM_OVERLAY["goal"] = None
+        _AIM_OVERLAY["goal_offset"] = None
         _draw_aim_overlay(robot, ik)
 
 
@@ -2614,7 +2669,7 @@ def run_aim_trial(
 # policy ends up in when things go slightly wrong, and how to get back.
 RECOVERY_PROB = 0.30
 RECOVERY_MAX_ATTEMPTS = 3
-_DISTURB: dict = {"nudge_at": None, "dist": 0.0, "angle": 0.0, "done": False, "slide": None}
+_DISTURB: dict = {"nudge_at": None, "dist": 0.0, "angle": 0.0, "done": False, "slide": None, "was_sliding": False}
 
 
 def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
@@ -2624,7 +2679,7 @@ def _run_aim_trial(robot, ik, fps, cube, q_now, rng, hold_s) -> bool:
     # letting go after a lift is sometimes right, keyed on a random number it
     # cannot see.
     disturbance = "nudge" if rng.uniform() < RECOVERY_PROB else None
-    _DISTURB.update(nudge_at=None, done=False, slide=None)
+    _DISTURB.update(nudge_at=None, done=False, slide=None, was_sliding=False)
     if disturbance == "nudge":
         _DISTURB.update(
             nudge_at=float(rng.uniform(0.25, 0.7)),
