@@ -521,6 +521,11 @@ def main() -> None:
         help="Unix socket of a sim_cube_trt_server; model calls go to TRT engines.",
     )
     parser.add_argument(
+        "--tucked-prob", type=float, default=None,
+        help="how often each arm starts tucked (0 = never, 0.75 = current default). Checkpoints "
+             "trained before tucked starts existed see them as out-of-distribution.",
+    )
+    parser.add_argument(
         "--smooth-chunk",
         action="store_true",
         help="zero-phase 3-tap smoothing of each predicted chunk (arm joints only); "
@@ -534,6 +539,8 @@ def main() -> None:
              "on the TRT server). 16 markedly reduces chunk wiggle vs the default 4.",
     )
     args = parser.parse_args()
+    if args.tucked_prob is not None:
+        rcp.TUCKED_START_PROB = float(args.tucked_prob)
     if args.task is None:
         if args.task_mode == "color":
             import random_color_pick as rcol
