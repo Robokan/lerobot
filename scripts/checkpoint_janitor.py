@@ -7,7 +7,7 @@ already killed one run mid-flight). This watches a run's checkpoint directory
 and keeps:
 
   * every checkpoint at a multiple of --keep-every steps (default 5000),
-  * the --keep-recent most recent ones (default 5),
+  * the --keep-recent most recent ones (default 1: a rolling "latest"),
   * optimizer state ONLY on the newest checkpoint, so the run can still be
     resumed but old optimizer states do not each cost 12 GB.
 
@@ -60,7 +60,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("output_dir", help="a run's --output_dir (its checkpoints/ is watched)")
     ap.add_argument("--keep-every", type=int, default=5000)
-    ap.add_argument("--keep-recent", type=int, default=5)
+    ap.add_argument("--keep-recent", type=int, default=1,
+                help="how many of the newest checkpoints to keep besides the --keep-every ones. "
+                     "1 gives a rolling latest at save_freq granularity.")
     ap.add_argument("--interval", type=float, default=120.0, help="seconds between sweeps")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
