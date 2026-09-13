@@ -413,7 +413,7 @@ def retreat_to_tuck(robot, ik, fps: int, trial: Trial) -> bool:
     drift, a straight joint interpolation from above the pile to the tuck
     swept the forearm through the pile and neighbouring stacks."""
     q_now = rcp._cmd_seed(robot, ik.arm.side)
-    q_tuck = np.deg2rad(ik.arm.tuck_deg)
+    q_tuck = rcp.tuck_q(ik)
     obstacles = [(bar_pos(robot, i), BAR_OBSTACLE_RADIUS_M) for bars in trial.stack_bars for i in bars]
     rcp.set_aim_target(rcp.AIM_TIP_ABOVE_CUBE_M, TABLE_TOP_Z, obstacles=obstacles)
     ik.set_q(q_now)
@@ -636,7 +636,7 @@ def main() -> None:
                 rcp.setup_start_pose(robot, iks[first_side], rng, args.fps)
                 # both arms retreat to their tuck when idle (an arm may hand over mid-request)
                 for a in rcp.ARMS:
-                    rcp._RETREAT_TARGET[a.side] = np.deg2rad(a.tuck_deg)
+                    rcp._RETREAT_TARGET[a.side] = rcp.tuck_q(iks[a.side])
                 if recorder is not None:
                     recorder.task = trial.prompt
                     recorder.start()

@@ -523,7 +523,7 @@ _RETREAT_STEP_RAD = math.radians(2.5)
 # (the top spans x 0.055..0.555), so the tucked arm is off the table
 # altogether. The IK solves the arm configuration; hand-picked joint angles
 # kept the hand out over the table no matter how far the shoulder was pulled.
-TUCK_TIP_TARGET = {"right": np.array([0.02, -0.26, 0.50]), "left": np.array([0.02, 0.26, 0.50])}
+TUCK_TIP_TARGET = {"right": np.array([-0.02, -0.28, 0.46]), "left": np.array([-0.02, 0.28, 0.46])}
 _TUCK_Q_CACHE: dict[str, np.ndarray] = {}
 
 
@@ -550,7 +550,7 @@ def _park_action(side: str) -> dict[str, float]:
     the table edge, or the full park when the cube spawned too close)."""
     park = _RETREAT_TARGET.get(side)
     if park is None:
-        park = np.deg2rad(ARMS_BY_SIDE[side].tuck_deg)
+        park = _TUCK_Q_CACHE.get(side, np.deg2rad(ARMS_BY_SIDE[side].tuck_deg))
     cur = _LAST_CMD.get(side)
     if cur is None:
         cur = park.copy()
@@ -1325,14 +1325,11 @@ def setup_start_pose(
     _LAST_CMD[ik.arm.side] = q_active.copy()
     _LAST_CMD[other.side] = q_other.copy()
     _OTHER_GRIP[other.side] = g_other
-    if d_tuck < _TUCK_CLEARANCE_M:
-        _RETREAT_TARGET[other.side] = np.deg2rad(other.park_deg)
-        print(
-            f"  cube is {d_tuck * 100:.0f} cm from {other.side}'s half-tuck spot "
-            f"— {other.side} will retreat to full park instead"
-        )
-    else:
-        _RETREAT_TARGET[other.side] = np.deg2rad(other.tuck_deg)
+    # Always the same deep tuck the arm can start in. There used to be a
+    # fallback to the old half-park whenever the cube sat near the tuck spot,
+    # which fired on most layouts and left the idle arm sitting over the table;
+    # the tuck is now off the table entirely, so it can never conflict.
+    _RETREAT_TARGET[other.side] = tuck_q(other_ik)
     if tucked_start:
         print(f"  {other.side} starts TUCKED (jittered, grip {g_other * 1000:.0f} mm)")
     else:
