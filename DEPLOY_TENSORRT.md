@@ -137,8 +137,13 @@ checkpoint exported at 79; that one token is the whole reason this step exists.
 python scripts/deployment/build_trt_pipeline.py \
     --model-path ~/groot/color_1cam_native \
     --output-dir gr00t_trt_color_1cam \
+    --embodiment-tag new_embodiment \
     --steps build,verify
 ```
+
+`--embodiment-tag` is required here. The builder tries to auto-detect it, but
+the processor config carried by these checkpoints describes ten embodiments, so
+auto-detection refuses to guess.
 
 Seven engines are built — `vit_bf16`, `llm_bf16`, `vl_self_attention`,
 `state_encoder`, `action_encoder`, `dit_bf16`, `action_decoder` — about 6.5 GB
