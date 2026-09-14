@@ -16,6 +16,8 @@ CKPT="$SPARK/lerobot/outputs/groot_color_1cam/checkpoints/030000/pretrained_mode
 STAGE="$HOME/elements_payload/groot-color-1cam"
 DEST=""
 NAME="groot-color-1cam"
+REPO_ID="local/openarm_color_sort_chest_300"
+DATASET="${HF_LEROBOT_HOME:-$HOME/.cache/huggingface/lerobot}/$REPO_ID"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,6 +52,15 @@ if [ ! -f "$STAGE/color_sample_batch.pt" ]; then
         --dataset local/openarm_color_sort_chest_300 \
         --out "$STAGE/color_sample_batch.pt" >/dev/null )
     echo "   captured color_sample_batch.pt"
+fi
+
+# The eval reads this dataset's normalisation statistics at startup, so the far
+# end needs it. -L dereferences: the chest view is symlinks into the 3-camera
+# dataset and would otherwise arrive as dangling links.
+if [ ! -f "$STAGE/dataset/$REPO_ID/meta/info.json" ]; then
+    echo "   copying dataset $REPO_ID (1.1 GB)"
+    mkdir -p "$STAGE/dataset/$REPO_ID"
+    rsync -aL "$DATASET"/ "$STAGE/dataset/$REPO_ID"/
 fi
 
 # Git bundles are self-contained clones; no network or remote needed at the

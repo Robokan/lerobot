@@ -28,6 +28,7 @@ statistics baked into the native checkpoint are never consulted at inference.
 groot-color-1cam/
   README.md                 this file
   checkpoint/               the lerobot checkpoint (12.6 GB)
+  dataset/                  the training dataset (1.1 GB)
   native_template/          config/processor/statistics sidecars (3 MB)
   color_sample_batch.pt     one preprocessed batch, for the ONNX export
   code/*.bundle             git bundles of the three repos
@@ -64,10 +65,26 @@ pulls TensorRT. Do not use the `spark/` or `thor/` installers.
 ## 2. Copy the checkpoint off the drive
 
 ```bash
-mkdir -p ~/groot && cp -r /media/$USER/Elements/groot-color-1cam/checkpoint ~/groot/color_1cam
-cp -r /media/$USER/Elements/groot-color-1cam/native_template ~/groot/native_template
-cp /media/$USER/Elements/groot-color-1cam/color_sample_batch.pt ~/groot/
+DRIVE=/media/$USER/Elements/groot-color-1cam
+mkdir -p ~/groot && cp -r $DRIVE/checkpoint ~/groot/color_1cam
+cp -r $DRIVE/native_template ~/groot/native_template
+cp $DRIVE/color_sample_batch.pt ~/groot/
 ```
+
+The dataset has to land in lerobot's cache, where `LeRobotDatasetMetadata`
+looks for it by repo id:
+
+```bash
+mkdir -p ~/.cache/huggingface/lerobot/local
+cp -r $DRIVE/dataset/local/openarm_color_sort_chest_300 \
+      ~/.cache/huggingface/lerobot/local/
+```
+
+The eval loads this at startup for its normalisation statistics — without it
+you get a dataset-not-found error before the policy is even built. Only
+`meta/` is actually read for that (1.9 MB of the 1.1 GB); the rest is the
+episodes themselves, shipped so the machine can also replay demonstrations or
+fine-tune.
 
 ## 3. Convert the checkpoint to native GR00T format
 
