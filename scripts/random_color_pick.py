@@ -3,8 +3,8 @@
 
 Each trial:
   1. Colour the cube red or green (50/50). Red means the LEFT arm and the red
-     pad on the left side of the table; green means the RIGHT arm and the green
-     pad on the right. The colour is the only cue — cubes spawn across their
+     grey pad on the left; green means the RIGHT arm and the grey pad on the
+     right. Pads are neutral grey — the CUBE's colour is the only cue. The colour is the only cue — cubes spawn across their
      arm's whole reach, including the shared middle band, so a green cube can
      sit left of centre and still calls for the right arm (cross-body). That
      is what stops the policy from learning "side -> arm" and ignoring colour.
@@ -56,6 +56,34 @@ CARRY_TRANSIT_Z = TABLE_TOP_Z + 0.18
 PLACE_MAX_ATTEMPTS = 3
 
 
+def show_pads(robot, visible: bool = True) -> None:
+    """The pads are invisible in the scene by default: pad_left is exactly the
+    cube's red, so leaving them on made every 'pick up the red cube' task show
+    two red objects and wrecked policies that had never seen one."""
+    import mujoco
+
+    for name in ("pad_left", "pad_right"):
+        gid = mujoco.mj_name2id(robot._model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        robot._model.geom_rgba[gid][3] = 1.0 if visible else 0.0
+
+
+_COLOUR_BAG: list[str] = []
+
+
+def next_colour(rng: np.random.Generator) -> str:
+    """Draw red/green from a shuffled bag, so the two stay balanced.
+
+    A plain coin flip shares the random stream with placement retries and IK
+    seeding, so for a given seed it can land 9-1 — and the ratio changes
+    whenever any unrelated code path changes how many draws it makes. A bag
+    guarantees an even split whatever else consumes the stream.
+    """
+    if not _COLOUR_BAG:
+        _COLOUR_BAG.extend(["red", "green"])
+        rng.shuffle(_COLOUR_BAG)
+    return _COLOUR_BAG.pop()
+
+
 def set_cube_colour(robot, rgba) -> None:
     import mujoco
 
@@ -64,7 +92,8 @@ def set_cube_colour(robot, rgba) -> None:
     m.mat_rgba[mid] = rgba
 
 
-CROSS_BODY_PROB = 0.4  # how often to try the far side of the table
+CROSS_BODY_PROB = 0.4     # how often to try the far side of the table
+CROSS_BODY_REACH_M = 0.15  # how far across the centreline an arm can actually fetch
 
 
 def place_cube_for(robot, iks, rng: np.random.Generator, colour: str, max_tries: int = 40):
@@ -80,11 +109,14 @@ def place_cube_for(robot, iks, rng: np.random.Generator, colour: str, max_tries:
     _, side, _ = COLOURS[colour]
     ik = iks[side]
     own = (0.0, 0.32) if side == "left" else (-0.32, 0.0)
-    far = (-0.32, 0.0) if side == "left" else (0.0, 0.32)
+    # Only the strip just across the centreline is reachable cross-body — the
+    # far half as a whole is not, so sampling it uniformly wasted nearly every
+    # draw and cross-body picks ended up at 7-13% instead of the intended 40%.
+    far = (-CROSS_BODY_REACH_M, 0.0) if side == "left" else (0.0, CROSS_BODY_REACH_M)
     for attempt in range(max_tries):
         # early attempts honour the cross-body draw; later ones fall back to
         # the arm's own side so a trial is never lost to an unreachable draw
-        band = far if (rng.uniform() < CROSS_BODY_PROB and attempt < max_tries // 2) else own
+        band = far if (rng.uniform() < CROSS_BODY_PROB and attempt < 3 * max_tries // 4) else own
         x = float(rng.uniform(*rcp.CUBE_X_RANGE))
         y = float(rng.uniform(*band))
         if any(np.hypot(x - pad[0], y - pad[1]) < PAD_KEEPOUT for _, _, pad in COLOURS.values()):
@@ -205,6 +237,7 @@ def main() -> None:
     rcp._AIM_OVERLAY_ENABLED = bool(args.debug)
     robot = rcp.make_robot(args.model_path, args.fps, viewer=not args.no_viewer,
                            cameras=args.cameras if args.record else "none")
+    show_pads(robot)
     iks = {a.side: rcp.build_ik(robot, a) for a in rcp.ARMS}
     rcp.park_both_arms(robot, iks)
     rcp.settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.2)
@@ -259,7 +292,7 @@ def main() -> None:
                 hdr = (f"episodes saved {successes}/{target_eps} (trial cap {max_trials})"
                        if target_eps else f"{t}/{max_trials}")
                 print(f"\n=== Trial {t} — {hdr} ===")
-                colour = "red" if rng.uniform() < 0.5 else "green"
+                colour = next_colour(rng)
                 rgba, side, _ = COLOURS[colour]
                 set_cube_colour(robot, rgba)
                 cube0 = place_cube_for(robot, iks, rng, colour)

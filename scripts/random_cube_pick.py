@@ -517,13 +517,13 @@ def _arm_q_from_obs(obs: dict, side: str) -> np.ndarray:
 # pick happens (12 deg/s at 30 fps — deliberate, unhurried).
 # Retreat rate of the idle arm. 0.8 deg/tick (24 deg/s) was slow enough that
 # the working arm could catch up with it mid-tuck and collide.
-_RETREAT_STEP_RAD = math.radians(2.5)
+_RETREAT_STEP_RAD = math.radians(1.5)
 
 # Where the idle arm parks: a wrist target BEHIND the table's near edge
 # (the top spans x 0.055..0.555), so the tucked arm is off the table
 # altogether. The IK solves the arm configuration; hand-picked joint angles
 # kept the hand out over the table no matter how far the shoulder was pulled.
-TUCK_TIP_TARGET = {"right": np.array([-0.02, -0.28, 0.46]), "left": np.array([-0.02, 0.28, 0.46])}
+TUCK_TIP_TARGET = {"right": np.array([0.08, -0.28, 0.53]), "left": np.array([0.08, 0.28, 0.53])}
 _TUCK_Q_CACHE: dict[str, np.ndarray] = {}
 
 
@@ -1329,7 +1329,9 @@ def setup_start_pose(
     # fallback to the old half-park whenever the cube sat near the tuck spot,
     # which fired on most layouts and left the idle arm sitting over the table;
     # the tuck is now off the table entirely, so it can never conflict.
-    _RETREAT_TARGET[other.side] = tuck_q(other_ik)
+    _RETREAT_TARGET[other.side] = np.clip(
+        jittered_tuck(other, rng, other_ik), other_ik.lo, other_ik.hi
+    )
     if tucked_start:
         print(f"  {other.side} starts TUCKED (jittered, grip {g_other * 1000:.0f} mm)")
     else:
@@ -2088,6 +2090,9 @@ AIM_PITCH_RAD = math.radians(30.0)  # measured: 30 deg plans in every scene, 22-
 # the scene instead of trying a different one.
 AIM_STEREOTYPED = True
 AIM_MIN_SHOULDER_CLEAR_M = 0.14  # standoff never closer than this to the shoulder
+# A TRANSIT path only has to miss the table. AIM_PAD_CLEARANCE_M is for the
+# final approach, where the arm sags under load.
+AIM_TRANSIT_CLEAR_M = 0.012
 
 
 def aim_standoff_candidates(ik: PositionOnlyIK, cube: np.ndarray) -> list[np.ndarray]:
@@ -2297,7 +2302,7 @@ def joint_path_clear(ik: PositionOnlyIK, q_a: np.ndarray, q_b: np.ndarray, steps
         # Real pad geometry, not the tip points: the pads hang ~3.6 cm below
         # them, so the old 3.5 cm tip margin approved paths whose pads were
         # already through the table (seed 11, mid-turn).
-        if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_PAD_CLEARANCE_M:
+        if min(finger_lowest_z_model(ik.model, ik.data, ik.arm)) < TABLE_TOP_Z + AIM_TRANSIT_CLEAR_M:
             return False
         if not obstacles_clear(ik, tips):
             return False
@@ -2494,6 +2499,8 @@ def execute_aim_and_approach(
         dist = float(np.linalg.norm(aim_point(cube_now) - ik.hand()))
         t_now = k * dt
         v = approach_speed_mps(aim_err, dist) * speed_scale
+        if turn_total > 1e-6:
+            v *= min(1.0, tau / turn_total)
         turn_rate = math.radians(AIM_TURN_RATE_DEG_S) * turn_scale
         tau_prev = tau
         tau = min(turn_total, tau + turn_rate * dt)
@@ -2523,10 +2530,21 @@ def execute_aim_and_approach(
             ik.set_q(q)
             return aim_pads_clear(ik)
 
+        # Blend the two verified paths as a WEIGHTED MIX, not by adding the
+        # remaining turn as a joint offset onto a chain pose: with a large turn
+        # outstanding that sum is an arbitrary pose belonging to neither path
+        # (seed 7 ep 2 needs 93 deg and the arm stalled in front of the cube).
+        # A convex mix is the turn path while the turn is young and the chain
+        # once it is done, and always lies between the two.
+        def blend(arc_s: float, turn_tau: float) -> np.ndarray:
+            w = 1.0 if turn_total <= 1e-6 else min(1.0, turn_tau / turn_total)
+            q_turn = _polyline_at(turn_path, tcum, turn_tau)
+            return (1.0 - w) * q_turn + w * _polyline_at(ref, arc, arc_s)
+
         # Check the pose that will actually be COMMANDED. If advancing the
         # approach would dip the pads, hold the approach this tick; if even the
         # turn alone would, hold the turn too (the arm pauses a tick).
-        q_target = _polyline_at(ref, arc, s_try) + turn_off
+        q_target = blend(s_try, tau)
         q_next = step_toward(q_target)
         if clear(q_next):
             s_arc = s_try
@@ -2538,10 +2556,10 @@ def execute_aim_and_approach(
             # own geometry is a deterministic function of the scene (unlike the
             # yield/back-off this replaces, which searched and was erratic).
             held += 1
-            q_next = step_toward(_polyline_at(ref, arc, s_arc) + turn_off)
+            q_next = step_toward(blend(s_arc, tau))
         else:
             held += 1
-            q_target = _polyline_at(ref, arc, s_arc) + turn_off
+            q_target = blend(s_arc, tau)
             q_next = step_toward(q_target)
             if not clear(q_next):
                 stalled += 1
@@ -2551,19 +2569,21 @@ def execute_aim_and_approach(
                 # the turn has completed, then approach along the verified chain.
                 yielding = True
                 s_arc = max(0.0, s_arc - AIM_SPEED_MAX_MPS * dt)  # fixed rate: v is 0 while yielding
-                q_target = _polyline_at(ref, arc, s_arc) + turn_off
+                q_target = blend(s_arc, tau)
                 q_next = step_toward(q_target)
-                if not clear(q_next) and stalled < int(1.5 * fps):
-                    tau = tau_prev
-                    turn_off = _polyline_at(turn_path, tcum, tau) - q_aim
-                    q_target = _polyline_at(ref, arc, s_arc) + turn_off
-                    q_next = step_toward(q_target)
+                if not clear(q_next):
+                    # Hold position rather than command a pose no check has
+                    # approved. This used to "force the verified turn through"
+                    # after 1.5 s, which is precisely how the pads ended up in
+                    # the table. If nothing clears, abandon the scene: a
+                    # skipped trial costs nothing (failures are dropped), a
+                    # collision costs a wrecked episode.
+                    q_next = q_cmd
+                    if stalled > int(1.5 * fps):
+                        print("  aim+approach: no clear way in from here — skipping this scene")
+                        return False
                 if stalled == 1:
                     print("    clearance hold: yielding the approach until the turn completes")
-                elif stalled == int(1.5 * fps):
-                    # still stuck with the approach backed off: the verified turn
-                    # path itself is being vetoed by the transient blend — let it go
-                    print("    clearance hold: forcing the verified turn through")
         q_cmd = q_next
         _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
         if s_arc >= 0.85 * total and finger_table_graze(robot, arm, min_force_n=2.0):

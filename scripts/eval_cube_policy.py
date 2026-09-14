@@ -275,6 +275,7 @@ def run_color_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> d
     0.5 s. Same scene setup as the generator, policy drives."""
     import random_color_pick as rcol
 
+    rcol.show_pads(robot)
     colour = "red" if rng.uniform() < 0.5 else "green"
     rgba, side, pad_xy = rcol.COLOURS[colour]
     other_pad = rcol.COLOURS["green" if colour == "red" else "red"][2]
