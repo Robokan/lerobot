@@ -194,6 +194,32 @@ costs nothing. On the Spark's unified memory this does not come up.
 The eval needs the dataset locally, but only for its normalisation statistics, so
 any copy of `local/openarm_color_sort_chest_300` will do.
 
+## Measuring the speedup
+
+`bench_trt_server.py` times action-chunk inference on its own — no MuJoCo, no
+preprocessing — using the same captured batch in both modes, so the only
+variable is how the model runs.
+
+With the server up:
+
+```bash
+cd lerobot && source .venv/bin/activate
+python scripts/bench_trt_server.py --batch ~/groot/color_sample_batch.pt \
+    --socket /tmp/groot_trt.sock
+```
+
+For the eager baseline, stop the server first — each mode holds about 14 GB and
+they will not coexist on a 24 GB card — then run from the Isaac-GR00T venv:
+
+```bash
+python scripts/bench_trt_server.py --batch ~/groot/color_sample_batch.pt \
+    --eager ~/groot/color_1cam_native
+```
+
+It reports the mean chunk latency and what that costs in control steps of lag at
+30 Hz, which is the figure that decides whether chunks can be replaced faster
+than they are consumed.
+
 ### Knobs worth knowing
 
 - `GROOT_TRT_DENOISE_STEPS=16` on the **server** raises the flow-matching Euler
