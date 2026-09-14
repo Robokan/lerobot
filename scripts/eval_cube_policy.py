@@ -330,7 +330,8 @@ def run_color_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> d
     }
 
 
-def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str):
+def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str,
+                     device: str = "cuda"):
     """Construct lerobot's real RTC engine around our policy + processors."""
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
     from lerobot.rollout.inference.factory import RTCInferenceConfig, create_inference_engine
@@ -352,7 +353,7 @@ def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task:
         ordered_action_keys=list(robot.action_features.keys()),
         task=task,
         fps=float(fps),
-        device="cuda",
+        device=device,
     )
     engine.start()
     return engine
@@ -539,6 +540,13 @@ def main() -> None:
         help="override flow-matching Euler steps (eager path; use GROOT_TRT_DENOISE_STEPS "
              "on the TRT server). 16 markedly reduces chunk wiggle vs the default 4.",
     )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="where the eager policy lives. With --trt-socket the engines already hold "
+             "the weights and the eager model is never called, so 'cpu' keeps ~12 GB out "
+             "of VRAM — required to run the TRT server and this script on one 24 GB card.",
+    )
     args = parser.parse_args()
     if args.tucked_prob is not None:
         rcp.TUCKED_START_PROB = float(args.tucked_prob)
@@ -571,7 +579,7 @@ def main() -> None:
     if args.policy == "zeros":
         policy = ZerosPolicy(robot)
     else:
-        policy = CheckpointPolicy(args.policy, args.dataset, args.task)
+        policy = CheckpointPolicy(args.policy, args.dataset, args.task, device=args.device)
         policy.configure_for_robot(robot)
         if args.trt_socket:
             policy.connect_trt(args.trt_socket)
@@ -579,7 +587,8 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     engine = None
     if args.rtc:
-        engine = build_rtc_engine(policy, robot, args.fps, args.rtc_horizon, args.task)
+        engine = build_rtc_engine(policy, robot, args.fps, args.rtc_horizon, args.task,
+                                  device=args.device)
 
     results = []
     if not args.no_viewer:
