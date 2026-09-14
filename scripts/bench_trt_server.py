@@ -72,8 +72,23 @@ def bench_eager(batch: dict, model_path: str, iters: int, warmup: int) -> list[f
     from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
 
     print(f"loading native model from {model_path} ...", flush=True)
-    model = Gr00tN1d7.from_pretrained(model_path, torch_dtype=torch.bfloat16).to("cuda").eval()
-    gpu = {k: torch.from_numpy(np.ascontiguousarray(v)).to("cuda") for k, v in batch.items()}
+    # The checkpoint stores fp32 and `torch_dtype=` is ignored as deprecated on
+    # this transformers version, so the cast has to happen after loading or the
+    # model runs fp32 and FlashAttention refuses it. The TRT server gets away
+    # with the same from_pretrained call because its engines replace exactly
+    # those attention modules.
+    model = Gr00tN1d7.from_pretrained(model_path).to("cuda", dtype=torch.bfloat16).eval()
+    print(f"  weights: {next(model.parameters()).dtype}", flush=True)
+
+    # The batch is saved fp32 (lerobot's processor emits fp32 and the socket
+    # protocol upcasts anyway), but eager runs the bf16 weights directly and
+    # FlashAttention rejects fp32. lerobot's eager path gets this from its bf16
+    # autocast; here the cast has to be explicit. Integer inputs — token ids,
+    # masks, grid sizes — must stay as they are.
+    gpu = {}
+    for k, v in batch.items():
+        t = torch.from_numpy(np.ascontiguousarray(v)).to("cuda")
+        gpu[k] = t.to(torch.bfloat16) if t.is_floating_point() else t
 
     wall = []
     for i in range(iters + warmup):
