@@ -105,6 +105,7 @@ class CheckpointPolicy:
         self.robot_type: str | None = None
         self.obs_features: dict | None = None
         self._trt_sock = None
+        self.replan_every: int | None = None
 
     def connect_trt(self, socket_path: str) -> None:
         """Route the model call to a TRT inference server (lerobot pre/post
@@ -190,6 +191,14 @@ class CheckpointPolicy:
                 processed = self.post(actions)
             chunk = processed.squeeze(0).cpu().numpy()
             n = getattr(self.policy.config, "n_action_steps", chunk.shape[0])
+            # Executing a whole chunk means committing n/fps seconds of motion
+            # open-loop. Over the last centimetres of an approach that is long
+            # enough for a small initial error to survive to the grasp, and no
+            # camera is consulted in between. Keeping fewer rows re-plans against
+            # a fresh observation; the discarded tail costs nothing, since every
+            # chunk is decoded relative to the observation that produced it.
+            if self.replan_every:
+                n = min(n, self.replan_every)
             self._queue = [chunk[i] for i in range(min(n, chunk.shape[0]))]
         vals = self._queue.pop(0).reshape(-1)
         return {k: float(v) for k, v in zip(self.action_keys, vals, strict=True)}
@@ -627,6 +636,12 @@ def main() -> None:
              "on the TRT server). 16 markedly reduces chunk wiggle vs the default 4.",
     )
     parser.add_argument(
+        "--replan-every", type=int, default=0, metavar="N",
+        help="re-plan after N executed actions instead of the full chunk (16). "
+             "Shortens open-loop execution during the approach; costs one extra "
+             "inference per N steps.",
+    )
+    parser.add_argument(
         "--device",
         default="cuda",
         help="where the eager policy lives. With --trt-socket the engines already hold "
@@ -666,6 +681,10 @@ def main() -> None:
         policy = ZerosPolicy(robot)
     else:
         policy = CheckpointPolicy(args.policy, args.dataset, args.task, device=args.device)
+        if args.replan_every:
+            policy.replan_every = args.replan_every
+            print(f"  re-planning every {args.replan_every} actions "
+                  f"({args.replan_every / args.fps * 1000:.0f} ms of open-loop motion)")
         policy.configure_for_robot(robot)
         if args.trt_socket and not args.rtc:
             # Not under --rtc: the TRT server serves one client at a time, and
