@@ -733,7 +733,7 @@ def main() -> None:
             t += 1
             results.append(r)
             print(
-                f"trial {t + 1:>3}/{args.trials}: {'SUCCESS' if r['success'] else 'fail   '} "
+                f"trial {t:>3}/{args.trials}: {'SUCCESS' if r['success'] else 'fail   '} "
                 f"cube_y={r['cube_y']:+.2f} intended={r['intended_arm']:5s} "
                 f"committed={r['committed_arm']:5s} "
                 f"{'t=%.1fs' % r['t_success'] if r['t_success'] else 'cube_z=%.3f' % r['final_cube_z']}"
