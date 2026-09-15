@@ -359,6 +359,92 @@ def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task:
     return engine
 
 
+def run_color_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: float) -> dict:
+    """Colour-sorting task under async RTC.
+
+    Same scene, same success test and same result fields as run_color_trial —
+    the difference is that actions come from the background inference engine
+    instead of blocking the loop on a fresh chunk every n_action_steps ticks.
+    The command slewing matches run_rtc_trial, gripper columns included (they
+    must stay unslewed or the fingers close too late to catch the cube).
+    """
+    from lerobot.utils.feature_utils import build_dataset_frame
+
+    import random_color_pick as rcol
+
+    rcol.show_pads(robot)
+    colour = "red" if rng.uniform() < 0.5 else "green"
+    rgba, side, pad_xy = rcol.COLOURS[colour]
+    other_pad = rcol.COLOURS["green" if colour == "red" else "red"][2]
+    rcol.set_cube_colour(robot, rgba)
+    cube0 = rcol.place_cube_for(robot, iks, rng, colour)
+    rcp.setup_start_pose(robot, iks[side], rng, fps)
+    pol.reset()
+    engine.reset()
+    engine.resume()  # the RTC background thread starts paused
+
+    travel = {"left": 0.0, "right": 0.0}
+    prev_q = {s_: rcp._arm_q_real(robot, iks[s_]) for s_ in ("left", "right")}
+    success = False
+    t_success = None
+    reset = False
+    held_since = None
+    cmd = None  # slew-limited command state
+    slew = 2.5  # deg per tick — spreads chunk-seam jumps
+    grip_idx = np.array([i for i, k in enumerate(pol.action_keys) if "gripper" in k])
+    t_start = time.perf_counter()
+    t_end = t_start + time_limit_s
+    while time.perf_counter() < t_end:
+        t0 = time.perf_counter()
+        if reset_requested():
+            reset = True
+            break
+        obs = robot.get_observation()
+        engine.notify_observation(obs)
+        frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
+        a = engine.get_action(frame)
+        if a is not None:
+            target = a.detach().cpu().numpy().reshape(-1)
+            if cmd is None:
+                cmd = target.copy()
+            else:
+                cmd = cmd + np.clip(target - cmd, -slew, slew)
+                cmd[grip_idx] = target[grip_idx]
+        if cmd is not None:
+            # queue priming/gap: resending the last command keeps the sim stepping
+            robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
+        precise_sleep(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+        for s_ in ("left", "right"):
+            q = rcp._arm_q_real(robot, iks[s_])
+            travel[s_] += float(np.abs(q - prev_q[s_]).sum())
+            prev_q[s_] = q
+        ok, _ = rcol.on_pad(robot, pad_xy)
+        if ok:
+            held_since = held_since or time.perf_counter()
+            if time.perf_counter() - held_since > 0.5:
+                success = True
+                t_success = time.perf_counter() - t_start
+                break
+        else:
+            held_since = None
+        if float(rcp.cube_pos(robot)[2]) < 0.2:
+            break
+    committed = max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none"
+    wrong_pad, _ = rcol.on_pad(robot, other_pad)
+    return {
+        "reset": reset,
+        "success": success,
+        "lifted_demo": success,
+        "t_success": t_success,
+        "cube_y": float(cube0[1]),
+        "colour": colour,
+        "intended_arm": side,
+        "committed_arm": committed,
+        "wrong_pad": bool(wrong_pad),
+        "final_cube_z": float(rcp.cube_pos(robot)[2]),
+    }
+
+
 def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
     """One episode under async RTC: continuous 30 Hz control, background chunks."""
     import time as _time
@@ -557,8 +643,8 @@ def main() -> None:
             args.task = rcol.TASK
         else:
             args.task = "pick up the red cube and lift it"
-    if args.task_mode == "color" and (args.rtc or args.jit):
-        parser.error("--task-mode color is implemented for the synchronous path only")
+    if args.task_mode == "color" and args.jit:
+        parser.error("--task-mode color is implemented for the synchronous and --rtc paths only")
     if args.trt_socket:
         # The RTC engine calls policy.predict_action_chunk directly, which
         # routes to TRT via this env var — the connect_trt socket only covers
@@ -581,7 +667,14 @@ def main() -> None:
     else:
         policy = CheckpointPolicy(args.policy, args.dataset, args.task, device=args.device)
         policy.configure_for_robot(robot)
-        if args.trt_socket:
+        if args.trt_socket and not args.rtc:
+            # Not under --rtc: the TRT server serves one client at a time, and
+            # the RTC engine opens its own connection from the inference thread
+            # (GROOT_TRT_SOCKET, see below). Connecting here as well would get
+            # that idle socket accepted first, leaving the engine's connect()
+            # sitting unaccepted in the backlog — its first chunk then blocks
+            # forever on recv, no chunk ever lands, and the arm never moves.
+            # The sync act() and --jit paths do need this socket.
             policy.connect_trt(args.trt_socket)
 
     rng = np.random.default_rng(args.seed)
@@ -611,6 +704,8 @@ def main() -> None:
                           f"jit t={t_used:.1f}s cube_z={cz:.3f}")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
+            elif engine is not None and args.task_mode == "color":
+                r = run_color_rtc_trial(robot, iks, rng, engine, policy, args.fps, args.time_limit)
             elif engine is not None:
                 cube0, arm = rcp.place_reachable_cube(robot, iks, rng)
                 rcp.setup_start_pose(robot, iks[arm.side], rng, args.fps)
