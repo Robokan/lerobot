@@ -44,6 +44,22 @@ for f in config.json embodiment_id.json processor_config.json statistics.json; d
     cp "$TPL/$f" "$STAGE/native_template/$f"
 done
 
+# export_groot_native.py reads the template's safetensors HEADER (names, shapes,
+# dtypes) and never its weights, so ship a header-only file — 138 KB instead of
+# 13.8 GB. Without it the conversion fails at the far end, which is exactly what
+# happened the first time this payload went out. Built from the stock
+# nvidia/GR00T-N1.7-3B so the check references NVIDIA's architecture, not ours.
+if [ ! -f "$STAGE/native_template/model.safetensors" ]; then
+    BASE=$(echo "$HOME"/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/*/ | head -1)
+    if [ -d "$BASE" ]; then
+        ( cd "$SPARK/lerobot" && .venv/bin/python scripts/make_native_template_header.py \
+            --snapshot "$BASE" --output "$STAGE/native_template/model.safetensors" | tail -1 )
+    else
+        echo "   WARNING: no nvidia/GR00T-N1.7-3B snapshot cached; native_template has no" >&2
+        echo "            model.safetensors and export_groot_native.py will fail at the far end" >&2
+    fi
+fi
+
 # The preprocessed batch the ONNX export takes its static shapes from. Captured
 # from this checkpoint's own processor and task string — see README step 4.
 if [ ! -f "$STAGE/color_sample_batch.pt" ]; then

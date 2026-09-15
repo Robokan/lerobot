@@ -29,7 +29,7 @@ groot-color-1cam/
   README.md                 this file
   checkpoint/               the lerobot checkpoint (12.6 GB)
   dataset/                  the training dataset (1.1 GB)
-  native_template/          config/processor/statistics sidecars (3 MB)
+  native_template/          sidecars + a header-only safetensors (3 MB)
   color_sample_batch.pt     one preprocessed batch, for the ONNX export
   code/*.bundle             git bundles of the three repos
 ```
@@ -94,33 +94,33 @@ its policy class. The conversion is a tensor rename plus one alias, and the
 script verifies the architecture against the sidecar template before it writes
 anything.
 
-The template is only ever read for its safetensors *header* — tensor names and
-shapes — so the payload ships the sidecars and not the 13.8 GB of weights beside
-them. `export_groot_native.py` still wants that header, and the stock
-`nvidia/GR00T-N1.7-3B` is sharded rather than a single file, so build one first
-from whichever copy the machine already has:
+The template is only ever read for its safetensors *header* — tensor names,
+shapes and dtypes — never its weights, so `native_template/` on the drive ships
+a 138 KB header-only `model.safetensors` instead of the 13.8 GB of weights that
+would normally sit beside those sidecars. Nothing else is needed:
 
 ```bash
 cd lerobot && source .venv/bin/activate
-mkdir -p ~/groot/native_template_hdr
-cp ~/groot/native_template/*.json ~/groot/native_template_hdr/
-python scripts/make_native_template_header.py \
-    --snapshot ~/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/* \
-    --output ~/groot/native_template_hdr/model.safetensors
-```
-
-That prints `1031 tensors`, which is the architecture the checkpoint must match.
-Then convert, taking the sidecars from the same directory:
-
-```bash
 python scripts/export_groot_native.py \
     --checkpoint ~/groot/color_1cam \
-    --template ~/groot/native_template_hdr \
+    --template ~/groot/native_template \
     --output ~/groot/color_1cam_native
 ```
 
-Expect `architecture matches native_template_hdr: 1031 tensors` followed by a
-13.8 GB write. It needs ~16 GB of RAM and no GPU.
+Expect `architecture matches native_template: 1031 tensors` followed by a 13.8 GB
+write. It needs ~16 GB of RAM and no GPU.
+
+That header was generated from the stock `nvidia/GR00T-N1.7-3B` on the Spark, so
+the check compares against NVIDIA's released architecture rather than anything
+derived from this checkpoint. If you ever need to rebuild it — a different base
+model, or a payload without it — `make_native_template_header.py` merges the
+shard headers of any native checkpoint into one:
+
+```bash
+python scripts/make_native_template_header.py \
+    --snapshot ~/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/<hash> \
+    --output <dir>/model.safetensors
+```
 
 ## 4. Export ONNX with a real lerobot batch
 
