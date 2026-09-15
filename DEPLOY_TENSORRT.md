@@ -94,16 +94,33 @@ its policy class. The conversion is a tensor rename plus one alias, and the
 script verifies the architecture against the sidecar template before it writes
 anything.
 
+The template is only ever read for its safetensors *header* — tensor names and
+shapes — so the payload ships the sidecars and not the 13.8 GB of weights beside
+them. `export_groot_native.py` still wants that header, and the stock
+`nvidia/GR00T-N1.7-3B` is sharded rather than a single file, so build one first
+from whichever copy the machine already has:
+
 ```bash
 cd lerobot && source .venv/bin/activate
+mkdir -p ~/groot/native_template_hdr
+cp ~/groot/native_template/*.json ~/groot/native_template_hdr/
+python scripts/make_native_template_header.py \
+    --snapshot ~/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/* \
+    --output ~/groot/native_template_hdr/model.safetensors
+```
+
+That prints `1031 tensors`, which is the architecture the checkpoint must match.
+Then convert, taking the sidecars from the same directory:
+
+```bash
 python scripts/export_groot_native.py \
     --checkpoint ~/groot/color_1cam \
-    --template ~/groot/native_template \
+    --template ~/groot/native_template_hdr \
     --output ~/groot/color_1cam_native
 ```
 
-Expect `architecture matches native_template: 1031 tensors` followed by a 13.8 GB
-write. It needs ~16 GB of RAM and no GPU.
+Expect `architecture matches native_template_hdr: 1031 tensors` followed by a
+13.8 GB write. It needs ~16 GB of RAM and no GPU.
 
 ## 4. Export ONNX with a real lerobot batch
 
@@ -202,6 +219,13 @@ MUJOCO_GL=egl python scripts/eval_cube_policy.py --task-mode color \
     --trt-socket /tmp/groot_trt.sock --device cpu
 ```
 
+`MUJOCO_GL=egl` is only as good as the host's EGL setup. glvnd picks its driver
+from `/usr/share/glvnd/egl_vendor.d/`, and if the NVIDIA entry is missing there
+the camera renders fall back to Mesa's llvmpipe **on the CPU** — correct images,
+hundreds of times slower, which starves the 30 Hz control loop (see "the eval crawls"
+below). `MUJOCO_GL=glfw` with a `DISPLAY` set renders through NVIDIA GLX instead
+and sidesteps the question entirely.
+
 **`--device cpu` is not optional on a 24 GB card.** The eval normally loads its
 own eager copy of the model into VRAM, which together with the server's engines
 and native model will not fit. With `--trt-socket` the eager model is never
@@ -263,6 +287,29 @@ sample batch and redo steps 4 and 5.
 **The server dies and the eval hangs** — the server survives client resets but
 not its own exceptions. Check its terminal; the eval will sit waiting on a socket
 read that will never return.
+
+**The eval crawls — the sim runs many times slower than real time** — the camera
+is being rendered in software. The give-away is `libEGL warning: egl: failed to
+create dri2 screen` at startup and `llvmpipe` threads eating every core while the
+GPU sits near idle (`top -H -p <eval pid>`); inference is not involved, and the
+TRT server will still bench at its usual rate. Check the host's EGL vendor
+directory:
+
+```bash
+ls /usr/share/glvnd/egl_vendor.d/
+```
+
+Only `50_mesa.json` there, with `/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0`
+present, means the NVIDIA entry was never installed. Write it once:
+
+```bash
+printf '{\n    "file_format_version" : "1.0.0",\n    "ICD" : {\n        "library_path" : "libEGL_nvidia.so.0"\n    }\n}\n' | sudo tee /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+```
+
+Without root, point glvnd at your own copy for the run
+(`__EGL_VENDOR_LIBRARY_FILENAMES=$HOME/groot/10_nvidia.json MUJOCO_EGL_DEVICE_ID=0`)
+or just use `MUJOCO_GL=glfw`. A 480x640 render should take about 1 ms; ~600 ms
+is llvmpipe.
 
 **The arm reaches for a cube that isn't there, or freezes after a miss** — that
 is the policy, not the deployment. The training data contains no recovery
