@@ -697,6 +697,15 @@ def main() -> None:
             policy.connect_trt(args.trt_socket)
 
     rng = np.random.default_rng(args.seed)
+    # The scene seed above does not touch the policy: GR00T's flow-matching
+    # head draws its initial action noise from torch's global RNG
+    # (groot_n1_7.py, torch.randn in get_action), so two runs of the same
+    # checkpoint on the same 30 scenes disagreed by 24 points on one colour
+    # subgroup. Seed torch too, so --seed reproduces the whole run and an A/B
+    # between checkpoints differs only in the checkpoint.
+    import torch as _torch
+
+    _torch.manual_seed(args.seed)
     engine = None
     if args.rtc:
         engine = build_rtc_engine(policy, robot, args.fps, args.rtc_horizon, args.task,
