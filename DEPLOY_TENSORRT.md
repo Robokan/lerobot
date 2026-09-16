@@ -237,18 +237,45 @@ MUJOCO_GL=egl python scripts/eval_cube_policy.py --task-mode color \
 views; `--cameras chest` would feed it one and it would behave badly without
 erroring. Use 30 trials, not 10 — with n=10 the 95% interval is ±30 points.
 
-### The experiment this drive is for: shorter open-loop windows
+### The experiment this drive is for: RTC, fairly measured
 
-The policy executes a 16-step chunk — 0.53 s of motion — between inferences,
-with no camera consulted in between. Over the last centimetres of an approach
-that is long enough for a small error to survive to the grasp. `--replan-every N`
-keeps only the first N actions of each chunk and re-plans against a fresh
-observation; the discarded tail costs nothing because each chunk is decoded
-relative to the observation that produced it.
+Real robots will run asynchronous RTC — inference on a background thread,
+re-planning as fast as the GPU allows, the arm never waiting. The only RTC
+number we have for this task (0/3) was taken while a training job held the
+Spark's GPU at 94%: inference took 14 of every 16 control steps and the engine
+had almost nothing left to execute. It measures contention, not RTC.
 
-On the Spark this could not be tested fairly: three-camera eager inference is
-too slow for N=4 to keep real-time pace. On a 4090 under TensorRT it should be
-comfortably inside budget, so run the sweep here:
+The 4090 under TensorRT is the first hardware where three-camera RTC can be
+measured honestly, so run it here first, against the sync baseline of **65%**
+(19/30 and 20/30 on seed 100):
+
+```bash
+MUJOCO_GL=egl python scripts/eval_cube_policy.py --task-mode color --rtc \
+    --policy ~/groot/color_3cam --dataset local/openarm_color_sort_all_300 \
+    --cameras all --trials 30 --seed 100 --smooth-chunk \
+    --trt-socket /tmp/groot_trt.sock --device cpu
+```
+
+Things to know about that command:
+
+- **Run it with the GPU otherwise idle.** The RTC trial loop is wall-clock
+  bounded, so anything else on the GPU directly lowers the score. (The sync eval
+  is step-budgeted and does not care; RTC does.)
+- `--rtc-horizon` (default 8) is how many actions execute before the next chunk
+  is merged in. Smaller = fresher plans, more seams.
+- Watch the server's per-call `ms`. Inference time *is* the re-plan interval
+  under RTC: at ~85 ms that is a fresh plan every 2-3 control steps.
+- Seams are where RTC can lose grasps: each merged chunk is spliced into a
+  partially executed one, and a splice landing in the final centimetres is a
+  discontinuity at the worst moment. `GROOT_NATIVE_RTC_PREFIX=1` on the eval
+  turns on prefix inpainting to smooth them; it hurt an undertrained checkpoint
+  and has not been tried on a good one — worth a second 30-trial run.
+
+### If RTC comes out *below* sync: the replan-every diagnostic
+
+RTC changes two things at once — a shorter open-loop window and chunk seams.
+`--replan-every N` (sync path) shortens the window with **no seams**, so it
+separates the two:
 
 ```bash
 for N in 16 8 4; do
@@ -259,12 +286,11 @@ for N in 16 8 4; do
 done
 ```
 
-Same seed each time, and torch is seeded from `--seed` too, so the three runs
-see identical scenes with identical policy noise: any difference is the
-replanning. Budget at 30 Hz is 533 / 267 / 133 ms per inference for N = 16 / 8 / 4.
-Watch the server's reported `ms` — if inference exceeds the budget the sync eval
-still produces a valid result (it is step-budgeted, not wall-clock), but a real
-arm would stall, so note which N is actually affordable on this GPU.
+Torch is seeded from `--seed` too, so these see identical scenes with identical
+policy noise and any difference is the replanning. If N=4 beats N=16 but RTC did
+not beat sync, the seams are the problem and inpainting is the lever. If N=4 does
+not help either, fresher feedback is not what this checkpoint is missing, and the
+answer is more training or better data rather than inference-time changes.
 
 `MUJOCO_GL=egl` is only as good as the host's EGL setup. glvnd picks its driver
 from `/usr/share/glvnd/egl_vendor.d/`, and if the NVIDIA entry is missing there
