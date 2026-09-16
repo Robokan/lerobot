@@ -390,6 +390,10 @@ def run_color_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: fl
     rcp.setup_start_pose(robot, iks[side], rng, fps)
     pol.reset()
     engine.reset()
+    # Publish the post-teleport observation BEFORE waking the thread so its
+    # first chunk is anchored to this trial's start pose, not to whatever it
+    # last saw (engine.reset() also drops the stale one; this just saves a tick).
+    engine.notify_observation(robot.get_observation())
     engine.resume()  # the RTC background thread starts paused
 
     travel = {"left": 0.0, "right": 0.0}
@@ -464,6 +468,7 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
     import numpy as _np
 
     engine.reset()
+    engine.notify_observation(robot.get_observation())  # anchor chunk 1 to THIS start pose
     engine.resume()  # the RTC background thread starts paused
     t_end = _time.perf_counter() + time_limit_s
     held_since = None

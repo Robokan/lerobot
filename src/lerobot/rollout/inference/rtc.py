@@ -250,6 +250,15 @@ class RTCInferenceEngine(InferenceEngine):
         self._postprocessor.reset()
         if self._action_queue is not None:
             self._action_queue.clear()
+        # Drop the last published observation too. The inference thread wakes on
+        # resume() and immediately plans from whatever it holds; without this,
+        # the first chunk of every episode after the first is anchored to the
+        # previous episode's final state — for a relative-action policy that
+        # decodes to targets near where the arm *was*, and the robot lunges
+        # toward its old pose at trial start. Forcing obs=None makes the thread
+        # wait for the caller's first notify_observation() of the new episode.
+        with self._obs_lock:
+            self._obs_holder.pop("obs", None)
 
     # ------------------------------------------------------------------
     # Action production (called from main thread)
