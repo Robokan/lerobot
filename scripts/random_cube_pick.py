@@ -2362,6 +2362,21 @@ def _polyline_at(points: list[np.ndarray], cum: np.ndarray, x: float) -> np.ndar
     return (1.0 - f) * points[i] + f * points[i + 1]
 
 
+# Gripper command during the approach. Default: fully open the whole way in,
+# then close_on_cube() does everything after the arm has arrived. A generator
+# may install a function of approach progress (0..1) returning the opening in
+# metres, so the fingers start closing over the last stretch and the squeeze
+# lands as the arm arrives (the caddy picker does this: it is much quicker and
+# it is how a person picks). The settle before the close is shortened likewise.
+_APPROACH_GRIP_FN: dict = {"fn": None}
+_APPROACH_SETTLE_S: dict = {"s": 0.5}
+
+
+def _approach_grip(progress: float) -> float:
+    fn = _APPROACH_GRIP_FN["fn"]
+    return FINGER_OPEN_M if fn is None else float(np.clip(fn(float(np.clip(progress, 0.0, 1.0))), 0.0, FINGER_OPEN_M))
+
+
 def execute_aim_and_approach(
     robot: MujocoBiOpenArm,
     ik: PositionOnlyIK,
@@ -2585,7 +2600,7 @@ def execute_aim_and_approach(
                 if stalled == 1:
                     print("    clearance hold: yielding the approach until the turn completes")
         q_cmd = q_next
-        _command_q(robot, ik, q_cmd, FINGER_OPEN_M, fps)
+        _command_q(robot, ik, q_cmd, _approach_grip(s_arc / max(total, 1e-9)), fps)
         if s_arc >= 0.85 * total and finger_table_graze(robot, arm, min_force_n=2.0):
             # Pads already brushing the table on the last stretch: the target
             # is as low as it gets (thin bars). Stop here before the servo
@@ -2626,7 +2641,7 @@ def execute_aim_and_approach(
         print(f"  aim+approach: held the approach {held} ticks for pad clearance while turning")
     if replans:
         print(f"  aim+approach: re-planned {replans}x for a bumped cube")
-    play_joint_path(robot, ik, q_cmd, q_cmd, FINGER_OPEN_M, fps, 0.5, "settle")  # physical arm trails
+    play_joint_path(robot, ik, q_cmd, q_cmd, _approach_grip(1.0), fps, _APPROACH_SETTLE_S["s"], "settle")  # physical arm trails
     ok, msg = tips_straddle_cube(robot, arm, cube_pos(robot))
     if ok:
         print(f"  fingers around the cube ({msg})")

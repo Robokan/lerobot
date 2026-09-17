@@ -591,8 +591,7 @@ def main() -> None:
     parser.add_argument("--dataset", default="local/openarm_sim_cube_chest_100",
                         help="training dataset (for normalization stats)")
     parser.add_argument("--arm-gain-scale", type=float, default=1.0,
-                        help="servo stiffness multiplier; match the generator that recorded the dataset "
-                             "(random_caddy_pick uses 3.0, the cube/colour generators 1.0)")
+                        help="servo stiffness multiplier; match the generator that recorded the dataset (all use 1.0)")
     parser.add_argument("--cameras", choices=["chest", "all"], default="chest",
                         help="must match what the policy was trained on")
     parser.add_argument("--trials", type=int, default=30)

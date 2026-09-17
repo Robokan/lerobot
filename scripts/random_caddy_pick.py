@@ -8,15 +8,23 @@ Each trial:
      so a colour says nothing about position and position nothing about colour:
      the policy has to find the pad the prompt names.
   2. The prompt names one pad: "get bar from blue pad".
+     Three quarters of episodes start with the arms exactly where the previous
+     episode ended (as they would in deployment); the rest from the cube
+     picker's random start poses.
   3. The arm is the one on the pad's side of the table — left arm for pads left
      of the robot, right arm for pads right of it. N is even by default so no
      pad sits on the centreline where that rule is ambiguous. (An odd N puts a
      slot there; it always goes to the LEFT arm.)
   4. The top bar of that stack is picked with the natural-motion machinery of
-     the cube picker (aim, close in along the aim line, squeeze, lift; retries
-     after a miss) and set down on the table directly in front of its pad,
-     toward the robot.
-  5. Success: exactly that bar rests in front of its pad and no other bar moved.
+     the cube picker (aim, close in along the aim line, squeeze; retries after
+     a miss); the fingers start closing over the last third of the approach so
+     the squeeze lands as the arm arrives. Then straight up to a transit height
+     that clears a pile in the middle, level across to the centre of the table
+     in front of the robot, straight down, and drop.
+     A pile of 0-4 bars already sits on the centre spot when the episode starts
+     (the robot has usually fetched some before); the new bar goes on top.
+  5. Success: exactly that bar rests on the pile (or the spot) and no other
+     bar moved.
 
 Recording (--record) stores each successful trial as one episode whose task
 string is the prompt.
@@ -45,21 +53,39 @@ import random_cube_pick as rcp  # noqa: E402  (shared grasp machinery)
 # The bar: a square slab of chocolate, all bars identical and brown.
 BAR_HALF = np.array([0.025, 0.025, 0.0125])  # 50 x 50 x 25 mm
 BAR_RGBA = (0.36, 0.22, 0.10, 1.0)
-BAR_LEVEL_SHRINK = 0.04  # each bar up a stack is 4% smaller in footprint than the one below (see Trial)
+# A bar rests on the bar below through four tiny feet under its box (see
+# scene.xml: bar boxes never collide with each other, which is what made
+# MuJoCo's box-box collider overflow), so stacked bars sit 1 mm apart.
+BAR_FOOT_M = 0.001
+BAR_PITCH_M = 2 * BAR_HALF[2] + BAR_FOOT_M  # centre-to-centre height in a stack
 
 # Grasp geometry for the aim machinery (same planner/executor as the cube
 # picker; only the target description changes). The finger plates are ~7.2 cm
 # tall centred on the "tip" point, so with the tips this far above the bar's
-# centre the plate bottoms sit ~13 mm above whatever the bar rests on (the
-# table, or the bar below it) and hold the bar's top ~12 mm. The arm sags
-# under load; measured 2.5 cm at full reach with the cube picker's servo gains,
-# which put the plates onto the bar BELOW the target (one-sided pinch, no
-# lift). A 2.5 cm bar has no room for that, so this scene runs the position
-# servos 3x stiffer (~0.5 cm sag; see make_robot). The eval must use the same
-# --arm-gain-scale.
-BAR_TIP_ABOVE_M = 0.038
-BAR_PAD_CLEARANCE_M = 0.004
-ARM_GAIN_SCALE = 3.0
+# centre the plate bottoms sit ~2-3 mm above whatever the bar rests on (the
+# table, or the bar below it) and hold nearly the bar's full height. (3.8 cm
+# was tried: the plates covered only the top 6 mm and closed past the bar;
+# 3.0 cm gripped, but visibly high on the bar.)
+#
+# That is where the tips must PHYSICALLY end up. The arm sags under the cube
+# picker's servo gains — at the grasp, measured against the plan: ~1.6 cm at
+# the end slots (39 cm from the shoulder), ~2.2 cm at the middle slots (47 cm) —
+# and a 2.5 cm bar has no room for that (the plates landed on the bar below
+# the target: one-sided pinch, no lift). So the plan aims the tips higher by
+# the expected sag for the reach FROM THE SHOULDER (base-relative reach put
+# the end slots 6 mm too high: they are far from the base but near the arm).
+# Stiffer servos were tried instead (3x) and cured the sag but made the carry
+# visibly shaky: the arm snapped to each 30 Hz command step (frame-to-frame
+# speed jitter 7.6 vs 3.0 cm/s). The gains stay at the cube picker's.
+BAR_TIP_ABOVE_M = 0.025
+BAR_PAD_CLEARANCE_M = 0.002
+ARM_GAIN_SCALE = 1.0
+
+
+def sag_estimate_m(shoulder_reach_m: float) -> float:
+    """Expected droop of the fingertips below the planned height when the
+    target is this far (xy) from the arm's shoulder."""
+    return float(np.clip(0.016 + 0.07 * (shoulder_reach_m - 0.39), 0.010, 0.030))
 
 MAX_STACKS = 9
 MAX_PER_STACK = 3
@@ -74,15 +100,46 @@ ARC_SPAN_DEG = 46.0
 ARC_RADIUS_JITTER = 0.015
 ARC_ANGLE_JITTER_DEG = 1.5
 
-# Where the bar goes: straight in front of its pad, toward the robot. Pad half
-# 4.5 cm + bar half 2.5 cm + a 3 cm gap.
-PLACE_IN_FRONT_M = 0.10
-PLACE_TOL = 0.05  # bar counts as delivered within this radius of the spot
+# Where the bar goes: the centre of the table, straight in front of the robot.
+# Fixed (nothing in the image marks it, so it must not vary).
+DROP_XY = np.array([0.31, 0.0])
+# Release with the bar's underside this far above whatever is at the spot. The
+# arm sags ~1 cm more as it lowers, so this lands nearer 2 cm; and the descent
+# stops early the moment the bar touches down (set onto a pile while still
+# gripped, it shoved the top bars off).
+DROP_HEIGHT_M = 0.03
+TOUCHDOWN_M = 0.004
+PLACE_TOL = 0.06  # bar counts as delivered within this radius of the spot
+# Bars already collected sit in a pile on the spot when an episode starts (the
+# robot has usually fetched some before this one), 0..PILE_MAX of them.
+PILE_MAX = 4
+PILE_XY_JITTER = 0.004
+PILE_YAW_JITTER = 0.15
+
+# Where an idle arm rests: hand well out over the table, level with the drop
+# spot and 20 cm to its side, not the cube picker's deep park behind the table
+# edge — the next pick then starts close to where it has to go. Pads are far
+# out on the arc and the drop spot is on the centreline, so nothing conflicts.
+TUCK_TIP_TARGET = {"right": np.array([0.30, -0.20, 0.50]), "left": np.array([0.30, 0.20, 0.50])}
+
+# Fingers start closing over the last stretch of the approach, from fully open
+# (44 mm) to just wider than the bar, so the squeeze lands as the arm arrives.
+# 32 mm is ~7.6 cm between the pads for a 5 cm bar.
+PRECLOSE_FROM = 0.65     # approach progress at which the fingers start closing
+PRECLOSE_M = 0.032
+APPROACH_SETTLE_S = 0.2
+
+
+def approach_grip(progress: float) -> float:
+    if progress <= PRECLOSE_FROM:
+        return rcp.FINGER_OPEN_M
+    u = (progress - PRECLOSE_FROM) / (1.0 - PRECLOSE_FROM)
+    return rcp.FINGER_OPEN_M + (PRECLOSE_M - rcp.FINGER_OPEN_M) * u
 
 PAD_HALF_XY = 0.045
 PAD_Z = TABLE_TOP_Z + 0.0015  # 3 mm slab, visual only
 PAD_PARK = (-0.9, 0.0, -0.5)  # unused pads hide under the floor
-WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.0125) for i in range(MAX_BARS)]
+WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.0135) for i in range(MAX_BARS)]
 
 # Nine well-separated colours (four used by default). Table is brown, bars are
 # brown: none of these is anywhere near either.
@@ -151,7 +208,13 @@ def hide_legacy_pads(robot) -> None:
 
 
 def bar_centre_z(level: int) -> float:
-    return TABLE_TOP_Z + BAR_HALF[2] * (2 * level + 1)
+    """Resting height of a bar's centre at ``level`` of a stack (0 = on the table)."""
+    return TABLE_TOP_Z + BAR_FOOT_M + BAR_HALF[2] + BAR_PITCH_M * level
+
+
+def stack_top_z(n_bars: int) -> float:
+    """Top surface of a stack of ``n_bars`` (the table itself for 0)."""
+    return TABLE_TOP_Z + BAR_PITCH_M * n_bars
 
 
 # --- one trial ---------------------------------------------------------------
@@ -166,6 +229,7 @@ class Trial:
         self.robot = robot
         self.n = n_stacks
         self.sizes = [int(rng.integers(1, MAX_PER_STACK + 1)) for _ in range(self.n)]
+        self.pile_n = min(int(rng.integers(0, PILE_MAX + 1)), MAX_BARS - sum(self.sizes))
 
         # slots on the arc, left (+y) to right (-y), with a little jitter
         angles = np.deg2rad(np.linspace(ARC_SPAN_DEG, -ARC_SPAN_DEG, self.n))
@@ -194,20 +258,14 @@ class Trial:
         for i in range(MAX_BARS):
             set_bar_pose(robot, i, *WAREHOUSE[i])
             gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"bar_{i}")
-            m.geom_size[gid] = BAR_HALF
+            # real bars are never quite identical: +-1%
+            m.geom_size[gid] = BAR_HALF * (1.0 + rng.uniform(-0.01, 0.01, size=3))
             m.geom_rgba[gid] = BAR_RGBA
         self.stack_bars: list[list[int]] = []
         bar_i = 0
         for s_idx, (x, y) in enumerate(self.stack_xy):
             bars = []
             for level in range(self.sizes[s_idx]):
-                # Two near-identical square boxes face-to-face overflow MuJoCo's
-                # box-box contact buffer (9 contacts, fatal): each bar up a stack
-                # is a few percent smaller in footprint than the one below, so the
-                # contact patch is always the upper bar's four corners.
-                gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"bar_{bar_i}")
-                shrink = 1.0 - BAR_LEVEL_SHRINK * level + float(rng.uniform(-0.005, 0.005))
-                m.geom_size[gid] = BAR_HALF * np.array([shrink, shrink, 1.0 + float(rng.uniform(-0.01, 0.01))])
                 jx, jy = rng.uniform(-0.0015, 0.0015, size=2)
                 jyaw = float(rng.uniform(-0.05, 0.05))
                 set_bar_pose(robot, bar_i, x + jx, y + jy, bar_centre_z(level),
@@ -215,6 +273,14 @@ class Trial:
                 bars.append(bar_i)
                 bar_i += 1
             self.stack_bars.append(bars)
+        # the pile of bars already fetched, on the drop spot
+        self.pile_bars: list[int] = []
+        for level in range(self.pile_n):
+            jx, jy = rng.uniform(-PILE_XY_JITTER, PILE_XY_JITTER, size=2)
+            set_bar_pose(robot, bar_i, DROP_XY[0] + jx, DROP_XY[1] + jy, bar_centre_z(level),
+                         yaw=float(rng.uniform(-PILE_YAW_JITTER, PILE_YAW_JITTER)))
+            self.pile_bars.append(bar_i)
+            bar_i += 1
         rcp.zero_sim_velocity(robot)
         mujoco.mj_forward(robot._model, robot._data)
         self.initial_pos = {i: bar_pos(robot, i) for i in range(MAX_BARS)}
@@ -228,9 +294,7 @@ class Trial:
         self.target = int(rng.integers(0, self.n))
         self.colour = self.colours[self.target][0]
         self.prompt = make_prompt(self.colour)
-        th = self.stack_yaw[self.target]
-        x, y = self.stack_xy[self.target]
-        self.place_xy = np.array([x - PLACE_IN_FRONT_M * math.cos(th), y - PLACE_IN_FRONT_M * math.sin(th)])
+        self.place_xy = DROP_XY.copy()
         self.side = self.arm_for(self.target)
         self.fail_stage: str | None = None
         self.moved: int | None = None
@@ -258,30 +322,32 @@ class Trial:
 
     def level_of(self, bar: int) -> int:
         """Which level the bar currently rests at (0 = table), from its live height."""
-        return int(round((float(bar_pos(self.robot, bar)[2]) - TABLE_TOP_Z - BAR_HALF[2]) / (2 * BAR_HALF[2])))
+        return int(round((float(bar_pos(self.robot, bar)[2]) - bar_centre_z(0)) / BAR_PITCH_M))
+
+    def arranged_bars(self) -> list[int]:
+        return [i for bars in self.stack_bars for i in bars] + self.pile_bars
 
     def describe(self) -> str:
         cols = " ".join(f"{c[0]}:{s}" for c, s in zip(self.colours, self.sizes, strict=True))
         return (f"\"{self.prompt}\"  slot {self.target + 1}/{self.n} y={self.stack_xy[self.target][1]:+.2f} "
-                f"-> {self.side} arm   [{cols}]")
+                f"-> {self.side} arm   [{cols}]  pile:{self.pile_n}")
 
 
 BAR_OBSTACLE_RADIUS_M = 0.055  # keep fingertips this far from other bars' centres
 
 
-def aim_target_for_bar(robot, trial: Trial, bar: int) -> None:
+def aim_target_for_bar(robot, ik, trial: Trial, bar: int) -> None:
     """Point the aim machinery at ``bar`` where it is NOW: tip offset, the
     surface under it, approach along the slot's radial, every other bar an
     obstacle. Re-evaluated before each attempt, so a retry after a bar tumbled
     off its stack plans for where it landed."""
     level = max(0, trial.level_of(bar))
-    support_z = TABLE_TOP_Z + 2 * BAR_HALF[2] * level
-    obstacles = [
-        (bar_pos(robot, i), BAR_OBSTACLE_RADIUS_M)
-        for bars in trial.stack_bars for i in bars if i != bar
-    ]
+    support_z = stack_top_z(level)
+    obstacles = [(bar_pos(robot, i), BAR_OBSTACLE_RADIUS_M) for i in trial.arranged_bars() if i != bar]
+    bp = bar_pos(robot, bar)
+    sag = sag_estimate_m(float(np.linalg.norm(bp[:2] - rcp.shoulder_pos(ik)[:2])))
     rcp.set_aim_target(
-        BAR_TIP_ABOVE_M, support_z, BAR_PAD_CLEARANCE_M,
+        BAR_TIP_ABOVE_M + sag, support_z, BAR_PAD_CLEARANCE_M,
         xy=bar_pos(robot, bar)[:2], azimuth=trial.stack_yaw[trial.target], obstacles=obstacles,
         # in_extra None: half a cube (= half a bar) so the pads centre on it.
         # squeeze None: the cube's squeeze; the bar is the cube's width.
@@ -291,7 +357,7 @@ def aim_target_for_bar(robot, trial: Trial, bar: int) -> None:
 def grasp_plannable(robot, ik, trial: Trial, rng: np.random.Generator) -> bool:
     """Can the natural-motion planner reach the target's top bar from idle?"""
     bar = trial.top_bar()
-    aim_target_for_bar(robot, trial, bar)
+    aim_target_for_bar(robot, ik, trial, bar)
     q_idle = np.deg2rad(ik.arm.idle_deg)
     planned = rcp.plan_aim_at_cube(ik, q_idle, bar_pos(robot, bar), rng)
     if planned is None:
@@ -302,15 +368,14 @@ def grasp_plannable(robot, ik, trial: Trial, rng: np.random.Generator) -> bool:
 def others_disturbed(robot, trial: Trial, exclude: set[int]) -> list[str]:
     """Bars (outside ``exclude``) that strayed from their arranged pose."""
     bad = []
-    for bars in trial.stack_bars:
-        for i in bars:
-            if i in exclude:
-                continue
-            p0, p1 = trial.initial_pos[i], bar_pos(robot, i)
-            dxy = float(np.linalg.norm(p1[:2] - p0[:2]))
-            dz = abs(float(p1[2] - p0[2]))
-            if dxy > 0.02 or dz > 0.006:
-                bad.append(f"bar_{i} moved {dxy * 100:.1f}cm xy / {dz * 1000:.0f}mm z")
+    for i in trial.arranged_bars():
+        if i in exclude:
+            continue
+        p0, p1 = trial.initial_pos[i], bar_pos(robot, i)
+        dxy = float(np.linalg.norm(p1[:2] - p0[:2]))
+        dz = abs(float(p1[2] - p0[2]))
+        if dxy > 0.02 or dz > 0.006:
+            bad.append(f"bar_{i} moved {dxy * 100:.1f}cm xy / {dz * 1000:.0f}mm z")
     return bad
 
 
@@ -326,7 +391,7 @@ def pick_bar(robot, ik, fps: int, trial: Trial, bar: int, rng: np.random.Generat
             rcp.set_gripper(robot, ik, rcp.FINGER_OPEN_M, fps, hold_s=0.6)
         if others_disturbed(robot, trial, {bar}):
             return False  # knocked something: nothing to recover into
-        aim_target_for_bar(robot, trial, bar)
+        aim_target_for_bar(robot, ik, trial, bar)
         bp = bar_pos(robot, bar)
         rcp._AIM_OVERLAY["cube"] = bp.copy()
         q_now = rcp._cmd_seed(robot, ik.arm.side)
@@ -348,81 +413,142 @@ def pick_bar(robot, ik, fps: int, trial: Trial, bar: int, rng: np.random.Generat
                 return False  # a hard table strike is not something to demonstrate
             trial.fail_stage = "approach"
             continue
-        if not rcp.grasp_and_lift(robot, ik, fps, rng, hold_s=0.0):  # straight into the carry
+        ik.set_q(rcp._cmd_seed(robot, ik.arm.side))
+        print(f"  close {ik.arm.side}…")
+        hold = rcp.close_on_cube(robot, ik, fps)
+        if hold < 0.0:
             trial.fail_stage = "grasp"
             continue
+        rcp._AIM_LAST_HOLD["m"] = hold
+        outcome = carry_and_place(robot, ik, fps, trial.place_xy, hold, bar, stack_top_z(trial.pile_n))
+        if outcome == "lost":
+            trial.fail_stage = "grasp"  # slipped as it came off the stack: re-aim where it lies
+            continue
+        if outcome != "ok":
+            trial.fail_stage = "carry"
+            return False
         trial.fail_stage = None
         return True
     print("  fail: out of attempts")
     return False
 
 
-def carry_and_place(robot, ik, fps: int, target_xy: np.ndarray, grip_m: float, bar: int) -> bool:
-    """Carry the held bar to the spot in front of its pad and set it down on the
-    table: rise, translate at transit height, lower with the gripper's
-    orientation held, release, retreat. The bar hangs wherever the pads caught
-    it, so the tips are aimed at target + (tips - bar) and the BAR lands on the
-    spot."""
-    transit_z = TABLE_TOP_Z + 0.18
+# Lift straight up until the bar's underside is this high over the table, cross
+# to the centre at that height, then straight down to the drop. High enough to
+# clear a pile of bars already in the middle (the real box fills up).
+TRANSIT_UNDERSIDE_M = 0.14
+LIFT_SPEED_MPS = 0.12
+CARRY_SPEED_MPS = 0.15
+LOWER_SPEED_MPS = 0.12
+
+
+def carry_and_place(robot, ik, fps: int, target_xy: np.ndarray, grip_m: float, bar: int,
+                    spot_top_z: float = TABLE_TOP_Z) -> str:
+    """Fingers are closed on the bar. Straight up until the bar's underside is
+    TRANSIT_UNDERSIDE_M over the table, or higher if the pile at the spot needs
+    it (dragging it sideways from rest shoved the rest of the stack along),
+    level across to over the table centre, straight down to DROP_HEIGHT_M
+    above ``spot_top_z`` (the table, or the top of the pile), release. Wrist frozen throughout: re-orienting a just-gripped bar pries it
+    out of the pads (the cube picker learned that). The bar hangs wherever the
+    pads caught it, so the tips are aimed at target + (tips - bar) and the BAR
+    arrives over the spot.
+
+    Returns "ok", "lost" (the bar parted from the pads early: a grasp failure,
+    retryable) or "fail"."""
     arm = ik.arm
-
-    def lost(stage: str) -> bool:
-        d = float(np.linalg.norm(bar_pos(robot, bar) - rcp.tip_mid_world(robot, arm)))
-        print(f"    [{stage}] bar-to-tips {d * 100:.1f} cm{'  <-- LOST' if d > 0.06 else ''}")
-        return d > 0.06
-
-    tip = rcp.tip_mid_world(robot, arm)
-    hop = np.array([tip[0], tip[1], transit_z])
-    if rcp.play_tip_cartesian(robot, ik, hop, grip_m, fps, 0.0, label="carry: rise", freeze_wrist=True) is None:
-        return False
-    if lost("after rise"):
-        return False
-    tip = rcp.tip_mid_world(robot, arm)
-    offset = tip[:2] - bar_pos(robot, bar)[:2]
-    over = np.array([target_xy[0] + offset[0], target_xy[1] + offset[1], transit_z])
-    if rcp.play_tip_cartesian(robot, ik, over, grip_m, fps, 0.0, label="carry: over spot", lock_z=transit_z,
-                              freeze_wrist=True, min_z=transit_z - 0.01, speed_mps=0.18) is None:
-        return False
-    if lost("over spot"):
-        return False
-    # lower with the gripper orientation held (freezing wrist angles re-pitches
-    # the gripper as the shoulder/elbow descend)
     q_prev = rcp._cmd_seed(robot, arm.side)
     ik.set_q(q_prev)
-    a = ik.rot()[:, 2]
-    yaw_hold = math.atan2(float(a[1]), float(a[0]))
-    pitch_hold = math.atan2(-float(a[2]), float(np.hypot(a[0], a[1])))
-    rest_z = bar_centre_z(0)
-    tip = rcp.tip_mid_world(robot, arm)
-    bar_now = bar_pos(robot, bar)
-    tip0 = ik.tip_mid().copy()
-    tip_end = np.array([target_xy[0] + (tip[0] - bar_now[0]), target_xy[1] + (tip[1] - bar_now[1]),
-                        rest_z + float(tip[2] - bar_now[2]) + 0.004])
-    dist = float(np.linalg.norm(tip_end - tip0))
-    n = max(2, int(max(0.4, dist / 0.12) * fps))
-    print(f"  carry: lower onto the table ({n / fps:.1f}s, {dist * 100:.0f} cm)…")
-    for k in range(n):
-        u = (k + 1) / n
-        s_u = u * u * (3.0 - 2.0 * u)
-        tip_t = (1.0 - s_u) * tip0 + s_u * tip_end
-        for _ in range(2):
-            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), yaw=yaw_hold, pitch=pitch_hold, level=True)
+    wrist_hold = q_prev[4:7].copy()
+    tip_start = rcp.tip_mid_world(robot, arm).copy()
+    bar_start = bar_pos(robot, bar)
+
+    def tick(tip_t: np.ndarray) -> None:
+        nonlocal q_prev
+        for _ in range(3):
+            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), freeze_wrist=wrist_hold)
         q = rcp._rate_limit_q(ik.q(), q_prev, math.radians(1.4))
         ik.set_q(q)
         rcp._hold_fingers(robot, ik, grip_m)
         rcp.precise_sleep(1.0 / fps)
         q_prev = q.copy()
-        if float(bar_pos(robot, bar)[2]) <= rest_z + 0.002:
-            break  # touched down
-    print(f"  before release: bar {np.linalg.norm(bar_pos(robot, bar)[:2] - target_xy) * 100:.1f} cm off the spot, "
-          f"z-above-rest {(bar_pos(robot, bar)[2] - rest_z) * 100:+.1f} cm")
-    # Release, and do not move until the fingers are actually open.
-    if rcp.set_gripper(robot, ik, rcp.FINGER_OPEN_M, fps, hold_s=1.5) < 0.0:
-        rcp.set_gripper(robot, ik, rcp.FINGER_OPEN_M, fps, hold_s=1.5)
+
+    def segment(tip_a: np.ndarray, tip_b: np.ndarray, speed: float, label: str,
+                stop_below_z: float | None = None) -> float | None:
+        """Ease-in-out straight tip move; returns the fraction travelled when the
+        bar parted from the pads, or None if it stayed. With ``stop_below_z``
+        the move ends as soon as the bar's underside reaches that height."""
+        dist = float(np.linalg.norm(tip_b - tip_a))
+        n = max(2, int(max(0.4, dist / speed) * fps))
+        print(f"  {label}: {dist * 100:.0f} cm ({n / fps:.1f}s)…")
+        for k in range(n):
+            u = (k + 1) / n
+            s_u = u * u * (3.0 - 2.0 * u)
+            tick((1.0 - s_u) * tip_a + s_u * tip_b)
+            if rcp.grasp_table_fault(robot, arm) is not None:
+                print(f"  {label}: TABLE HIT {rcp.grasp_table_fault(robot, arm)} — aborting")
+                return -1.0
+            if float(np.linalg.norm(bar_pos(robot, bar) - rcp.tip_mid_world(robot, arm))) > 0.06:
+                return u
+            if stop_below_z is not None and float(bar_pos(robot, bar)[2]) - BAR_HALF[2] <= stop_below_z:
+                print(f"  {label}: touched down at {u * 100:.0f}% — releasing here")
+                break
+        return None
+
+    # 1. straight up to transit height, closed-loop on the bar's own height
+    #    (the arm sags under load: keep raising the command until the bar is
+    #    actually there)
+    tip_bar_dz = float(tip_start[2] - bar_start[2])
+    transit_bar_z = max(TABLE_TOP_Z + TRANSIT_UNDERSIDE_M, spot_top_z + 0.06) + BAR_HALF[2]
+    lift_m = transit_bar_z - float(bar_start[2])
+    n_lift = max(2, int(lift_m / LIFT_SPEED_MPS * fps))
+    print(f"  lift: {lift_m * 100:.0f} cm straight up ({n_lift / fps:.1f}s)…")
+    extra = 0.0
+    for k in range(n_lift + int(1.5 * fps)):
+        u = min(1.0, (k + 1) / n_lift)
+        s_u = u * u * (3.0 - 2.0 * u)
+        if u >= 1.0:
+            if float(bar_pos(robot, bar)[2]) >= transit_bar_z - 0.005:
+                break
+            extra = min(extra + 0.04 / fps, 0.04)
+        tick(tip_start + np.array([0.0, 0.0, s_u * lift_m + extra]))
+        if k > int(0.5 * fps) and float(bar_pos(robot, bar)[2] - bar_start[2]) < 0.005:
+            print("  lift: bar did not come up with the fingers — slipped")
+            return "lost"
+    rise = float(bar_pos(robot, bar)[2] - bar_start[2])
+    if rise < 0.5 * lift_m:
+        print(f"  lift: bar only rose {rise * 100:.1f} cm of {lift_m * 100:.0f} — slipped")
+        return "lost"
+
+    # 2. level across to over the centre, 3. straight down to the drop height
+    tip0 = rcp.tip_mid_world(robot, arm).copy()
+    bar0 = bar_pos(robot, bar)
+    over = np.array([target_xy[0] + (tip0[0] - bar0[0]), target_xy[1] + (tip0[1] - bar0[1]), tip0[2]])
+    lost_at = segment(tip0, over, CARRY_SPEED_MPS, "carry: across to the centre")
+    if lost_at is None:
+        tip2 = rcp.tip_mid_world(robot, arm).copy()
+        bar2 = bar_pos(robot, bar)
+        drop_bar_z = spot_top_z + DROP_HEIGHT_M + BAR_HALF[2]
+        down = np.array([target_xy[0] + (tip2[0] - bar2[0]), target_xy[1] + (tip2[1] - bar2[1]),
+                         drop_bar_z + float(tip2[2] - bar2[2])])
+        lost_at = segment(tip2, down, LOWER_SPEED_MPS, "carry: down to the drop",
+                          stop_below_z=spot_top_z + TOUCHDOWN_M)
+    if lost_at is not None:
+        if lost_at < 0:
+            return "fail"
+        print(f"  carry: bar parted from the pads {lost_at * 100:.0f}% of the way")
+        return "lost"
+    p = bar_pos(robot, bar)
+    print(f"  drop: bar {np.linalg.norm(p[:2] - target_xy) * 100:.1f} cm off centre, "
+          f"underside {(p[2] - BAR_HALF[2] - spot_top_z) * 100:.1f} cm above the spot")
+    # open, and do not move until the fingers actually are
+    if rcp.set_gripper(robot, ik, rcp.FINGER_OPEN_M, fps, hold_s=1.0) < 0.0:
+        rcp.set_gripper(robot, ik, rcp.FINGER_OPEN_M, fps, hold_s=1.0)
+    # back off to transit height: the next episode usually starts from here,
+    # and the pile it finds under the hand may be taller than this one
     tip = rcp.tip_mid_world(robot, arm)
-    up = np.array([tip[0], tip[1], transit_z])
-    rcp.play_tip_cartesian(robot, ik, up, rcp.FINGER_OPEN_M, fps, 0.0, label="carry: retreat", freeze_wrist=True)
-    return True
+    up = np.array([tip[0], tip[1], max(tip[2] + 0.08, transit_bar_z + tip_bar_dz)])
+    rcp.play_tip_cartesian(robot, ik, up, rcp.FINGER_OPEN_M, fps, 0.0, label="back off", freeze_wrist=True)
+    return "ok"
 
 
 def run_trial(robot, iks, fps: int, trial: Trial, rng: np.random.Generator) -> bool:
@@ -433,18 +559,14 @@ def run_trial(robot, iks, fps: int, trial: Trial, rng: np.random.Generator) -> b
     try:
         bp = bar_pos(robot, bar)
         print(f"  pick: bar_{bar} (level {trial.level_of(bar)} of {trial.sizes[trial.target]}) "
-              f"at ({bp[0]:.2f},{bp[1]:.2f},{bp[2]:.3f}) with the {trial.side} arm "
-              f"-> spot ({trial.place_xy[0]:.2f},{trial.place_xy[1]:.2f})")
-        rcp.set_gripper(robot, ik, rcp.FINGER_OPEN_M, fps, hold_s=1.0)
+              f"at ({bp[0]:.2f},{bp[1]:.2f},{bp[2]:.3f}) with the {trial.side} arm -> centre")
+        # no separate "open the gripper" step: the approach commands the open
+        # width from its first tick, so the fingers open while the arm moves
         if not pick_bar(robot, ik, fps, trial, bar, rng):
             bad = others_disturbed(robot, trial, {bar})
             if bad:
                 print(f"  fail: KNOCKED: {'; '.join(bad)}")
                 trial.fail_stage = "knock-over"
-            return False
-        if not carry_and_place(robot, ik, fps, trial.place_xy, rcp._AIM_LAST_HOLD["m"], bar):
-            print("  fail: carry/place")
-            trial.fail_stage = "carry"
             return False
     finally:
         rcp.set_target_body("cube")
@@ -458,9 +580,10 @@ def run_trial(robot, iks, fps: int, trial: Trial, rng: np.random.Generator) -> b
         rcp.precise_sleep(1.0 / fps)
     p = bar_pos(robot, bar)
     d = float(np.linalg.norm(p[:2] - trial.place_xy))
-    on_table = abs(float(p[2]) - bar_centre_z(0)) < 0.010
-    ok = d < PLACE_TOL and on_table
-    print(f"  placed bar_{bar}: {d * 100:.1f} cm from the spot, z={p[2]:.3f} -> {'OK' if ok else 'MISS'}")
+    on_top = abs(float(p[2]) - bar_centre_z(trial.pile_n)) < 0.012  # flat on the pile (or the table)
+    ok = d < PLACE_TOL and on_top
+    print(f"  dropped bar_{bar}: {d * 100:.1f} cm from the centre, z={p[2]:.3f} "
+          f"(pile of {trial.pile_n} expects {bar_centre_z(trial.pile_n):.3f}) -> {'OK' if ok else 'MISS'}")
     if not ok:
         trial.fail_stage = "place"
     bad = others_disturbed(robot, trial, {bar})
@@ -472,42 +595,115 @@ def run_trial(robot, iks, fps: int, trial: Trial, rng: np.random.Generator) -> b
 
 
 STACK_KEEPOUT_M = 0.10  # a starting hand stays this far (xy) from every stack, unless well above it
+# In deployment the next pick starts wherever the last drop ended, so most
+# episodes begin from the previous episode's final pose; the rest from the cube
+# picker's random starts, for variety.
+CONTINUE_PROB = 0.75
+
+
+def draw_start_poses(ik, other_ik, rng: np.random.Generator, tucked_prob: float):
+    """The cube picker's start distribution (setup_start_pose), drawn WITHOUT
+    touching the sim: three quarters of the time an arm starts from a jittered
+    tuck, otherwise from a random pose in its workspace box; grippers start
+    anywhere from closed to open (nearly closed when tucked)."""
+    def one(ik_):
+        tucked = rng.uniform() < tucked_prob
+        if tucked:
+            q = np.clip(rcp.jittered_tuck(ik_.arm, rng, ik_), ik_.lo, ik_.hi)
+            g = float(rng.uniform(0.0, 0.006))
+        else:
+            q = rcp._random_start_q(ik_, ik_.arm, rng)
+            g = float(rng.uniform(0.0, rcp.FINGER_OPEN_M))
+        return q, g, tucked
+
+    return one(ik), one(other_ik)
+
+
+def hand_clear_of_stacks(ik, q: np.ndarray, tops: list[tuple[np.ndarray, float]]) -> bool:
+    """Hand and fingertips of pose ``q`` outside every stack's keep-out, or well
+    above it — evaluated in the planner's model, not the sim."""
+    ik.set_q(q)
+    pts = [ik.hand(), *rcp.finger_tips_from_data(ik.model, ik.data, ik.arm)]
+    for pt in pts:
+        for xy, top_z in tops:
+            if float(np.linalg.norm(pt[:2] - xy)) < STACK_KEEPOUT_M and float(pt[2]) < top_z + 0.12:
+                return False
+    return True
+
+
+def continue_from_here(robot, iks, trial: Trial, fps: int) -> bool:
+    """Start this episode with both arms exactly where the last one left them,
+    if that pose is clear of the new layout (the pile may have grown under the
+    hand). Returns False if a fresh start is needed."""
+    tops = [(np.array(xy), stack_top_z(sz)) for xy, sz in zip(trial.stack_xy, trial.sizes, strict=True)]
+    tops.append((DROP_XY.copy(), stack_top_z(trial.pile_n)))
+    for arm in rcp.ARMS:
+        low = min(rcp.finger_lowest_z(robot, arm))
+        for pt in (rcp.hand_pos_world(robot, arm), *rcp.finger_tips_world(robot, arm)):
+            for xy, top_z in tops:
+                if float(np.linalg.norm(pt[:2] - xy)) < STACK_KEEPOUT_M and low < top_z + 0.02:
+                    print(f"  (cannot continue: {arm.side} hand over a stack at ({xy[0]:.2f},{xy[1]:.2f}), "
+                          f"fingers {(low - top_z) * 100:+.1f} cm from its top — fresh start)")
+                    return False
+    for arm in rcp.ARMS:
+        q = rcp._arm_q_real(robot, iks[arm.side])
+        iks[arm.side].set_q(q)
+        rcp._LAST_CMD[arm.side] = q.copy()
+        rcp._OTHER_GRIP[arm.side] = rcp._finger_opening_m(robot, arm.side)
+    ik = iks[trial.side]
+    tip = ik.tip_mid()
+    print(f"  {ik.arm.side} start CONTINUING from the last episode's end tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f})")
+    rcp.settle_pose(robot, ik, rcp._finger_opening_m(robot, ik.arm.side), fps, hold_s=0.2)
+    if others_disturbed(robot, trial, set()):
+        print("  (cannot continue: settling disturbed a bar — fresh start)")
+        trial.restore_bars()
+        return False
+    return True
 
 
 def safe_start_pose(robot, iks, trial: Trial, rng: np.random.Generator, fps: int) -> bool:
-    """The cube picker's start randomisation, re-drawn until neither arm starts
-    in or over a stack. Its random starts cover the far half of the table —
-    exactly where the pads are — and a hand teleported into a stack sends bars
-    flying before the episode begins; a hand parked just above one sweeps it
-    on the idle arm's retreat. After a few rejected draws fall back to tucked
-    starts, which are always clear."""
+    """Teleport both arms to random start poses, once. Candidates are drawn and
+    checked in the planner's model first, so a hand that would start in or
+    over a stack is never shown (the cube picker's random starts cover the far
+    half of the table, exactly where the pads are; a hand teleported into a
+    stack sends bars flying, one parked above a stack sweeps it on the idle
+    arm's retreat). After a few rejected draws fall back to tucked starts,
+    which are always clear."""
+    import mujoco
+
     ik = iks[trial.side]
-    tops = [(np.array(xy), bar_centre_z(sz - 1) + BAR_HALF[2]) for xy, sz in zip(trial.stack_xy, trial.sizes, strict=True)]
-    prob0 = rcp.TUCKED_START_PROB
-    try:
-        for attempt in range(8):
-            if attempt >= 5:
-                rcp.TUCKED_START_PROB = 1.0
+    other_ik = iks["left" if trial.side == "right" else "right"]
+    tops = [(np.array(xy), stack_top_z(sz)) for xy, sz in zip(trial.stack_xy, trial.sizes, strict=True)]
+    tops.append((DROP_XY.copy(), stack_top_z(trial.pile_n)))
+    for attempt in range(12):
+        prob = rcp.TUCKED_START_PROB if attempt < 8 else 1.0
+        (q_a, g_a, tucked_a), (q_o, g_o, tucked_o) = draw_start_poses(ik, other_ik, rng, prob)
+        if not (hand_clear_of_stacks(ik, q_a, tops) and hand_clear_of_stacks(other_ik, q_o, tops)):
+            continue
+        # apply, exactly as setup_start_pose does
+        rcp._set_arm_qpos(robot, ik.arm.side, q_a)
+        rcp._set_gripper_qpos(robot, ik.arm.side, g_a)
+        rcp._set_arm_qpos(robot, other_ik.arm.side, q_o)
+        rcp._set_gripper_qpos(robot, other_ik.arm.side, g_o)
+        rcp.zero_sim_velocity(robot)
+        mujoco.mj_forward(robot._model, robot._data)
+        ik.set_q(q_a)
+        rcp._LAST_CMD[ik.arm.side] = q_a.copy()
+        rcp._LAST_CMD[other_ik.arm.side] = q_o.copy()
+        rcp._OTHER_GRIP[other_ik.arm.side] = g_o
+        tip = ik.tip_mid()
+        print(f"  {ik.arm.side} start {'TUCKED (jittered)' if tucked_a else 'random'} "
+              f"tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f}); "
+              f"{other_ik.arm.side} starts {'TUCKED' if tucked_o else 'random'} (grip {g_o * 1000:.0f} mm)"
+              + (f"  [{attempt} draw(s) rejected]" if attempt else ""))
+        rcp.settle_pose(robot, ik, g_a, fps, hold_s=0.2)
+        if others_disturbed(robot, trial, set()):
+            print("  (start pose disturbed a bar — redrawing)")
             trial.restore_bars()
-            rcp.set_target_body(f"bar_{trial.top_bar()}")  # start-pose checks look at the target
-            rcp.settle_pose(robot, ik, 0.0, fps, hold_s=0.3)
-            rcp.setup_start_pose(robot, ik, rng, fps)
-            rcp.set_target_body("cube")
-            clear = True
-            for arm in rcp.ARMS:
-                hand = rcp.hand_pos_world(robot, arm)
-                tips = rcp.finger_tips_world(robot, arm)
-                for pt in (hand, *tips):
-                    for xy, top_z in tops:
-                        if float(np.linalg.norm(pt[:2] - xy)) < STACK_KEEPOUT_M and float(pt[2]) < top_z + 0.12:
-                            clear = False
-            if clear and not others_disturbed(robot, trial, set()):
-                return True
-            print("  (start pose in or over a stack — redrawing)")
-        return False
-    finally:
-        rcp.TUCKED_START_PROB = prob0
-        trial.restore_bars()
+            continue
+        return True
+    trial.restore_bars()
+    return False
 
 
 def save_snapshot(robot, path: str) -> None:
@@ -530,7 +726,7 @@ def main() -> None:
     ap.add_argument("--stacks", type=int, default=4,
                     help=f"number of pads/stacks on the arc (2-{MAX_STACKS}); even keeps the centreline clear")
     ap.add_argument("--arm-gain-scale", type=float, default=ARM_GAIN_SCALE,
-                    help="servo stiffness multiplier (1.0 = the cube picker's gains); pass the same value to the eval")
+                    help="servo stiffness multiplier (default 1.0 = the cube picker's gains, which the eval uses)")
     ap.add_argument("--model-path", default=str(Path.home() / "sparkpack/openarm_mujoco/v1/scene.xml"))
     ap.add_argument("--no-viewer", action="store_true")
     ap.add_argument("--record", default=None, metavar="REPO_ID")
@@ -546,6 +742,9 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     rcp._AIM_OVERLAY_ENABLED = bool(args.debug)
+    rcp.TUCK_TIP_TARGET = TUCK_TIP_TARGET  # before any tuck is solved (it is cached)
+    rcp._APPROACH_GRIP_FN["fn"] = approach_grip
+    rcp._APPROACH_SETTLE_S["s"] = APPROACH_SETTLE_S
     robot = rcp.make_robot(args.model_path, args.fps, viewer=not args.no_viewer,
                            cameras=args.cameras if args.record else "none",
                            arm_gain_scale=args.arm_gain_scale)
@@ -601,6 +800,7 @@ def main() -> None:
     t = 0
     per_side = {"left": [0, 0], "right": [0, 0]}
     fails: dict[str, int] = {}
+    have_previous = False  # an episode has run, so "continue from here" has a here
     try:
         while t < max_trials:
             t += 1
@@ -622,9 +822,9 @@ def main() -> None:
                 print(f"  {trial.describe()}")
                 if args.snapshot and t == 1:
                     save_snapshot(robot, args.snapshot)
-                if not safe_start_pose(robot, iks, trial, rng, args.fps):
+                cont = have_previous and rng.uniform() < CONTINUE_PROB and continue_from_here(robot, iks, trial, args.fps)
+                if not cont and not safe_start_pose(robot, iks, trial, rng, args.fps):
                     print("  no clear start pose after several draws — skipping trial slot")
-                    rcp.park_both_arms(robot, iks)
                     continue
                 for a in rcp.ARMS:  # both arms retreat to their tuck when idle
                     rcp._RETREAT_TARGET[a.side] = rcp.tuck_q(iks[a.side])
@@ -632,6 +832,7 @@ def main() -> None:
                     recorder.task = trial.prompt
                     recorder.start()
                 ok = run_trial(robot, iks, args.fps, trial, rng)
+                have_previous = True
                 per_side[trial.side][1] += 1
                 if ok:
                     per_side[trial.side][0] += 1
@@ -650,8 +851,9 @@ def main() -> None:
                     if recorder is not None:
                         recorder.drop()
                     print(f"  trial FAIL ({trial.fail_stage})")
-                rcp.park_both_arms(robot, iks)
-                rcp.settle_pose(robot, iks[trial.side], 0.0, args.fps, hold_s=0.15)
+                # No park between episodes: the arms stay where they finished
+                # and jump straight to the next randomised start (the snap to
+                # a default pose and back looked like a glitch in the viewer).
             if ok and not args.debug:
                 print(f"episode {successes}", flush=True)
             if target_eps and successes >= target_eps:
