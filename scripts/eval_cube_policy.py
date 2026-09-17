@@ -590,6 +590,9 @@ def main() -> None:
     parser.add_argument("--policy", required=True, help="checkpoint dir, or 'zeros' for self-test")
     parser.add_argument("--dataset", default="local/openarm_sim_cube_chest_100",
                         help="training dataset (for normalization stats)")
+    parser.add_argument("--arm-gain-scale", type=float, default=1.0,
+                        help="servo stiffness multiplier; match the generator that recorded the dataset "
+                             "(random_caddy_pick uses 3.0, the cube/colour generators 1.0)")
     parser.add_argument("--cameras", choices=["chest", "all"], default="chest",
                         help="must match what the policy was trained on")
     parser.add_argument("--trials", type=int, default=30)
@@ -677,7 +680,8 @@ def main() -> None:
     if args.denoise_steps:
         os.environ["GROOT_DENOISE_STEPS"] = str(args.denoise_steps)
 
-    robot = rcp.make_robot(args.model_path, args.fps, viewer=not args.no_viewer, cameras=args.cameras)
+    robot = rcp.make_robot(args.model_path, args.fps, viewer=not args.no_viewer, cameras=args.cameras,
+                           arm_gain_scale=args.arm_gain_scale)
     iks = {a.side: rcp.build_ik(robot, a) for a in rcp.ARMS}
     rcp.park_both_arms(robot, iks)
     rcp.settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.2)
