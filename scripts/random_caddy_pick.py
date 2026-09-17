@@ -43,6 +43,7 @@ import io
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -107,7 +108,7 @@ DROP_XY = np.array([0.31, 0.0])
 # arm sags ~1 cm more as it lowers, so this lands nearer 2 cm; and the descent
 # stops early the moment the bar touches down (set onto a pile while still
 # gripped, it shoved the top bars off).
-DROP_HEIGHT_M = 0.03
+DROP_HEIGHT_M = 0.02
 TOUCHDOWN_M = 0.004
 PLACE_TOL = 0.06  # bar counts as delivered within this radius of the spot
 # Bars already collected sit in a pile on the spot when an episode starts (the
@@ -454,9 +455,191 @@ def pick_bar(robot, ik, fps: int, trial: Trial, bar: int, rng: np.random.Generat
 # to the centre at that height, then straight down to the drop. High enough to
 # clear a pile of bars already in the middle (the real box fills up).
 TRANSIT_UNDERSIDE_M = 0.14
+LIFT_SAG_ALLOWANCE_M = 0.02  # command the lift this much past the target; it ends when the bar gets there
 LIFT_SPEED_MPS = 0.12
 CARRY_SPEED_MPS = 0.15
 LOWER_SPEED_MPS = 0.12
+
+
+def step_frozen_wrist(ik, tip_target: np.ndarray, wrist_hold: np.ndarray,
+                      iters: int = 3, max_dq: float = math.radians(1.6), damp: float = 1e-2,
+                      gain: float = 0.5, joints: tuple[int, ...] = (0, 1, 2, 3)) -> float:
+    """Damped-least-squares step of the tip toward ``tip_target`` using only the
+    four proximal joints, wrist joints pinned at ``wrist_hold``. ``gain`` < 1:
+    correcting the full error every tick over-corrected the sideways component
+    while the elbow was rate-limited on the vertical, and the shoulder yaw
+    alternated sign tick to tick (side-to-side wobble). Returns the remaining
+    tip error."""
+    import mujoco
+
+    for _ in range(iters):
+        err = tip_target - ik.tip_mid()
+        n = float(np.linalg.norm(err))
+        if n < 1e-6:
+            break
+        err = err * min(1.0, 0.025 / n)
+        jacp = np.zeros((3, ik.model.nv))
+        mujoco.mj_jacBody(ik.model, ik.data, jacp, None, ik.body)
+        jp = jacp[:, ik.dadr][:, list(joints)]
+        dq = gain * (jp.T @ np.linalg.solve(jp @ jp.T + damp**2 * np.eye(3), err))
+        biggest = float(np.max(np.abs(dq)))
+        if biggest > max_dq:
+            dq *= max_dq / biggest
+        q = ik.q()
+        q[list(joints)] += dq
+        q[4:7] = wrist_hold
+        q = np.clip(q, ik.lo, ik.hi)
+        q[3] = max(q[3], math.radians(8.0))
+        ik.set_q(q)
+    return float(np.linalg.norm(ik.tip_mid() - tip_target))
+
+
+def plan_line_frozen_wrist(ik, q0: np.ndarray, tip_b: np.ndarray, wrist_hold: np.ndarray,
+                           spacing_m: float = 0.01, joints: tuple[int, ...] = (0, 1, 2, 3),
+                           lateral_slack_m: float = 0.006) -> list[np.ndarray] | None:
+    """Joint-space waypoints that take the tips from where ``q0`` puts them to
+    ``tip_b`` along a straight line, wrist joints held, solved to convergence
+    at every centimetre and warm-started from the previous waypoint. Playing a
+    pre-solved path gives a smooth, monotone joint trajectory; solving one IK
+    step per tick reacted to its own tracking error every tick (the wobble).
+    ``joints`` selects the free joints: a vertical move is solved with shoulder
+    pitch, upper-arm roll and elbow only (3 joints, one unique path) — freeing
+    the shoulder yaw too let it sway one way and back. With the yaw held a
+    world-vertical line is not exactly reachable (the tip rises on the arm's
+    own arc), so ``lateral_slack_m`` says how far off the line the waypoints may
+    settle; height is always held to 2 mm."""
+    ik.set_q(q0)
+    tip_a = ik.tip_mid().copy()
+    n = max(2, int(math.ceil(float(np.linalg.norm(tip_b - tip_a)) / spacing_m)) + 1)
+    path = [q0.copy()]
+    for k in range(1, n):
+        tgt = tip_a + (tip_b - tip_a) * (k / (n - 1))
+        for _ in range(60):
+            if step_frozen_wrist(ik, tgt, wrist_hold, iters=1, max_dq=math.radians(3.0), gain=1.0, joints=joints) < 0.0008:
+                break
+        miss = ik.tip_mid() - tgt
+        if abs(float(miss[2])) > 0.002 or float(np.linalg.norm(miss[:2])) > lateral_slack_m:
+            print(f"    (line plan: waypoint {k}/{n - 1} off by {np.linalg.norm(miss) * 1000:.1f} mm with joints {joints})")
+            return None  # unreachable with these joints
+        path.append(ik.q().copy())
+    return smooth_path(ik, path, tip_a, tip_b, max_dev_m=max(0.006, lateral_slack_m + 0.004))
+
+
+def smooth_path(ik, path: list[np.ndarray], tip_a: np.ndarray, tip_b: np.ndarray,
+                window: int = 5, max_dev_m: float = 0.006) -> list[np.ndarray]:
+    """Moving-average the joint path (end points fixed). Each waypoint's solve
+    settles its one redundant degree of freedom on its own, so the raw path has
+    small kinks — a joint creeping one way for a few waypoints, then another —
+    that read as sway. Kept only if the tips stay within max_dev_m of the line."""
+    if len(path) < window + 2:
+        return path
+    arr = np.array(path)
+    half = window // 2
+    sm = arr.copy()
+    for k in range(1, len(arr) - 1):
+        lo, hi = max(0, k - half), min(len(arr), k + half + 1)
+        sm[k] = arr[lo:hi].mean(axis=0)
+    u = tip_b - tip_a
+    u = u / max(float(np.linalg.norm(u)), 1e-9)
+    for q in sm:
+        ik.set_q(q)
+        r = ik.tip_mid() - tip_a
+        if float(np.linalg.norm(r - (r @ u) * u)) > max_dev_m:
+            return path
+    return [q.copy() for q in sm]
+
+
+def plan_vertical_natural(ik, q0: np.ndarray, dz: float, wrist_hold: np.ndarray,
+                          joints: tuple[int, ...] = (1, 2, 3), spacing_m: float = 0.01) -> list[np.ndarray] | None:
+    """Joint path that raises (or lowers) the tips by ``dz`` with the wrist AND
+    the shoulder yaw held, tracking only height: the tips follow the arm's own
+    arc (a little radial drift) instead of a world-vertical line. A straight
+    vertical line at these poses needs the shoulder yaw to swing out and back
+    (the shoulder pitch sits at its limit, so the elbow does the lifting and
+    the yaw has to undo the elbow's sideways component), which read as sway."""
+    import mujoco
+
+    ik.set_q(q0)
+    z0 = float(ik.tip_mid()[2])
+    n = max(2, int(math.ceil(abs(dz) / spacing_m)) + 1)
+    path = [q0.copy()]
+    idx = list(joints)
+    for k in range(1, n):
+        z_t = z0 + dz * (k / (n - 1))
+        for _ in range(60):
+            err = z_t - float(ik.tip_mid()[2])
+            if abs(err) < 0.0005:
+                break
+            err = float(np.clip(err, -0.02, 0.02))
+            jacp = np.zeros((3, ik.model.nv))
+            mujoco.mj_jacBody(ik.model, ik.data, jacp, None, ik.body)
+            jz = jacp[2, ik.dadr][idx]
+            dq = jz * err / (float(jz @ jz) + 1e-4)
+            biggest = float(np.max(np.abs(dq)))
+            if biggest > math.radians(3.0):
+                dq *= math.radians(3.0) / biggest
+            q = ik.q()
+            q[idx] += dq
+            q[4:7] = wrist_hold
+            q = np.clip(q, ik.lo, ik.hi)
+            q[3] = max(q[3], math.radians(8.0))
+            ik.set_q(q)
+        if abs(float(ik.tip_mid()[2]) - z_t) > 0.002:
+            print(f"    (vertical plan: waypoint {k}/{n - 1} short by {(ik.tip_mid()[2] - z_t) * 1000:.1f} mm)")
+            return None
+        path.append(ik.q().copy())
+    return smooth_path(ik, path, ik.tip_mid(), ik.tip_mid(), max_dev_m=1.0)
+
+
+def path_tip_shift(ik, path: list[np.ndarray]) -> np.ndarray:
+    """Where the tips end relative to where they start along ``path``."""
+    ik.set_q(path[0])
+    a = ik.tip_mid().copy()
+    ik.set_q(path[-1])
+    return ik.tip_mid() - a
+
+
+def play_path(robot, ik, fps: int, path: list[np.ndarray], grip_m: float, speed_mps: float,
+              label: str, stop_when=None, min_s: float = 0.4) -> bool:
+    """Play a joint path with an ease-in-out time profile at ~speed_mps along
+    the tip line, never faster than the joint rate limit. ``stop_when()`` may
+    end it early (bar touched down, bar at height). Returns False if the bar
+    parted from the pads."""
+    ik.set_q(path[0])
+    tips = []
+    for q in path:
+        ik.set_q(q)
+        tips.append(ik.tip_mid().copy())
+    seg = np.linalg.norm(np.diff(np.array(tips), axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    length = float(cum[-1])
+    # ease-in-out peaks at 1.5x the mean speed: enough ticks that the peak
+    # joint step stays under the rate limit
+    travel = float(np.sum(np.max(np.abs(np.diff(np.array(path), axis=0)), axis=1))) if len(path) > 1 else 0.0
+    n = int(max(min_s, length / speed_mps, 1.5 * travel / math.radians(1.4) / fps) * fps)
+    n = max(2, n)
+    print(f"  {label}: {length * 100:.0f} cm ({n / fps:.1f}s)…")
+    q_prev = path[0].copy()
+    for k in range(n):
+        t0 = time.perf_counter()
+        u = (k + 1) / n
+        s_u = u * u * (3.0 - 2.0 * u)
+        target = s_u * length
+        i = int(np.searchsorted(cum, target, side="right")) - 1
+        i = min(max(i, 0), len(path) - 2)
+        w = 0.0 if seg[i] < 1e-9 else float((target - cum[i]) / seg[i])
+        q = (1.0 - w) * path[i] + w * path[i + 1]
+        dq = q - q_prev
+        biggest = float(np.max(np.abs(dq)))
+        if biggest > math.radians(1.4):
+            q = q_prev + dq * math.radians(1.4) / biggest
+        ik.set_q(q)
+        rcp._hold_fingers(robot, ik, grip_m)
+        rcp.precise_sleep(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+        q_prev = q.copy()
+        if stop_when is not None and stop_when():
+            break
+    return True
 
 
 def carry_and_place(robot, ik, fps: int, target_xy: np.ndarray, grip_m: float, bar: int,
@@ -476,84 +659,119 @@ def carry_and_place(robot, ik, fps: int, target_xy: np.ndarray, grip_m: float, b
     q_prev = rcp._cmd_seed(robot, arm.side)
     ik.set_q(q_prev)
     wrist_hold = q_prev[4:7].copy()
-    tip_start = rcp.tip_mid_world(robot, arm).copy()
+    # Every segment is planned in the COMMANDED frame (ik.tip_mid(), where the
+    # last command put the tips), never from the physical tips: the arm sags
+    # ~2 cm below its command under load, and a segment started from the
+    # physical tip first commanded the arm 2 cm DOWN before it went up — the
+    # dip-then-rise at the start of every lift and lower. The bar's offset from
+    # the commanded tip (which includes that sag) is what places the bar.
+    tip_start = ik.tip_mid().copy()
     bar_start = bar_pos(robot, bar)
 
-    def tick(tip_t: np.ndarray) -> None:
+    def in_hand() -> bool:
+        return float(np.linalg.norm(bar_pos(robot, bar) - rcp.tip_mid_world(robot, arm))) <= 0.06
+
+    def run_path(path: list[np.ndarray], speed: float, label: str, stop_when=None) -> str:
+        """Play a planned joint path; 'ok', 'lost' (bar parted from the pads) or
+        'fail' (table hit)."""
         nonlocal q_prev
-        for _ in range(3):
-            ik.step_tip_mid(tip_t, max_dq=math.radians(1.6), freeze_wrist=wrist_hold)
-        q = rcp._rate_limit_q(ik.q(), q_prev, math.radians(1.4))
-        ik.set_q(q)
-        rcp._hold_fingers(robot, ik, grip_m)
-        rcp.precise_sleep(1.0 / fps)
-        q_prev = q.copy()
+        lost = {"v": False}
 
-    def segment(tip_a: np.ndarray, tip_b: np.ndarray, speed: float, label: str,
-                stop_below_z: float | None = None) -> float | None:
-        """Ease-in-out straight tip move; returns the fraction travelled when the
-        bar parted from the pads, or None if it stayed. With ``stop_below_z``
-        the move ends as soon as the bar's underside reaches that height."""
-        dist = float(np.linalg.norm(tip_b - tip_a))
-        n = max(2, int(max(0.4, dist / speed) * fps))
-        print(f"  {label}: {dist * 100:.0f} cm ({n / fps:.1f}s)…")
-        for k in range(n):
-            u = (k + 1) / n
-            s_u = u * u * (3.0 - 2.0 * u)
-            tick((1.0 - s_u) * tip_a + s_u * tip_b)
+        def stop() -> bool:
+            if not in_hand():
+                lost["v"] = True
+                return True
             if rcp.grasp_table_fault(robot, arm) is not None:
-                print(f"  {label}: TABLE HIT {rcp.grasp_table_fault(robot, arm)} — aborting")
-                return -1.0
-            if float(np.linalg.norm(bar_pos(robot, bar) - rcp.tip_mid_world(robot, arm))) > 0.06:
-                return u
-            if stop_below_z is not None and float(bar_pos(robot, bar)[2]) - BAR_HALF[2] <= stop_below_z:
-                print(f"  {label}: touched down at {u * 100:.0f}% — releasing here")
-                break
-        return None
+                lost["v"] = None
+                return True
+            return bool(stop_when()) if stop_when is not None else False
 
-    # 1. straight up to transit height, closed-loop on the bar's own height
-    #    (the arm sags under load: keep raising the command until the bar is
-    #    actually there)
+        play_path(robot, ik, fps, path, grip_m, speed, label, stop_when=stop)
+        q_prev = ik.q().copy()
+        if lost["v"] is None:
+            print(f"  {label}: TABLE HIT — aborting")
+            return "fail"
+        return "lost" if lost["v"] else "ok"
+
+    # 1. up to transit height on the arm's own arc (yaw held), commanded a
+    #    little past the target because the arm sags under load, and cut short
+    #    the moment the bar is actually there.
     tip_bar_dz = float(tip_start[2] - bar_start[2])
     transit_bar_z = max(TABLE_TOP_Z + TRANSIT_UNDERSIDE_M, spot_top_z + 0.06) + BAR_HALF[2]
-    lift_m = transit_bar_z - float(bar_start[2])
-    n_lift = max(2, int(lift_m / LIFT_SPEED_MPS * fps))
-    print(f"  lift: {lift_m * 100:.0f} cm straight up ({n_lift / fps:.1f}s)…")
-    extra = 0.0
-    for k in range(n_lift + int(1.5 * fps)):
-        u = min(1.0, (k + 1) / n_lift)
-        s_u = u * u * (3.0 - 2.0 * u)
-        if u >= 1.0:
-            if float(bar_pos(robot, bar)[2]) >= transit_bar_z - 0.005:
-                break
-            extra = min(extra + 0.04 / fps, 0.04)
-        tick(tip_start + np.array([0.0, 0.0, s_u * lift_m + extra]))
-        if k > int(0.5 * fps) and float(bar_pos(robot, bar)[2] - bar_start[2]) < 0.005:
-            print("  lift: bar did not come up with the fingers — slipped")
-            return "lost"
+    lift_m = transit_bar_z - float(bar_start[2]) + LIFT_SAG_ALLOWANCE_M
+    path = plan_vertical_natural(ik, q_prev, lift_m, wrist_hold)
+    if path is None:
+        path = plan_line_frozen_wrist(ik, q_prev, tip_start + np.array([0.0, 0.0, lift_m]), wrist_hold)
+    if path is None:
+        print("  lift: no wrist-held path up — aborting")
+        return "fail"
+    r = run_path(path, LIFT_SPEED_MPS, "lift", stop_when=lambda: float(bar_pos(robot, bar)[2]) >= transit_bar_z)
+    if r != "ok":
+        if r == "lost":
+            print(f"  lift: bar parted from the fingers (rose {(bar_pos(robot, bar)[2] - bar_start[2]) * 100:.1f} cm)")
+        return r
     rise = float(bar_pos(robot, bar)[2] - bar_start[2])
-    if rise < 0.5 * lift_m:
+    if rise < 0.5 * (lift_m - LIFT_SAG_ALLOWANCE_M):
         print(f"  lift: bar only rose {rise * 100:.1f} cm of {lift_m * 100:.0f} — slipped")
         return "lost"
 
-    # 2. level across to over the centre, 3. straight down to the drop height
-    tip0 = rcp.tip_mid_world(robot, arm).copy()
+    # 2. level across to over the centre, 3. down to the drop height on the
+    #    arm's own arc. The descent drifts a little radially, so the across
+    #    move aims where the descent will then bring the bar onto the spot:
+    #    plan both, measure the descent's drift, re-aim, repeat.
+    ik.set_q(q_prev)
+    tip0 = ik.tip_mid().copy()
     bar0 = bar_pos(robot, bar)
-    over = np.array([target_xy[0] + (tip0[0] - bar0[0]), target_xy[1] + (tip0[1] - bar0[1]), tip0[2]])
-    lost_at = segment(tip0, over, CARRY_SPEED_MPS, "carry: across to the centre")
-    if lost_at is None:
-        tip2 = rcp.tip_mid_world(robot, arm).copy()
-        bar2 = bar_pos(robot, bar)
-        drop_bar_z = spot_top_z + DROP_HEIGHT_M + BAR_HALF[2]
-        down = np.array([target_xy[0] + (tip2[0] - bar2[0]), target_xy[1] + (tip2[1] - bar2[1]),
-                         drop_bar_z + float(tip2[2] - bar2[2])])
-        lost_at = segment(tip2, down, LOWER_SPEED_MPS, "carry: down to the drop",
-                          stop_below_z=spot_top_z + TOUCHDOWN_M)
-    if lost_at is not None:
-        if lost_at < 0:
+    tip_over_bar = tip0 - bar0                      # commanded tips relative to the bar (includes the sag)
+    drop_bar_z = spot_top_z + DROP_HEIGHT_M + BAR_HALF[2]
+    dz_down = (drop_bar_z + float(tip_over_bar[2])) - float(tip0[2])
+    drift = np.zeros(2)
+    path_across = path_down = None
+    for _ in range(3):
+        over = np.array([target_xy[0] + tip_over_bar[0] - drift[0], target_xy[1] + tip_over_bar[1] - drift[1], tip0[2]])
+        path_across = plan_line_frozen_wrist(ik, q_prev, over, wrist_hold)
+        if path_across is None:
+            break
+        path_down = plan_vertical_natural(ik, path_across[-1], dz_down, wrist_hold)
+        if path_down is None:
+            break
+        new_drift = path_tip_shift(ik, path_down)[:2]
+        if float(np.linalg.norm(new_drift - drift)) < 0.002:
+            drift = new_drift
+            break
+        drift = new_drift
+    if path_across is None:
+        print("  carry: no wrist-held path across — aborting")
+        return "fail"
+    r = run_path(path_across, CARRY_SPEED_MPS, "carry: across to the centre")
+    if r == "ok":
+        if path_down is None:  # fall back to a straight descent
+            ik.set_q(q_prev)
+            tip2 = ik.tip_mid().copy()
+            bar2 = bar_pos(robot, bar)
+            down = np.array([target_xy[0] + (tip2[0] - bar2[0]), target_xy[1] + (tip2[1] - bar2[1]),
+                             drop_bar_z + float(tip2[2] - bar2[2])])
+            path_down = plan_line_frozen_wrist(ik, q_prev, down, wrist_hold)
+        else:
+            path_down = plan_vertical_natural(ik, q_prev, dz_down, wrist_hold) or path_down
+        touched = {"v": False}
+
+        def touchdown() -> bool:
+            if float(bar_pos(robot, bar)[2]) - BAR_HALF[2] <= spot_top_z + TOUCHDOWN_M:
+                touched["v"] = True
+                return True
+            return False
+
+        if path_down is None:
+            print("  carry: no wrist-held path down — aborting")
             return "fail"
-        print(f"  carry: bar parted from the pads {lost_at * 100:.0f}% of the way")
-        return "lost"
+        r = run_path(path_down, LOWER_SPEED_MPS, "carry: down to the drop", stop_when=touchdown)
+        if touched["v"]:
+            print("  carry: touched down — releasing here")
+    if r != "ok":
+        if r == "lost":
+            print("  carry: bar parted from the pads on the way")
+        return r
     p = bar_pos(robot, bar)
     print(f"  drop: bar {np.linalg.norm(p[:2] - target_xy) * 100:.1f} cm off centre, "
           f"underside {(p[2] - BAR_HALF[2] - spot_top_z) * 100:.1f} cm above the spot")
