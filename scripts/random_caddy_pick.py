@@ -128,13 +128,29 @@ TUCK_TIP_TARGET = {"right": np.array([0.30, -0.20, 0.50]), "left": np.array([0.3
 PRECLOSE_FROM = 0.65     # approach progress at which the fingers start closing
 PRECLOSE_M = 0.032
 APPROACH_SETTLE_S = 0.2
+# The fingers open at this rate while the arm starts moving (commanding the
+# open width outright made a tucked arm's gripper pop open in a couple of ticks).
+GRIP_OPEN_MPS = 0.04
+_GRIP = {"cmd": rcp.FINGER_OPEN_M, "fps": 30}
+
+
+def reset_grip_ramp(robot, side: str, fps: int) -> None:
+    """Start the approach's gripper ramp from where the fingers actually are."""
+    _GRIP["cmd"] = float(rcp._finger_opening_m(robot, side))
+    _GRIP["fps"] = fps
 
 
 def approach_grip(progress: float) -> float:
+    """Gripper command for this approach tick: ramp open at GRIP_OPEN_MPS, then
+    over the last stretch ease toward PRECLOSE_M."""
     if progress <= PRECLOSE_FROM:
-        return rcp.FINGER_OPEN_M
-    u = (progress - PRECLOSE_FROM) / (1.0 - PRECLOSE_FROM)
-    return rcp.FINGER_OPEN_M + (PRECLOSE_M - rcp.FINGER_OPEN_M) * u
+        target = rcp.FINGER_OPEN_M
+    else:
+        u = (progress - PRECLOSE_FROM) / (1.0 - PRECLOSE_FROM)
+        target = rcp.FINGER_OPEN_M + (PRECLOSE_M - rcp.FINGER_OPEN_M) * u
+    step = GRIP_OPEN_MPS / _GRIP["fps"]
+    _GRIP["cmd"] = min(target, _GRIP["cmd"] + step) if target > _GRIP["cmd"] else target
+    return _GRIP["cmd"]
 
 PAD_HALF_XY = 0.045
 PAD_Z = TABLE_TOP_Z + 0.0015  # 3 mm slab, visual only
@@ -407,6 +423,7 @@ def pick_bar(robot, ik, fps: int, trial: Trial, bar: int, rng: np.random.Generat
             print("  fail: every path to the aim pose sweeps the fingers through the table")
             trial.fail_stage = "plan"
             return False
+        reset_grip_ramp(robot, ik.arm.side, fps)
         if not rcp.execute_aim_and_approach(robot, ik, fps, [q_now] + waypoints, chain, rng):
             if rcp.grasp_table_fault(robot, ik.arm) is not None:
                 trial.fail_stage = "table strike"
