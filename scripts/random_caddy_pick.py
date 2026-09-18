@@ -2,7 +2,7 @@
 """Caddy picking: stacks of brown chocolate bars on coloured pads; "get bar from blue pad".
 
 Each trial:
-  1. Arrange N stacks (default 4, 1-3 bars each) of identical brown square bars
+  1. Arrange N stacks (default 6, 1-3 bars each) of identical brown square bars
      (50 x 50 x 25 mm) on an arc in front of the arms, each stack on a coloured
      pad. The pad colours are a fresh random draw from the palette every trial,
      so a colour says nothing about position and position nothing about colour:
@@ -158,7 +158,7 @@ PAD_Z = TABLE_TOP_Z + 0.0015  # 3 mm slab, visual only
 PAD_PARK = (-0.9, 0.0, -0.5)  # unused pads hide under the floor
 WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.0135) for i in range(MAX_BARS)]
 
-# Nine well-separated colours (four used by default). Table is brown, bars are
+# Nine well-separated colours (six used by default). Table is brown, bars are
 # brown: none of these is anywhere near either.
 PALETTE: list[tuple[str, tuple[float, float, float, float]]] = [
     ("red", (0.85, 0.15, 0.12, 1.0)),
@@ -176,6 +176,18 @@ PALETTE: list[tuple[str, tuple[float, float, float, float]]] = [
 
 def make_prompt(colour: str) -> str:
     return f"get bar from {colour} pad"
+
+
+_SIDE_BAG: list[str] = []
+
+
+def next_side(rng: np.random.Generator) -> str:
+    """Left/right from a shuffled bag: an even split however many other draws
+    the random stream takes (a plain coin flip came out 187/127 over 300)."""
+    if not _SIDE_BAG:
+        _SIDE_BAG.extend(["left", "right"])
+        rng.shuffle(_SIDE_BAG)
+    return _SIDE_BAG.pop()
 
 
 # --- scene helpers -----------------------------------------------------------
@@ -308,7 +320,12 @@ class Trial:
             for i in range(MAX_BARS)
         ]
 
-        self.target = int(rng.integers(0, self.n))
+        # Arm balance the colour picker's way: draw the SIDE from a shuffled
+        # two-element bag (so left and right alternate in pairs whatever else
+        # consumes the random stream), then a slot on that side.
+        side = next_side(rng)
+        slots = [i for i in range(self.n) if self.arm_for(i) == side]
+        self.target = int(slots[rng.integers(0, len(slots))])
         self.colour = self.colours[self.target][0]
         self.prompt = make_prompt(self.colour)
         self.place_xy = DROP_XY.copy()
@@ -958,7 +975,7 @@ def main() -> None:
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--stacks", type=int, default=4,
+    ap.add_argument("--stacks", type=int, default=6,
                     help=f"number of pads/stacks on the arc (2-{MAX_STACKS}); even keeps the centreline clear")
     ap.add_argument("--arm-gain-scale", type=float, default=ARM_GAIN_SCALE,
                     help="servo stiffness multiplier (default 1.0 = the cube picker's gains, which the eval uses)")
