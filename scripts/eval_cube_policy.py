@@ -352,6 +352,17 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
     """
     import random_caddy_pick as rc
 
+    # The generator overrides these module globals in its main() before it
+    # solves any pose. The eval has to do the same, or the scene it builds is
+    # not the scene the policy was trained on: the idle arm would tuck to the
+    # cube picker's deep park behind the table instead of the caddy task's rest
+    # over the near edge, which changes every camera's view of the other arm.
+    if rcp.TUCK_TIP_TARGET is not rc.TUCK_TIP_TARGET:
+        rcp.TUCK_TIP_TARGET = rc.TUCK_TIP_TARGET
+        rcp._TUCK_Q_CACHE.clear()          # it caches per side; the old target is in there
+        rcp._APPROACH_GRIP_FN["fn"] = rc.approach_grip
+        rcp._APPROACH_SETTLE_S["s"] = rc.APPROACH_SETTLE_S
+
     rc.hide_legacy_pads(robot)
     rcp.set_cube_xy(robot, -0.90, -0.90)
     trial = None
