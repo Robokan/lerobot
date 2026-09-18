@@ -18,9 +18,10 @@
 set -euo pipefail
 
 SPARK="${SPARK:-$HOME/sparkpack}"
-NAME="groot-color-3cam"
-CKPT="$HOME/cloud_ckpts/groot_color_3cam_aug/checkpoints/049000"
-REPO_ID="local/openarm_color_sort_all_300"
+NAME="groot-caddy6"
+CKPT="$HOME/cloud_ckpts/groot_caddy6_3cam/checkpoints/070000"
+REPO_ID="local/openarm_caddy6_pick_all_300"
+README="$SPARK/lerobot/DEPLOY_CADDY.md"
 ONNX=""
 DEST=""
 WAIT=0
@@ -29,6 +30,7 @@ STAGE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --name)           NAME="$2"; shift 2 ;;
+        --readme)         README="$2"; shift 2 ;;
         --checkpoint)     CKPT="$2"; shift 2 ;;
         --dataset)        REPO_ID="$2"; shift 2 ;;
         --onnx)           ONNX="$2"; shift 2 ;;
@@ -50,7 +52,7 @@ SAMPLE="sample_batch.pt"
 echo "== staging $NAME into $STAGE"
 mkdir -p "$STAGE/code" "$STAGE/native_template"
 
-cp "$SPARK/lerobot/DEPLOY_TENSORRT.md" "$STAGE/README.md"
+cp "$README" "$STAGE/README.md"
 
 # Sidecar files for export_groot_native.py: architecture and embodiment
 # descriptors, not trained weights. 3 MB instead of shipping a second 14 GB
@@ -79,7 +81,7 @@ fi
 # The preprocessed batch the ONNX export takes its static shapes from. Captured
 # from THIS checkpoint's own processor, task string and camera set — a batch from
 # a different camera count bakes the wrong ViT patch count into the engines.
-if [ ! -f "$STAGE/$SAMPLE" ]; then
+if [ -n "$ONNX" ] && [ ! -f "$STAGE/$SAMPLE" ]; then
     ( cd "$SPARK/lerobot" && .venv/bin/python scripts/dump_groot_sample_batch.py \
         --checkpoint "$CKPT" --dataset "$REPO_ID" --out "$STAGE/$SAMPLE" 2>/dev/null \
         | grep -E "pixel_values|attention_mask" | sed 's/^/   /' )
