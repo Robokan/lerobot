@@ -1,8 +1,31 @@
 # Training GR00T on a Runpod pod
 
-The whole procedure, from a recorded dataset on this workstation to checkpoints
-on HuggingFace and a pod that shuts itself off. Written after the caddy-picker
-run on 2026-09-17, which is also where every warning below comes from.
+The whole procedure, from a recorded dataset to checkpoints on HuggingFace and a
+pod that shuts itself off. Written after the caddy-picker run on 2026-09-17,
+which is also where every warning below comes from.
+
+## The loop
+
+One workstation does everything; the Hub is the only thing in the middle. There
+is no USB drive in this picture and no machine-to-machine copying.
+
+```
+  workstation                     HuggingFace                  Runpod pod
+  -----------                     -----------                  ----------
+  record episodes  ── dataset ──>  dataset repo  ── pull ──>  train 70k steps
+                                   ckpt repo    <── push ──   checkpoints
+  evaluate         <── ckpt ────   ckpt repo
+```
+
+  1. `scripts/random_caddy_pick.py --record …` records the episodes.
+  2. `scripts/cloud_launch.sh …` pushes the dataset and the code, creates the
+     pod, trains, and stops the pod when it is done.
+  3. `scripts/hf_get_checkpoint.py …` brings a checkpoint back down.
+  4. `scripts/eval_cube_policy.py --task-mode caddy …` scores it.
+
+Steps 1 and 4 need a GPU for rendering and inference; step 2 needs only network.
+Running all four on the machine that does inference is the point: the checkpoint
+lands where it will be used.
 
 ## Once per account: the token
 
@@ -107,12 +130,38 @@ runpodctl pod delete <pod-id>
 - **Free private Hub storage is 100 GB**, and deleting LFS files does not
   reclaim it without squashing history. `hf_prune_checkpoints.py` does both.
 
+## Bringing a checkpoint back
+
+```bash
+scripts/hf_get_checkpoint.py evaughan69/groot_caddy6_3cam --list
+scripts/hf_get_checkpoint.py evaughan69/groot_caddy6_3cam 070000 \
+    --dataset evaughan69/openarm_caddy6_pick_all_300
+```
+
+The dataset lands in the LeRobot cache under its Hub id, so the eval takes that
+id directly. Then:
+
+```bash
+MUJOCO_GL=egl .venv/bin/python scripts/eval_cube_policy.py \
+    --policy ~/checkpoints/groot_caddy6_3cam/070000 \
+    --task-mode caddy --dataset evaughan69/openarm_caddy6_pick_all_300 \
+    --cameras all --stacks 6 --trials 30 --seed 100 --no-viewer
+```
+
+## Setting up a new workstation
+
+Needs: this repo, `openarm_mujoco` beside it, a venv
+(`uv sync --locked --extra dataset --extra training --extra core_scripts --extra groot`),
+`runpodctl` authenticated (`runpodctl doctor`), and `hf auth login` with a write
+token. The Runpod secret is account-level, so it carries over.
+
 ## The pieces
 
 | script | runs on | does |
 |---|---|---|
 | `cloud_launch.sh` | workstation | the whole thing above |
 | `hf_upload_dataset.py` | workstation | dataset to the Hub, with retries |
+| `hf_get_checkpoint.py` | workstation | checkpoint and dataset back down |
 | `hf_prune_checkpoints.py` | workstation | delete old checkpoints, reclaim quota |
 | `pod_autostop_watchdog.sh` | workstation | the stop that does not depend on the pod |
 | `cloud_train_setup.sh` | pod | venv, dataset, the `lerobot-train` command |
