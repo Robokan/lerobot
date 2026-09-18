@@ -59,16 +59,26 @@ fi
 cd lerobot
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
-uv sync --locked
+# The extras matter: a bare `uv sync --locked` leaves out datasets and
+# transformers and training dies on the first import. These four are what a
+# GR00T training run actually needs.
+uv sync --locked --extra dataset --extra training --extra core_scripts --extra groot
 
 # --- dataset ---------------------------------------------------------------
 # lerobot resolves datasets by repo id under this cache root.
 CACHE="${HF_LEROBOT_HOME:-$HOME/.cache/huggingface/lerobot}"
-if [ ! -f "$CACHE/$REPO_ID/meta/info.json" ]; then
+if [ -f "$CACHE/$REPO_ID/meta/info.json" ]; then
+    echo "dataset: already in the cache, $(du -sh "$CACHE/$REPO_ID" | cut -f1)"
+elif [ -d "$DATASET_SRC" ]; then
     mkdir -p "$CACHE/$(dirname "$REPO_ID")"
     cp -r "$DATASET_SRC" "$CACHE/$REPO_ID"
+    echo "dataset: copied $(du -sh "$CACHE/$REPO_ID" | cut -f1) into the cache"
+else
+    # No local copy: REPO_ID had better be a Hub repo, which lerobot downloads
+    # on first use. That is the cheap path — the pod pulls at datacenter speed
+    # instead of us paying for the pod while a home link uploads.
+    echo "dataset: no local copy, expecting lerobot to fetch '$REPO_ID' from the Hub"
 fi
-echo "dataset: $(du -sh "$CACHE/$REPO_ID" | cut -f1) at $CACHE/$REPO_ID"
 
 # --- policy source ---------------------------------------------------------
 if [ "$MODE" = warm ]; then
