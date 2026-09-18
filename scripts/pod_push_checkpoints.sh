@@ -97,6 +97,12 @@ shut_down() {
     return 1
 }
 
+# "No lerobot-train process" means training has FINISHED only if it was ever
+# seen running. Without this the script starts while cloud_train_setup.sh is
+# still doing uv sync, sees no trainer and no checkpoints, concludes the run is
+# complete and stops the pod — which is exactly what happened on the first try.
+SEEN_TRAINING=0
+
 echo "[push] watching $OUT every ${INTERVAL}s -> $REPO"
 echo "[push] min step to push: $MIN_STEP | keep newest $KEEP on the Hub | when done: $ON_DONE"
 while true; do
@@ -160,7 +166,12 @@ PY
         done
     fi
     # Stop once training has exited and everything on disk has been pushed.
-    if ! pgrep -f "lerobot-train" >/dev/null; then
+    if pgrep -f "lerobot-train" >/dev/null; then
+        [ "$SEEN_TRAINING" = 1 ] || echo "[push] training is running"
+        SEEN_TRAINING=1
+    elif [ "$SEEN_TRAINING" = 0 ]; then
+        echo "[push] no trainer yet (still setting up?) — waiting, not concluding anything"
+    else
         pending=0
         for d in "$OUT"/checkpoints/[0-9]*/; do
             [ -d "$d" ] || continue
