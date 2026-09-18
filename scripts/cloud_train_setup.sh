@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
 # Bring a fresh cloud GPU box (RunPod H100 80GB, x86, CUDA 12.8+) up to a
-# running colour-sort training job.
+# running GR00T training job.
 #
 # Upload these to the pod first (see DEPLOY_TENSORRT.md for how the bundles are
 # made):
 #   lerobot.bundle                          self-contained clone, no network needed
-#   openarm_color_sort_all_300/             the 3-camera dataset (~3 GB)
-#   050000_3cam/                            optional warm-start checkpoint (12.6 GB)
+#   <dataset>/                              the 3-camera dataset (~3 GB)
+#   <checkpoint>/                           optional warm-start checkpoint (12.6 GB)
 #
-# Then:
+# Then, e.g. the caddy picker from scratch:
+#   bash cloud_train_setup.sh --scratch \
+#       --dataset ./openarm_caddy6_pick_all_300 \
+#       --repo-id local/openarm_caddy6_pick_all_300 \
+#       --out outputs/groot_caddy6_3cam --steps 50000
 #   bash cloud_train_setup.sh --warm-start ./050000_3cam
-#   bash cloud_train_setup.sh --scratch            # from the base model instead
 set -euo pipefail
 
 BUNDLE="${BUNDLE:-./lerobot.bundle}"
-DATASET_SRC="${DATASET_SRC:-./openarm_color_sort_all_300}"
-REPO_ID="local/openarm_color_sort_all_300"
-OUT="${OUT:-outputs/groot_color_3cam_aug}"
-STEPS="${STEPS:-20000}"
+DATASET_SRC="${DATASET_SRC:-./openarm_caddy6_pick_all_300}"
+REPO_ID="${REPO_ID:-local/openarm_caddy6_pick_all_300}"
+OUT="${OUT:-outputs/groot_caddy6_3cam}"
+STEPS="${STEPS:-50000}"
 BATCH="${BATCH:-16}"
+SAVE_FREQ="${SAVE_FREQ:-1000}"
+# Image augmentation is OFF by default. It exists to bridge sim-to-real
+# lighting, and this is a pure simulation study — and on the caddy task it
+# would be actively harmful, because the PAD COLOUR is what the prompt names:
+# at the default hue jitter of +-18 deg orange drifts toward red and yellow,
+# purple toward pink, i.e. the transform relabels the task.
+AUG_ON=0
 WARM=""
 MODE=""
 
@@ -28,6 +38,11 @@ while [ $# -gt 0 ]; do
         --scratch)    MODE=scratch; shift ;;
         --steps)      STEPS="$2"; shift 2 ;;
         --batch)      BATCH="$2"; shift 2 ;;
+        --dataset)    DATASET_SRC="$2"; shift 2 ;;
+        --repo-id)    REPO_ID="$2"; shift 2 ;;
+        --out)        OUT="$2"; shift 2 ;;
+        --save-freq)  SAVE_FREQ="$2"; shift 2 ;;
+        --augment)    AUG_ON=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -77,21 +92,21 @@ fi
 
 # --- augmentation ----------------------------------------------------------
 # Off on the Spark because the sharpness jitter's CPU depthwise conv crashes
-# oneDNN's aarch64 JIT. x86 has no such problem, so it goes on here — EXCEPT
-# the affine transform.
-#
-# RandomAffine rotates +-5 deg and translates up to 5% of the frame while
-# leaving the action labels untouched. For a fixed-camera manipulation policy
-# that is not augmentation, it is label noise: it teaches the model that the
-# same action is correct for a cube that appears somewhere else. This task
-# already fails on grasp precision, and needs the gripper placed within about a
-# centimetre, so a 5% frame shift is far larger than the error we are trying to
-# remove. Colour and sharpness jitter change appearance without moving
-# anything, which is the kind of invariance we actually want.
-AUG=(
-    --dataset.image_transforms.enable=true
-    --dataset.image_transforms.tfs.affine.weight=0.0
-)
+# oneDNN's aarch64 JIT crashes on the sharpness jitter, so the Spark never ran
+# augmentation; x86 has no such problem. --augment turns the tfs back on minus
+# the affine transform, which rotates +-5 deg and translates up to 5% of the
+# frame while leaving the action labels untouched: for a fixed-camera
+# manipulation policy that is not augmentation, it is label noise.
+if [ "$AUG_ON" = 1 ]; then
+    AUG=(
+        --dataset.image_transforms.enable=true
+        --dataset.image_transforms.tfs.affine.weight=0.0
+    )
+    echo "image augmentation ON (affine excluded)"
+else
+    AUG=(--dataset.image_transforms.enable=false)
+    echo "image augmentation OFF (simulation study; pad colour is the task cue)"
+fi
 
 set -x
 uv run lerobot-train \
@@ -102,6 +117,6 @@ uv run lerobot-train \
     --job_name="$(basename "$OUT")" \
     --batch_size="$BATCH" \
     --steps="$STEPS" \
-    --save_freq=1000 \
+    --save_freq="$SAVE_FREQ" \
     --checkpoint_keep_every=10000 \
     --log_freq=100

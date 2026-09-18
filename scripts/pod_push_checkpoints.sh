@@ -16,12 +16,21 @@
 #
 # Usage (on the pod):
 #   nohup bash scripts/pod_push_checkpoints.sh <hf-user>/<repo> > /workspace/push.log 2>&1 &
+#
+# When training has finished and everything is on the Hub, this STOPS THE POD
+# (set ON_DONE=terminate to delete it instead, ON_DONE=none to leave it up).
 set -uo pipefail
 
-REPO="${1:?usage: pod_push_checkpoints.sh <hf-user>/<repo-name> [output-dir] [interval-s] [keep-n]}"
-OUT="${2:-/workspace/lerobot/outputs/groot_color_3cam_aug}"
+REPO="${1:?usage: pod_push_checkpoints.sh <hf-user>/<repo-name> [output-dir] [interval-s] [keep-n] [min-step]}"
+OUT="${2:-/workspace/lerobot/outputs/groot_caddy6_3cam}"
 INTERVAL="${3:-120}"
-KEEP="${4:-2}"          # how many of the newest checkpoints to keep on the Hub
+KEEP="${4:-4}"          # how many of the newest checkpoints to keep on the Hub
+# Early checkpoints of a from-scratch run are never the one you deploy, and each
+# costs 12.6 GB of a 100 GB Hub quota. Below this step a checkpoint is skipped
+# and DELETED from the pod (freeing its ~24 GB, weights + optimiser state, so a
+# long run cannot fill the disk the way the 50k colour run did).
+MIN_STEP="${5:-${MIN_STEP:-40000}}"
+ON_DONE="${ON_DONE:-stop}"      # stop | terminate | none
 STATE="/workspace/.pushed_checkpoints"
 VENV="/workspace/lerobot/.venv/bin"
 
@@ -56,7 +65,40 @@ then
     exit 1
 fi
 
+# Stop (or delete) this pod. Nothing here ever sees a key we supply: runpodctl
+# on the pod image is already authenticated for its own pod, and RUNPOD_API_KEY
+# is only read if the pod was created with one in its environment. If neither
+# works the pod stays up and says so — the pod's own --stop-after backstop,
+# set at creation, is what guarantees it cannot bill forever.
+shut_down() {
+    case "$ON_DONE" in
+        none) echo "[push] ON_DONE=none — leaving the pod running"; return 0 ;;
+        terminate) verb=remove ;;
+        *) verb=stop ;;
+    esac
+    local pod="${RUNPOD_POD_ID:-}"
+    [ -n "$pod" ] || { echo "[push] RUNPOD_POD_ID not set — cannot $verb the pod; STOP IT YOURSELF" >&2; return 1; }
+    echo "[push] ${verb}ping pod $pod ..."
+    if command -v runpodctl >/dev/null && runpodctl "$verb" pod "$pod"; then
+        echo "[push] pod $verb requested via runpodctl"; return 0
+    fi
+    if [ -n "${RUNPOD_API_KEY:-}" ]; then
+        local url="https://rest.runpod.io/v1/pods/$pod/stop"
+        [ "$verb" = remove ] && url="https://rest.runpod.io/v1/pods/$pod"
+        if [ "$verb" = remove ]; then
+            curl -fsS -X DELETE "$url" -H "Authorization: Bearer $RUNPOD_API_KEY" && \
+                { echo "[push] pod deleted via REST"; return 0; }
+        else
+            curl -fsS -X POST "$url" -H "Authorization: Bearer $RUNPOD_API_KEY" && \
+                { echo "[push] pod stopped via REST"; return 0; }
+        fi
+    fi
+    echo "[push] COULD NOT $verb THE POD — it is still billing. Stop it from the console." >&2
+    return 1
+}
+
 echo "[push] watching $OUT every ${INTERVAL}s -> $REPO"
+echo "[push] min step to push: $MIN_STEP | keep newest $KEEP on the Hub | when done: $ON_DONE"
 while true; do
     if [ -d "$OUT/checkpoints" ]; then
         for d in "$OUT"/checkpoints/[0-9]*/; do
@@ -64,6 +106,13 @@ while true; do
             step=$(basename "$d")
             grep -qx "$step" "$STATE" && continue
             [ -f "$d/pretrained_model/model.safetensors" ] || continue
+            # Too early to be worth Hub storage: drop it from the pod instead.
+            if [ "$((10#$step))" -lt "$MIN_STEP" ]; then
+                echo "[push] $step < MIN_STEP $MIN_STEP — not pushing; freeing $(du -sh "$d" | cut -f1) on the pod"
+                echo "$step" >> "$STATE"
+                rm -rf "$d"
+                continue
+            fi
             # Only push once the file has stopped growing, or we ship a half-written checkpoint.
             s1=$(stat -c%s "$d/pretrained_model/model.safetensors")
             sleep 20
@@ -117,7 +166,11 @@ PY
             [ -d "$d" ] || continue
             grep -qx "$(basename "$d")" "$STATE" || pending=1
         done
-        [ "$pending" = 0 ] && { echo "[push] training finished, all checkpoints pushed"; exit 0; }
+        if [ "$pending" = 0 ]; then
+            echo "[push] training finished, all checkpoints pushed at $(date -Is)"
+            shut_down
+            exit 0
+        fi
     fi
     sleep "$INTERVAL"
 done
