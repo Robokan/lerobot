@@ -339,6 +339,99 @@ def run_color_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> d
     }
 
 
+def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
+                    stacks: int = 6) -> dict:
+    """Caddy picking (random_caddy_pick): stacks of identical brown bars on
+    coloured pads, prompt names one pad, the bar goes on the pile at the centre.
+
+    Success = the bar from the NAMED pad ends up on the pile and nothing else
+    moved. Two ways to fail that a cube task does not have: the policy can take
+    a bar from the wrong pad (the colour grounding failed) and it can knock a
+    neighbouring stack over. Both are reported separately, because "took the
+    right bar but fumbled it" and "took the wrong bar" need different fixes.
+    """
+    import random_caddy_pick as rc
+
+    rc.hide_legacy_pads(robot)
+    rcp.set_cube_xy(robot, -0.90, -0.90)
+    trial = None
+    for _ in range(8):
+        cand = rc.Trial(robot, rng, stacks)
+        if rc.grasp_plannable(robot, iks[cand.side], cand, rng):
+            trial = cand
+            break
+    if trial is None:
+        return {"reset": True, "success": None}
+    if not rc.safe_start_pose(robot, iks, trial, rng, fps):
+        return {"reset": True, "success": None}
+    for a in rcp.ARMS:
+        rcp._RETREAT_TARGET[a.side] = rcp.tuck_q(iks[a.side])
+
+    # The prompt is per-trial here, unlike the colour task's fixed string.
+    policy.task = trial.prompt
+    policy.reset()
+
+    target = trial.top_bar()
+    watch = trial.arranged_bars()
+    start = {i: rc.bar_pos(robot, i).copy() for i in watch}
+    travel = {"left": 0.0, "right": 0.0}
+    prev_q = {s_: rcp._arm_q_real(robot, iks[s_]) for s_ in ("left", "right")}
+    lifted = False
+    held = 0
+    success = False
+    t_success = None
+    reset = False
+
+    def on_pile(i: int) -> bool:
+        p = rc.bar_pos(robot, i)
+        return (float(np.linalg.norm(p[:2] - trial.place_xy)) < rc.PLACE_TOL
+                and abs(float(p[2]) - rc.bar_centre_z(trial.pile_n)) < 0.012)
+
+    for k in range(int(time_limit_s * fps)):
+        t0 = time.perf_counter()
+        if reset_requested():
+            reset = True
+            break
+        obs = robot.get_observation()
+        robot.send_action(policy.act(obs))
+        precise_sleep(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+        for s_ in ("left", "right"):
+            q = rcp._arm_q_real(robot, iks[s_])
+            travel[s_] += float(np.abs(q - prev_q[s_]).sum())
+            prev_q[s_] = q
+        if float(rc.bar_pos(robot, target)[2] - start[target][2]) > 0.04:
+            lifted = True
+        if on_pile(target):
+            held += 1
+            if held >= fps // 2:
+                success = True
+                t_success = (k + 1) / fps
+                break
+        else:
+            held = 0
+
+    # Which bars actually moved, and was the one it delivered the right one?
+    moved = [i for i in watch
+             if float(np.linalg.norm(rc.bar_pos(robot, i)[:2] - start[i][:2])) > 0.03]
+    delivered = [i for i in watch if i not in trial.pile_bars and on_pile(i)]
+    wrong_pad = bool(delivered) and target not in delivered
+    disturbed = [i for i in moved if i != target and i not in delivered]
+    return {
+        "reset": reset,
+        "success": bool(success and not disturbed),
+        "lifted_demo": lifted,
+        "t_success": t_success,
+        "cube_y": float(trial.stack_xy[trial.target][1]),
+        "colour": trial.colour,
+        "intended_arm": trial.side,
+        "committed_arm": max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none",
+        "wrong_pad": wrong_pad,
+        "knocked": bool(disturbed),
+        "pile_n": trial.pile_n,
+        "final_cube_z": float(rc.bar_pos(robot, target)[2]),
+    }
+
+
 def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str,
                      device: str = "cuda"):
     """Construct lerobot's real RTC engine around our policy + processors."""
@@ -601,8 +694,12 @@ def main() -> None:
     parser.add_argument("--time-limit", type=float, default=25.0)
     parser.add_argument("--task", default=None,
                         help="task prompt given to the policy (default: the generator's string for --task-mode)")
-    parser.add_argument("--task-mode", choices=["lift", "color"], default="lift",
-                        help="lift: pick up the cube (random_cube_pick); color: red/green cube onto its pad (random_color_pick)")
+    parser.add_argument("--task-mode", choices=["lift", "color", "caddy"], default="lift",
+                        help="lift: pick up the cube (random_cube_pick); color: red/green cube onto "
+                             "its pad (random_color_pick); caddy: bar from the named coloured pad "
+                             "onto the pile (random_caddy_pick)")
+    parser.add_argument("--stacks", type=int, default=6,
+                        help="caddy mode: pads on the arc; match the recorded data")
     parser.add_argument("--model-path", default=str(Path.home() / "sparkpack/openarm_mujoco/v1/scene.xml"))
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument(
@@ -659,13 +756,15 @@ def main() -> None:
     if args.tucked_prob is not None:
         rcp.TUCKED_START_PROB = float(args.tucked_prob)
     if args.task is None:
-        if args.task_mode == "color":
+        if args.task_mode == "caddy":
+            args.task = "get bar from red pad"  # placeholder; set per trial from the prompt
+        elif args.task_mode == "color":
             import random_color_pick as rcol
 
             args.task = rcol.TASK
         else:
             args.task = "pick up the red cube and lift it"
-    if args.task_mode == "color" and args.jit:
+    if args.task_mode in ("color", "caddy") and args.jit:
         parser.error("--task-mode color is implemented for the synchronous and --rtc paths only")
     if args.trt_socket:
         # The RTC engine calls policy.predict_action_chunk directly, which
@@ -757,6 +856,8 @@ def main() -> None:
                           f"rtc t={t_used:.1f}s cube_z={cz:.3f}")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
+            elif args.task_mode == "caddy":
+                r = run_caddy_trial(robot, iks, rng, policy, args.fps, args.time_limit, args.stacks)
             elif args.task_mode == "color":
                 r = run_color_trial(robot, iks, rng, policy, args.fps, args.time_limit)
             else:
@@ -798,7 +899,17 @@ def main() -> None:
                 1 for r in results if r["committed_arm"] not in (r["intended_arm"], "none")
             )
             print(f"  arm-selection mismatches (committed != scripted choice): {wrong}/{n}")
-            if args.task_mode == "color":
+            if args.task_mode == "caddy":
+                print(f"  took a bar from the WRONG pad: {sum(1 for r in results if r.get('wrong_pad'))}/{n}")
+                print(f"  knocked another bar over:      {sum(1 for r in results if r.get('knocked'))}/{n}")
+                for colour in sorted({r.get("colour") for r in results if r.get("colour")}):
+                    grp = [r for r in results if r.get("colour") == colour]
+                    print(f"  {colour:7s}: {sum(r['success'] for r in grp)}/{len(grp)}")
+                for lo, hi, label in ((0, 0, "empty"), (1, 2, "1-2 bars"), (3, 9, "3+ bars")):
+                    grp = [r for r in results if lo <= r.get("pile_n", -1) <= hi]
+                    if grp:
+                        print(f"  pile {label:8s}: {sum(r['success'] for r in grp)}/{len(grp)}")
+            elif args.task_mode == "color":
                 for colour in ("red", "green"):
                     grp = [r for r in results if r.get("colour") == colour]
                     if grp:
