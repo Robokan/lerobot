@@ -849,6 +849,51 @@ def run_trial(robot, iks, fps: int, trial: Trial, rng: np.random.Generator) -> b
 
 
 STACK_KEEPOUT_M = 0.10  # a starting hand stays this far (xy) from every stack, unless well above it
+
+# --- where a "random" start actually goes -----------------------------------
+# The cube picker's random start samples its arm's whole workspace box, which
+# for this scene means mostly the FAR half of the table — exactly where the
+# pads and stacks are. hand_clear_of_stacks then rejects those draws, while the
+# park-plus-jitter branch inside rcp._random_start_q is always clear and always
+# survives. The filter therefore eats precisely the starts that look different,
+# and measured over a real run only 14% of episodes began with the gripper more
+# than 15 cm from its rest pose, against a nominal 25%.
+#
+# So draw random starts from a ring that is clear of the stacks BY CONSTRUCTION:
+# nearer the robot than the pad arc (0.48 m), on the working arm's own side so
+# it avoids the pile on the centreline, and high enough to clear the table.
+CADDY_TUCKED_START_PROB = 0.60      # 40% random, vs the cube picker's 25%
+RANDOM_START_RADIUS = (0.20, 0.36)  # vs ARC_RADIUS 0.48
+RANDOM_START_AZIM_DEG = (8.0, 55.0)  # from the centreline, on the arm's own side
+RANDOM_START_Z = (0.46, 0.64)
+# ...and it must LOOK different: the tuck tip sits at radius 0.36 / azimuth 34,
+# inside the ring above, so without this most "random" draws landed within a few
+# centimetres of the rest pose and were indistinguishable on screen.
+RANDOM_START_MIN_FROM_TUCK_M = 0.18
+
+
+def caddy_random_start_q(ik, arm, rng: np.random.Generator) -> np.ndarray:
+    """A visibly-elsewhere start pose that survives the stack clearance test."""
+    sign = 1.0 if arm.side == "left" else -1.0
+    for _ in range(20):
+        r = float(rng.uniform(*RANDOM_START_RADIUS))
+        th = sign * math.radians(float(rng.uniform(*RANDOM_START_AZIM_DEG)))
+        tip = np.array([r * math.cos(th), r * math.sin(th), float(rng.uniform(*RANDOM_START_Z))])
+        q0 = rcp.plan_q_to_tip_mid(ik, np.deg2rad(arm.idle_deg), rcp.clamp_tip_target(tip),
+                                   max_iters=800, tol=0.02, yaw=0.0)
+        if q0 is None:
+            continue
+        q = np.clip(q0 + rcp._random_start_offsets(rng), ik.lo, ik.hi)
+        ik.set_q(q)
+        if float(ik.tip_mid()[2]) <= TABLE_TOP_Z + 0.08:
+            continue
+        got = ik.tip_mid().copy()
+        ik.set_q(rcp.tuck_q(ik))
+        far_enough = float(np.linalg.norm(got - ik.tip_mid())) >= RANDOM_START_MIN_FROM_TUCK_M
+        ik.set_q(q)
+        if far_enough:
+            return q
+    return np.clip(rcp.jittered_tuck(arm, rng, ik), ik.lo, ik.hi)
 # In deployment the next pick starts wherever the last drop ended, so most
 # episodes begin from the previous episode's final pose; the rest from the cube
 # picker's random starts, for variety.
@@ -866,7 +911,10 @@ def draw_start_poses(ik, other_ik, rng: np.random.Generator, tucked_prob: float)
             q = np.clip(rcp.jittered_tuck(ik_.arm, rng, ik_), ik_.lo, ik_.hi)
             g = float(rng.uniform(0.0, 0.006))
         else:
-            q = rcp._random_start_q(ik_, ik_.arm, rng)
+            # NOT rcp._random_start_q: a quarter of its draws are the park pose
+            # plus jitter (indistinguishable from tucked) and the rest land over
+            # the stacks and get rejected. See caddy_random_start_q.
+            q = caddy_random_start_q(ik_, ik_.arm, rng)
             g = float(rng.uniform(0.0, rcp.FINGER_OPEN_M))
         return q, g, tucked
 
@@ -930,7 +978,7 @@ def safe_start_pose(robot, iks, trial: Trial, rng: np.random.Generator, fps: int
     tops = [(np.array(xy), stack_top_z(sz)) for xy, sz in zip(trial.stack_xy, trial.sizes, strict=True)]
     tops.append((DROP_XY.copy(), stack_top_z(trial.pile_n)))
     for attempt in range(12):
-        prob = rcp.TUCKED_START_PROB if attempt < 8 else 1.0
+        prob = CADDY_TUCKED_START_PROB if attempt < 8 else 1.0
         (q_a, g_a, tucked_a), (q_o, g_o, tucked_o) = draw_start_poses(ik, other_ik, rng, prob)
         if not (hand_clear_of_stacks(ik, q_a, tops) and hand_clear_of_stacks(other_ik, q_o, tops)):
             continue
