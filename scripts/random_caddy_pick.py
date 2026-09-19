@@ -154,13 +154,6 @@ def approach_grip(progress: float) -> float:
     return _GRIP["cmd"]
 
 PAD_HALF_XY = 0.045
-# A vertical plate at the far edge of each pad, facing the robot. The pad alone
-# is nearly covered by the bar on it: measured in the policy's own 256x256 chest
-# view, a coloured pad came to 8-56 pixels, so the cue the prompt names was
-# effectively invisible. The plate gives the colour real area without a
-# container the gripper would have to reach into.
-BAK_HALF = (0.05, 0.004, 0.035)   # 10 x 0.8 x 7 cm
-BAK_PARK = (-0.9, 0.0, -0.5)
 PAD_Z = TABLE_TOP_Z + 0.0015  # 3 mm slab, visual only
 PAD_PARK = (-0.9, 0.0, -0.5)  # unused pads hide under the floor
 WAREHOUSE = [(-0.55, -0.66 + 0.12 * i, 0.0135) for i in range(MAX_BARS)]
@@ -220,34 +213,19 @@ def bar_pos(robot, i: int) -> np.ndarray:
 
 def set_pad(robot, i: int, xy: tuple[float, float] | None, rgba=None, half_xy: float = PAD_HALF_XY,
             yaw: float = 0.0) -> None:
-    """Place (or park, with xy=None) and colour pad geom ``cpad_i`` and its
-    backplate ``cbak_i``. ``yaw`` is the slot's radial angle: the plate goes at
-    the far edge, its face normal pointing back at the robot."""
+    """Place (or park, with xy=None) and colour visual pad geom ``cpad_i``.
+    ``yaw`` is accepted and ignored; the pad is square and axis-agnostic."""
     import mujoco
 
     m = robot._model
     gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"cpad_{i}")
-    bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"cbak_{i}")
     if xy is None:
         m.geom_pos[gid] = PAD_PARK
-        if bid >= 0:
-            m.geom_pos[bid] = BAK_PARK
     else:
         m.geom_pos[gid] = [xy[0], xy[1], PAD_Z]
         m.geom_size[gid] = [half_xy, half_xy, 0.0015]
-        if bid >= 0:
-            # far edge = one pad-half further out along the slot's radial line
-            off = half_xy + BAK_HALF[1]
-            m.geom_pos[bid] = [xy[0] + off * math.cos(yaw), xy[1] + off * math.sin(yaw),
-                               TABLE_TOP_Z + BAK_HALF[2]]
-            m.geom_size[bid] = list(BAK_HALF)
-            # rotate about z so the plate faces the robot
-            c, s_ = math.cos(yaw), math.sin(yaw)
-            m.geom_quat[bid] = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
     if rgba is not None:
         m.geom_rgba[gid] = rgba
-        if bid >= 0:
-            m.geom_rgba[bid] = rgba
 
 
 def hide_legacy_pads(robot) -> None:
