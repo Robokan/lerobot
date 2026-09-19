@@ -29,6 +29,9 @@ SAVE_FREQ="${SAVE_FREQ:-1000}"
 # at the default hue jitter of +-18 deg orange drifts toward red and yellow,
 # purple toward pink, i.e. the transform relabels the task.
 AUG_ON=0
+EXTRA_ARGS=()
+POLICY="${POLICY:-groot}"      # groot | pi05
+LORA=0                          # pi05 only: LoRA (PEFT) instead of a full finetune
 WARM=""
 MODE=""
 
@@ -43,6 +46,8 @@ while [ $# -gt 0 ]; do
         --out)        OUT="$2"; shift 2 ;;
         --save-freq)  SAVE_FREQ="$2"; shift 2 ;;
         --augment)    AUG_ON=1; shift ;;
+        --policy)     POLICY="$2"; shift 2 ;;
+        --lora)       LORA=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -84,6 +89,34 @@ fi
 if [ "$MODE" = warm ]; then
     POLICY_ARGS=(--policy.path="$WARM")
     echo "warm start from $WARM"
+elif [ "$POLICY" = pi05 ]; then
+    # pi0.5: PaliGemma 2B + a Gemma 300M action expert. chunk_size stays at the
+    # 50 it was pretrained with — changing it reshapes the action expert and
+    # throws away the pretrained head — while n_action_steps controls how many
+    # of those 50 we actually execute before re-planning.
+    POLICY_ARGS=(
+        --policy.type=pi05
+        --policy.pretrained_path=lerobot/pi05_base
+        --policy.chunk_size=50
+        --policy.n_action_steps=16
+        --policy.freeze_vision_encoder=false
+        --policy.train_expert_only=false
+        --policy.gradient_checkpointing=true
+        --policy.dtype=bfloat16
+        --policy.push_to_hub=false
+        --policy.device=cuda
+    )
+    if [ "$LORA" = 1 ]; then
+        # LoRA is a TOP-LEVEL --peft.* config, not --policy.use_peft: the latter
+        # means "resume an existing adapter" and looks for adapter_config.json
+        # in the pretrained path, which a base checkpoint does not have.
+        # target_modules defaults to pi0.5's own (gemma expert q/v plus the
+        # state and action projections), so it need not be named here.
+        EXTRA_ARGS+=(--peft.r=16 --peft.lora_alpha=32)
+        echo "pi0.5 from lerobot/pi05_base, LoRA r=16 alpha=32"
+    else
+        echo "pi0.5 from lerobot/pi05_base, full finetune"
+    fi
 else
     POLICY_ARGS=(
         --policy.type=groot
@@ -97,7 +130,7 @@ else
         --policy.push_to_hub=false
         --policy.device=cuda
     )
-    echo "training from the base model"
+    echo "GR00T N1.7 from the base model"
 fi
 
 # --- augmentation ----------------------------------------------------------
@@ -121,6 +154,7 @@ fi
 set -x
 uv run lerobot-train \
     "${POLICY_ARGS[@]}" \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
     --dataset.repo_id="$REPO_ID" \
     "${AUG[@]}" \
     --output_dir="$OUT" \
