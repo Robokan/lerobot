@@ -32,6 +32,8 @@ MIN_STEP=40000        # checkpoints below this are skipped and deleted on the po
 KEEP=4                # newest checkpoints kept on the Hub
 BATCH=16
 AUGMENT=0
+POLICY=groot          # groot | pi05
+LORA=0                # pi05 only: LoRA instead of a full finetune
 GPUS=("NVIDIA H100 80GB HBM3" "NVIDIA H100 NVL" "NVIDIA H100 PCIe")
 IMAGE="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 VOLUME=200
@@ -49,6 +51,8 @@ while [ $# -gt 0 ]; do
         --keep)       KEEP="$2"; shift 2 ;;
         --batch)      BATCH="$2"; shift 2 ;;
         --augment)    AUGMENT=1; shift ;;
+        --policy)     POLICY="$2"; shift 2 ;;
+        --lora)       LORA=1; shift ;;
         --volume)     VOLUME="$2"; shift 2 ;;
         --max-hours)  MAX_HOURS="$2"; shift 2 ;;
         --dry-run)    DRY=1; shift ;;
@@ -165,13 +169,14 @@ PY" || { say "token cannot do the job — stopping the pod"; "$RUNPODCTL" stop p
 
 # --- 3. training, pusher, watchdog ----------------------------------------
 AUG_FLAG=""; [ "$AUGMENT" = 1 ] && AUG_FLAG="--augment"
-say "starting training: $STEPS steps"
+POL_FLAGS="--policy $POLICY"; [ "$LORA" = 1 ] && POL_FLAGS="$POL_FLAGS --lora"
+say "starting training: $STEPS steps, policy $POLICY$([ "$LORA" = 1 ] && echo ' (LoRA)')"
 # From /workspace, not /workspace/lerobot: cloud_train_setup.sh expects the
 # bundle and the clone as siblings of its working directory.
 $SSH "cd /workspace && export PATH=\$HOME/.local/bin:\$PATH && \
       nohup bash /workspace/cloud_train_setup.sh --scratch --repo-id '$HF_DATASET' \
         --dataset /pull-from-hub --out outputs/$OUT --steps $STEPS --batch $BATCH \
-        --save-freq 1000 $AUG_FLAG > /workspace/train.log 2>&1 & sleep 5; echo ok" || exit 1
+        --save-freq 1000 $AUG_FLAG $POL_FLAGS > /workspace/train.log 2>&1 & sleep 5; echo ok" || exit 1
 
 say "starting the checkpoint pusher (skip < $MIN_STEP, keep $KEEP, stop the pod when done)"
 $SSH "cd /workspace && MIN_STEP=$MIN_STEP ON_DONE=stop \
