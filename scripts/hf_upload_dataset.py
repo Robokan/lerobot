@@ -31,6 +31,12 @@ def main() -> int:
     ap.add_argument("--to", required=True, help="Hub repo, e.g. evaughan69/openarm_caddy6_pick_all_300")
     ap.add_argument("--root", default=os.environ.get("HF_LEROBOT_HOME", str(Path.home() / ".cache/huggingface/lerobot")))
     ap.add_argument("--public", action="store_true", help="create the repo public (default private)")
+    ap.add_argument("--xet", action="store_true",
+                    help="use the Hub's xet backend. Off by default: it has now hung or "
+                         "dropped on this link twice, once silently with the process asleep "
+                         "on an open socket and no timeout, which no retry loop can catch.")
+    ap.add_argument("--timeout", type=int, default=900,
+                    help="seconds without progress before giving up on an attempt")
     ap.add_argument("--retries", type=int, default=8,
                     help="attempts before giving up; a long upload over a home link "
                          "reliably meets at least one transient Hub error")
@@ -47,6 +53,11 @@ def main() -> int:
     print(f"{src}\n  {info['total_episodes']} episodes, {info['total_frames']} frames, "
           f"{info['fps']} fps, cameras {cams}, {size / 1e9:.2f} GB")
 
+    if not args.xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        print("  xet disabled (pass --xet to re-enable)")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(args.timeout))
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(args.timeout))
     api = HfApi()
     api.create_repo(args.to, repo_type="dataset", private=not args.public, exist_ok=True)
     print(f"uploading to {args.to} (private={not args.public})", flush=True)
@@ -54,9 +65,6 @@ def main() -> int:
         # Xet is the Hub's newer content-addressed backend and it is where the
         # drops happen; after a couple of failures fall back to plain LFS, which
         # is slower but has not dropped on this link.
-        if attempt == 3:
-            os.environ["HF_HUB_DISABLE_XET"] = "1"
-            print("  switching off xet for the remaining attempts", flush=True)
         try:
             api.upload_folder(repo_id=args.to, repo_type="dataset", folder_path=str(src),
                               commit_message=f"{info['total_episodes']} episodes, {info['total_frames']} frames")
