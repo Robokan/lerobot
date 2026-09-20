@@ -63,6 +63,10 @@ done
 for v in DATASET HF_DATASET HF_CKPT OUT; do
     [ -n "${!v}" ] || { echo "missing --${v,,} " | tr '_' '-' >&2; exit 2; }
 done
+# The Hub's xet backend has now hung twice on this link: the process sleeps on
+# an open socket with no CPU, no I/O and no exception, so no retry or timeout
+# catches it. Everything here uses plain LFS. Set HF_HUB_DISABLE_XET=0 to opt in.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 STATE="${STATE:-$HOME/.cache/cloud_launch}"
 mkdir -p "$STATE"
 say() { echo "$(date +%H:%M:%S) $*"; }
