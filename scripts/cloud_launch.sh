@@ -188,7 +188,7 @@ $SSH "set -e
 cd /workspace
 curl -fsSL -H \"Authorization: Bearer \$HF_TOKEN\" \
   'https://huggingface.co/datasets/$HF_DATASET/resolve/main/code/lerobot.bundle' -o lerobot.bundle
-git bundle verify /workspace/lerobot.bundle >/dev/null
+head -c 32 /workspace/lerobot.bundle | grep -q 'git bundle'   # not 'git bundle verify': that needs to be run INSIDE a repo
 rm -rf lerobot && git clone -q -b main /workspace/lerobot.bundle lerobot
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=\$HOME/.local/bin:\$PATH
