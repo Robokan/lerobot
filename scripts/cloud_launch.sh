@@ -125,12 +125,22 @@ for gpu in "${GPUS[@]}"; do
 done
 [ -n "$POD" ] || { say "no pod could be created on any GPU — nothing spent"; exit 1; }
 say "pod $POD is up — BILLING STARTS NOW"
+# From here on, ANY failure must stop the pod. Without this a broken step just
+# exits the script and leaves an idle GPU running: a bad bundle download once
+# cost 18 hours and $64 because the script exited and nothing stopped the pod.
+die() {
+    say "FAILED: $*"
+    say "stopping pod $POD"
+    "$RUNPODCTL" pod stop "$POD" 2>&1 | tail -1 ||         say "COULD NOT STOP $POD — STOP IT YOURSELF: runpodctl pod stop $POD"
+    exit 1
+}
+trap 'die "unexpected error on line $LINENO"' ERR
 echo "$POD" > "$STATE/pod_id"
 
 read -r IP PORT KEY < <("$RUNPODCTL" ssh info "$POD" | "$PY" -c \
     'import json,sys;d=json.load(sys.stdin);print(d["ip"],d["port"],d["key"]["path"] if isinstance(d.get("key"),dict) else d["path"])' 2>/dev/null) \
     || read -r IP PORT KEY < <("$RUNPODCTL" ssh info "$POD" | tr ',' '\n' | grep -oE '"(ip|port|path)": ?"?[^",]*' | cut -d: -f2- | tr -d ' "' | tr '\n' ' ')
-[ -n "${IP:-}" ] || { say "could not read ssh info for $POD — STOP IT YOURSELF"; exit 1; }
+[ -n "${IP:-}" ] || die "could not read ssh info for $POD"
 printf '%s\n' "$IP" "$PORT" "$KEY" > "$STATE/pod_ssh"
 # Runpod keeps the container env (including the substituted HF_TOKEN) in
 # /etc/rp_environment, sourced only by an INTERACTIVE shell. A plain
@@ -140,22 +150,26 @@ SCP="scp -i $KEY -P $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
 
 say "checking the secret reached the container"
 $SSH 'test -n "$HF_TOKEN" && [ "${HF_TOKEN#*RUNPOD_SECRET}" = "$HF_TOKEN" ]' || {
-    say "HF_TOKEN missing or unsubstituted — create the Runpod secret named HF_TOKEN. Stopping the pod."
-    "$RUNPODCTL" stop pod "$POD"; exit 3; }
+    die "HF_TOKEN missing or unsubstituted — create the Runpod secret named HF_TOKEN"; }
 
 say "pulling code and building the venv (~10 min)"
 $SCP "$SPARK/lerobot/scripts/cloud_train_setup.sh" "$SPARK/lerobot/scripts/pod_push_checkpoints.sh" \
-     "root@$IP:/workspace/" || exit 1
+     "root@$IP:/workspace/" || die "could not copy the setup scripts"
 # -b main matters: a bundle made from a branch carries no HEAD ref, and a plain
 # clone of one leaves an EMPTY working tree.
+# -f so an HTTP error is an error: without it curl writes the error BODY into
+# the file and the next step fails with "does not look like a v2 or v3 bundle".
+# And the header must be in DOUBLE quotes — in single quotes \$HF_TOKEN stays
+# literal, the request 401s, and you get exactly that corrupt "bundle".
 $SSH "set -e
 cd /workspace
-curl -sL -H 'Authorization: Bearer \$HF_TOKEN' \
+curl -fsSL -H \"Authorization: Bearer \$HF_TOKEN\" \
   'https://huggingface.co/datasets/$HF_DATASET/resolve/main/code/lerobot.bundle' -o lerobot.bundle
+git bundle verify /workspace/lerobot.bundle >/dev/null
 rm -rf lerobot && git clone -q -b main /workspace/lerobot.bundle lerobot
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=\$HOME/.local/bin:\$PATH
-cd lerobot && uv sync --locked --extra dataset --extra training --extra core_scripts --extra groot 2>&1 | tail -2" || exit 1
+cd lerobot && uv sync --locked --extra dataset --extra training --extra core_scripts --extra groot 2>&1 | tail -2" || die "code pull or venv build failed"
 
 say "proving the token can read the dataset and write checkpoints"
 $SSH "cd /workspace/lerobot && .venv/bin/python - <<PY
@@ -165,7 +179,7 @@ api = HfApi(token=os.environ['HF_TOKEN'])
 api.create_repo('$HF_CKPT', private=True, exist_ok=True)
 n = len(api.list_repo_files('$HF_DATASET', repo_type='dataset'))
 print(f\"hf {api.whoami()['name']} | write OK | dataset {n} files\")
-PY" || { say "token cannot do the job — stopping the pod"; "$RUNPODCTL" stop pod "$POD"; exit 3; }
+PY" || die "the token cannot read the dataset or write the checkpoint repo"
 
 # --- 3. training, pusher, watchdog ----------------------------------------
 AUG_FLAG=""; [ "$AUGMENT" = 1 ] && AUG_FLAG="--augment"
@@ -176,13 +190,14 @@ say "starting training: $STEPS steps, policy $POLICY$([ "$LORA" = 1 ] && echo ' 
 $SSH "cd /workspace && export PATH=\$HOME/.local/bin:\$PATH && \
       nohup bash /workspace/cloud_train_setup.sh --scratch --repo-id '$HF_DATASET' \
         --dataset /pull-from-hub --out outputs/$OUT --steps $STEPS --batch $BATCH \
-        --save-freq 1000 $AUG_FLAG $POL_FLAGS > /workspace/train.log 2>&1 & sleep 5; echo ok" || exit 1
+        --save-freq 1000 $AUG_FLAG $POL_FLAGS > /workspace/train.log 2>&1 & sleep 5; echo ok" || die "training did not start"
 
 say "starting the checkpoint pusher (skip < $MIN_STEP, keep $KEEP, stop the pod when done)"
 $SSH "cd /workspace && MIN_STEP=$MIN_STEP ON_DONE=stop \
       nohup bash /workspace/pod_push_checkpoints.sh '$HF_CKPT' \
       /workspace/lerobot/outputs/$OUT 180 $KEEP $MIN_STEP > /workspace/push.log 2>&1 & sleep 2; echo ok"
 
+trap - ERR      # training is running; the watchdog owns the pod from here
 FINAL=$(printf '%06d' "$STEPS")
 say "starting the local watchdog (stops the pod on checkpoint $FINAL, or after ${MAX_HOURS}h)"
 setsid nohup "$SPARK/lerobot/scripts/pod_autostop_watchdog.sh" "$POD" "$HF_CKPT" "$FINAL" "$MAX_HOURS" \
