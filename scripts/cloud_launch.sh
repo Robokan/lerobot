@@ -150,10 +150,20 @@ die() {
 trap 'die "unexpected error on line $LINENO"' ERR
 echo "$POD" > "$STATE/pod_id"
 
-read -r IP PORT KEY < <("$RUNPODCTL" ssh info "$POD" | "$PY" -c \
-    'import json,sys;d=json.load(sys.stdin);print(d["ip"],d["port"],d["key"]["path"] if isinstance(d.get("key"),dict) else d["path"])' 2>/dev/null) \
-    || read -r IP PORT KEY < <("$RUNPODCTL" ssh info "$POD" | tr ',' '\n' | grep -oE '"(ip|port|path)": ?"?[^",]*' | cut -d: -f2- | tr -d ' "' | tr '\n' ' ')
-[ -n "${IP:-}" ] || die "could not read ssh info for $POD"
+# Grep, not a JSON shape I have not verified: the previous version assumed
+# d["key"]["path"] and blew up on the ERR trap one second after the pod came
+# up. And retry — `pod create --wait` returns when port 22 answers, but
+# `ssh info` can still 404 for a few seconds after that.
+IP=""; PORT=""; KEY=""
+for _try in $(seq 1 20); do
+    info=$("$RUNPODCTL" ssh info "$POD" 2>/dev/null) || true
+    IP=$(echo "$info"   | grep -oE '"ip": "[^"]*"'   | cut -d'"' -f4)
+    PORT=$(echo "$info" | grep -oE '"port": [0-9]*'  | awk '{print $2}')
+    KEY=$(echo "$info"  | grep -oE '"path": "[^"]*"' | cut -d'"' -f4)
+    [ -n "$IP" ] && [ -n "$PORT" ] && [ -n "$KEY" ] && break
+    sleep 10
+done
+[ -n "$IP" ] && [ -n "$PORT" ] && [ -n "$KEY" ] || die "could not read ssh info for $POD after 20 tries"
 printf '%s\n' "$IP" "$PORT" "$KEY" > "$STATE/pod_ssh"
 # Runpod keeps the container env (including the substituted HF_TOKEN) in
 # /etc/rp_environment, sourced only by an INTERACTIVE shell. A plain
