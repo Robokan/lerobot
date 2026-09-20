@@ -76,6 +76,32 @@ Checkpoints appear at `https://huggingface.co/<hf-ckpt>`. Anything below
 `--min-step` is never uploaded and is deleted from the pod, which is what keeps
 a long run from filling the disk.
 
+## How it stops — and what stops it when everything goes wrong
+
+**A pod ran idle for 18 hours and cost $64 on 2026-09-19.** The launcher's
+bundle download failed, the script hit `|| exit 1`, and exiting a script does
+not stop a pod. Nothing else was watching, because the watchdog was only armed
+after training started. Three layers now exist so that cannot recur, and none of
+them depends on the layer above being correct:
+
+| layer | covers | how |
+|---|---|---|
+| `die()` in `cloud_launch.sh` | a step fails between pod creation and training | stops the pod, then exits; an `ERR` trap catches unexpected failures too |
+| `pod_autostop_watchdog.sh` | the launcher itself dies, or training stalls | armed at pod CREATION, before any setup. Stops the pod if training is not running within 45 min, if its log stops growing for 25 min, if training exits, at the final checkpoint, or at the hard cap |
+| `pod_guard.sh` | the watchdog was killed, the box rebooted, a pod was made by hand | cron every 15 min; stops ANY pod with no training process for 45 min, knowing nothing about any particular run |
+
+Install the last one once:
+
+```bash
+crontab -e
+*/15 * * * * $HOME/sparkpack/lerobot/scripts/pod_guard.sh --enforce >> $HOME/pod_guard.log 2>&1
+```
+
+The principle: **a pod is stopped by default, and only repeated positive
+evidence of healthy training keeps it alive.** Absence of evidence — an
+unreachable pod, a missing log, a dead watchdog — stops it. A wrongly stopped
+pod costs one restarted run; a wrongly running one costs dollars per hour.
+
 ## How it stops
 
 Two independent mechanisms, because neither alone is trustworthy:

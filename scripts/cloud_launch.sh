@@ -125,6 +125,15 @@ for gpu in "${GPUS[@]}"; do
 done
 [ -n "$POD" ] || { say "no pod could be created on any GPU — nothing spent"; exit 1; }
 say "pod $POD is up — BILLING STARTS NOW"
+# Arm the dead-man's switch FIRST, before any setup step can fail. It stops the
+# pod unless it sees training running within its grace period, so a bug
+# anywhere below cannot leave a GPU billing. This ordering is the fix for the
+# 18-hour, $64 idle pod.
+FINAL=$(printf '%06d' "$STEPS")
+setsid nohup "$SPARK/lerobot/scripts/pod_autostop_watchdog.sh" "$POD" "$HF_CKPT" "$FINAL" "$MAX_HOURS" \
+    > "$STATE/watchdog.log" 2>&1 < /dev/null &
+disown
+say "watchdog armed (grace 45m, stall 25m, cap ${MAX_HOURS}h) -> $STATE/watchdog.log"
 # From here on, ANY failure must stop the pod. Without this a broken step just
 # exits the script and leaves an idle GPU running: a bad bundle download once
 # cost 18 hours and $64 because the script exited and nothing stopped the pod.
@@ -197,12 +206,7 @@ $SSH "cd /workspace && MIN_STEP=$MIN_STEP ON_DONE=stop \
       nohup bash /workspace/pod_push_checkpoints.sh '$HF_CKPT' \
       /workspace/lerobot/outputs/$OUT 180 $KEEP $MIN_STEP > /workspace/push.log 2>&1 & sleep 2; echo ok"
 
-trap - ERR      # training is running; the watchdog owns the pod from here
-FINAL=$(printf '%06d' "$STEPS")
-say "starting the local watchdog (stops the pod on checkpoint $FINAL, or after ${MAX_HOURS}h)"
-setsid nohup "$SPARK/lerobot/scripts/pod_autostop_watchdog.sh" "$POD" "$HF_CKPT" "$FINAL" "$MAX_HOURS" \
-    > "$STATE/watchdog.log" 2>&1 < /dev/null &
-disown
+trap - ERR      # training is running; the watchdog (armed at creation) owns the pod
 
 cat <<EOF
 
