@@ -41,7 +41,7 @@ for p in json.load(sys.stdin):
     if [ -n "$ip" ] && [ -n "$port" ] && [ -n "$key" ]; then
         out=$(ssh -i "$key" -p "$port" -o ConnectTimeout=15 -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null "root@$ip" \
-              'pgrep -fc "lerobot-train|python.*train" || true' 2>/dev/null)
+              'pgrep -fc "[l]erobot-train|[p]ython.*train" || true' 2>/dev/null)
         [[ "$out" =~ ^[0-9]+$ ]] && alive=$out
     fi
     mark="$STATE_DIR/$id.idle_since"

@@ -89,8 +89,20 @@ while true; do
     [ "$now" -ge "$deadline" ] && stop_pod "hard cap of ${MAX_H}h reached"
 
     # Is training alive, and is its log still growing?
-    alive=$(ssh_to_pod 'pgrep -fc lerobot-train || true')
+    #
+    # '[l]erobot-train', not 'lerobot-train': the ssh command line carries the
+    # pattern onto the pod, so a plain pgrep -f MATCHES ITSELF and reports
+    # training running when nothing is. That misfire once stopped a pod in the
+    # middle of a healthy venv build — pgrep said "alive", train.log did not
+    # exist yet, and the stall timer ran out. The bracket makes the pattern not
+    # match its own literal text.
+    alive=$(ssh_to_pod 'pgrep -fc "[l]erobot-train" || true')
     size=$(ssh_to_pod 'stat -c%s /workspace/train.log 2>/dev/null || echo -1')
+    # Setup has not reached training yet; that is what the grace period is for,
+    # and the stall timer must not run during it.
+    if [ "$size" = "-1" ] && [ "$seen_training" = 0 ]; then
+        alive=0
+    fi
     [[ "$alive" =~ ^[0-9]+$ ]] || alive=0
     [[ "$size"  =~ ^-?[0-9]+$ ]] || size=-1
 
