@@ -31,7 +31,11 @@ MAX_H="${4:-12}"
 RUNPODCTL="${RUNPODCTL:-$HOME/.local/bin/runpodctl}"
 PY="${PY:-$HOME/sparkpack/lerobot/.venv/bin/python}"
 INTERVAL="${INTERVAL:-180}"
-GRACE_MIN="${GRACE_MIN:-45}"     # setup (image pull, bundle, uv sync) must finish inside this
+# Setup must show PROGRESS, not finish, inside this. A venv build with the pi
+# and peft extras ran past 45 minutes and a fixed deadline killed it mid-install,
+# so the timer resets whenever the venv grows. A build that is genuinely wedged
+# stops growing and still dies.
+GRACE_MIN="${GRACE_MIN:-30}"
 STALL_MIN="${STALL_MIN:-25}"     # training may go this long without the log growing
 
 deadline=$(( $(date +%s) + MAX_H * 3600 ))
@@ -39,6 +43,7 @@ grace_until=$(( $(date +%s) + GRACE_MIN * 60 ))
 seen_training=0
 last_log_size=-1
 last_growth=$(date +%s)
+last_venv_size=-1
 
 echo "[watchdog] pod $POD | grace ${GRACE_MIN}m | stall ${STALL_MIN}m | cap ${MAX_H}h | final $FINAL"
 
@@ -102,6 +107,15 @@ while true; do
     # and the stall timer must not run during it.
     if [ "$size" = "-1" ] && [ "$seen_training" = 0 ]; then
         alive=0
+        # Still installing? Then it is making progress and the grace period is
+        # extended. Only a build that has STOPPED growing runs out of time.
+        venv=$(ssh_to_pod 'du -sb /workspace/lerobot/.venv 2>/dev/null | cut -f1 || echo 0')
+        [[ "$venv" =~ ^[0-9]+$ ]] || venv=0
+        if [ "$venv" -gt "$last_venv_size" ]; then
+            [ "$last_venv_size" -ge 0 ] && echo "[watchdog] setup progressing: venv $(( venv / 1000000 )) MB — extending grace"
+            last_venv_size=$venv
+            grace_until=$(( now + GRACE_MIN * 60 ))
+        fi
     fi
     [[ "$alive" =~ ^[0-9]+$ ]] || alive=0
     [[ "$size"  =~ ^-?[0-9]+$ ]] || size=-1
