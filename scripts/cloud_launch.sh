@@ -192,7 +192,19 @@ head -c 32 /workspace/lerobot.bundle | grep -q 'git bundle'   # not 'git bundle 
 rm -rf lerobot && git clone -q -b main /workspace/lerobot.bundle lerobot
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=\$HOME/.local/bin:\$PATH
-cd lerobot && uv sync --locked --extra dataset --extra training --extra core_scripts --extra groot 2>&1 | tail -2" || die "code pull or venv build failed"
+cd lerobot
+# Write the build to a log on the pod instead of piping through tail: piped, it
+# produces NO output until it finishes, so a 45-minute build and a wedged one
+# look identical from here. setup.log is also what the watchdog reads to decide
+# whether setup is progressing.
+( uv sync --locked --extra dataset --extra training --extra core_scripts --extra groot --extra pi --extra peft \
+    > /workspace/setup.log 2>&1; echo \"SETUP_EXIT=\$?\" >> /workspace/setup.log ) &
+for i in \$(seq 1 240); do
+    grep -q '^SETUP_EXIT=' /workspace/setup.log 2>/dev/null && break
+    sleep 15
+done
+tail -3 /workspace/setup.log
+grep -q '^SETUP_EXIT=0' /workspace/setup.log" || die "code pull or venv build failed (see /workspace/setup.log on the pod)"
 
 say "proving the token can read the dataset and write checkpoints"
 $SSH "cd /workspace/lerobot && .venv/bin/python - <<PY

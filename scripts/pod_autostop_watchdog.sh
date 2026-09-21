@@ -35,7 +35,7 @@ INTERVAL="${INTERVAL:-180}"
 # and peft extras ran past 45 minutes and a fixed deadline killed it mid-install,
 # so the timer resets whenever the venv grows. A build that is genuinely wedged
 # stops growing and still dies.
-GRACE_MIN="${GRACE_MIN:-30}"
+GRACE_MIN="${GRACE_MIN:-40}"
 STALL_MIN="${STALL_MIN:-25}"     # training may go this long without the log growing
 
 deadline=$(( $(date +%s) + MAX_H * 3600 ))
@@ -109,7 +109,10 @@ while true; do
         alive=0
         # Still installing? Then it is making progress and the grace period is
         # extended. Only a build that has STOPPED growing runs out of time.
-        venv=$(ssh_to_pod 'du -sb /workspace/lerobot/.venv 2>/dev/null | cut -f1 || echo 0')
+        # venv size OR the setup log growing: a long "Building wheel ..." phase
+        # compiles without the venv changing size, which once looked like a
+        # stall and cost a 49-minute build.
+        venv=$(ssh_to_pod 'echo $(( $(du -sb /workspace/lerobot/.venv 2>/dev/null | cut -f1 || echo 0) + $(stat -c%s /workspace/setup.log 2>/dev/null || echo 0) ))')
         [[ "$venv" =~ ^[0-9]+$ ]] || venv=0
         if [ "$venv" -gt "$last_venv_size" ]; then
             [ "$last_venv_size" -ge 0 ] && echo "[watchdog] setup progressing: venv $(( venv / 1000000 )) MB — extending grace"
