@@ -153,6 +153,17 @@ runpodctl pod delete <pod-id>
   `info.json`, or training dies at load with a confusing message.
 - **HuggingFace uploads drop.** A 2.8 GB push died 11 minutes in on their xet
   backend. `hf_upload_dataset.py` retries and falls back to plain LFS.
+- **A LoRA run saves `adapter_model.safetensors`, not `model.safetensors`.** The
+  pusher gated on the latter and silently `continue`d, so a completed 20,000-step
+  pi0.5 run finished with an empty Hub repo while the log said only "training is
+  running". The guard now accepts either name and says so when it finds neither.
+  `eval_cube_policy.py` had the mirror of this bug: a bare `from_pretrained`
+  cannot load an adapter, so adapters now go through `make_policy`.
+- **A pod-local volume is hostage to one host's GPUs.** Recovering those
+  checkpoints needed the pod started again, and the first attempt returned "not
+  enough free GPUs on the host machine". It took a retry loop to get in. A
+  **network volume** detaches and re-attaches to any pod, including a cheap CPU
+  one; use one for anything long.
 - **Free private Hub storage is 100 GB**, and deleting LFS files does not
   reclaim it without squashing history. `hf_prune_checkpoints.py` does both.
 

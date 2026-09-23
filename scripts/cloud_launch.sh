@@ -222,17 +222,43 @@ POL_FLAGS="--policy $POLICY"; [ "$LORA" = 1 ] && POL_FLAGS="$POL_FLAGS --lora"
 say "starting training: $STEPS steps, policy $POLICY$([ "$LORA" = 1 ] && echo ' (LoRA)')"
 # From /workspace, not /workspace/lerobot: cloud_train_setup.sh expects the
 # bundle and the clone as siblings of its working directory.
+# setsid, and ALL THREE descriptors redirected. Backgrounding alone leaves the
+# ssh channel open on the child's stdout/stderr, so ssh does not return: the
+# launcher then blocked here for two hours while training ran fine, and when the
+# connection finally dropped, die() read the non-zero exit as "training did not
+# start" and stopped a healthy pod at step 5000.
 $SSH "cd /workspace && export PATH=\$HOME/.local/bin:\$PATH && \
-      nohup bash /workspace/cloud_train_setup.sh --scratch --repo-id '$HF_DATASET' \
+      setsid bash /workspace/cloud_train_setup.sh --scratch --repo-id '$HF_DATASET' \
         --dataset /pull-from-hub --out outputs/$OUT --steps $STEPS --batch $BATCH \
-        --save-freq 1000 $AUG_FLAG $POL_FLAGS > /workspace/train.log 2>&1 & sleep 5; echo ok" || die "training did not start"
+        --save-freq 1000 $AUG_FLAG $POL_FLAGS \
+        > /workspace/train.log 2>&1 < /dev/null & disown; echo started" \
+    || die "could not issue the training command"
+
+# Do not proceed on "the command was issued": wait until the trainer is really
+# stepping. This is the only point at which it is safe to hand the pod to the
+# watchdog.
+say "waiting for training to actually step"
+stepping=0
+for _i in $(seq 1 60); do
+    if $SSH 'grep -qE "step:[0-9]" /workspace/train.log 2>/dev/null'; then stepping=1; break; fi
+    if ! $SSH 'pgrep -f "[l]erobot-train|[c]loud_train_setup" >/dev/null'; then
+        $SSH 'tail -20 /workspace/train.log' || true
+        die "the training process died during startup"
+    fi
+    sleep 30
+done
+[ "$stepping" = 1 ] || die "training never produced a step in 30 minutes"
+say "training is stepping"
 
 say "starting the checkpoint pusher (skip < $MIN_STEP, keep $KEEP, stop the pod when done)"
 $SSH "cd /workspace && MIN_STEP=$MIN_STEP ON_DONE=stop \
-      nohup bash /workspace/pod_push_checkpoints.sh '$HF_CKPT' \
-      /workspace/lerobot/outputs/$OUT 180 $KEEP $MIN_STEP > /workspace/push.log 2>&1 & sleep 2; echo ok"
+      setsid bash /workspace/pod_push_checkpoints.sh '$HF_CKPT' \
+      /workspace/lerobot/outputs/$OUT 180 $KEEP $MIN_STEP \
+      > /workspace/push.log 2>&1 < /dev/null & disown; echo started"
 
-trap - ERR      # training is running; the watchdog (armed at creation) owns the pod
+trap - ERR      # training is confirmed stepping; the watchdog owns the pod now.
+                # Nothing below may stop it: a failure here costs a missing log
+                # line, not a run.
 
 cat <<EOF
 

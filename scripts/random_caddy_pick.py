@@ -52,6 +52,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import random_cube_pick as rcp  # noqa: E402  (shared grasp machinery)
 
 # The bar: a square slab of chocolate, all bars identical and brown.
+# Set by the eval, which wants only the prompt per trial. Recording leaves it
+# False, where the start-pose line is how you see what was set up.
+QUIET = False
+
 BAR_HALF = np.array([0.025, 0.025, 0.0125])  # 50 x 50 x 25 mm
 BAR_RGBA = (0.36, 0.22, 0.10, 1.0)
 # A bar rests on the bar below through four tiny feet under its box (see
@@ -994,13 +998,15 @@ def safe_start_pose(robot, iks, trial: Trial, rng: np.random.Generator, fps: int
         rcp._LAST_CMD[other_ik.arm.side] = q_o.copy()
         rcp._OTHER_GRIP[other_ik.arm.side] = g_o
         tip = ik.tip_mid()
-        print(f"  {ik.arm.side} start {'TUCKED (jittered)' if tucked_a else 'random'} "
-              f"tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f}); "
-              f"{other_ik.arm.side} starts {'TUCKED' if tucked_o else 'random'} (grip {g_o * 1000:.0f} mm)"
-              + (f"  [{attempt} draw(s) rejected]" if attempt else ""))
+        if not QUIET:
+            print(f"  {ik.arm.side} start {'TUCKED (jittered)' if tucked_a else 'random'} "
+                  f"tip-mid=({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f}); "
+                  f"{other_ik.arm.side} starts {'TUCKED' if tucked_o else 'random'} (grip {g_o * 1000:.0f} mm)"
+                  + (f"  [{attempt} draw(s) rejected]" if attempt else ""))
         rcp.settle_pose(robot, ik, g_a, fps, hold_s=0.2)
         if others_disturbed(robot, trial, set()):
-            print("  (start pose disturbed a bar — redrawing)")
+            if not QUIET:
+                print("  (start pose disturbed a bar — redrawing)")
             trial.restore_bars()
             continue
         return True

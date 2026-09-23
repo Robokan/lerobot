@@ -81,7 +81,7 @@ class CheckpointPolicy:
         from lerobot.common.control_utils import predict_action
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
-        from lerobot.policies import get_policy_class, make_pre_post_processors
+        from lerobot.policies import get_policy_class, make_policy, make_pre_post_processors
 
         self._predict_action = predict_action
         self.torch = torch
@@ -91,10 +91,20 @@ class CheckpointPolicy:
         cfg = PreTrainedConfig.from_pretrained(path)
         cfg.pretrained_path = path
         cfg.device = device
-        self.policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
+        meta = LeRobotDatasetMetadata(dataset_repo_id)
+        # A LoRA checkpoint contains only adapter_model.safetensors; the base weights
+        # live wherever adapter_config.json points. A bare from_pretrained looks for
+        # model.safetensors and fails outright, so route adapters through make_policy,
+        # which reads the adapter config, loads the base policy and applies the
+        # adapter on top. Full fine-tunes keep the direct path they always had.
+        if getattr(cfg, "use_peft", False) or (Path(path) / "adapter_config.json").is_file():
+            cfg.use_peft = True
+            self.policy = make_policy(cfg, ds_meta=meta)
+        else:
+            self.policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
         self.policy.to(self.device).eval()
 
-        stats = LeRobotDatasetMetadata(dataset_repo_id).stats
+        stats = meta.stats
         self.pre, self.post = make_pre_post_processors(
             policy_cfg=cfg,
             pretrained_path=path,
@@ -204,14 +214,31 @@ class CheckpointPolicy:
         return {k: float(v) for k, v in zip(self.action_keys, vals, strict=True)}
 
 
+# Set from --no-reset-key. With the viewer open, something was draining an "r"
+# on the first tick of every trial: each one was abandoned before the arm moved,
+# nothing was ever scored, and the loop ran forever while reporting "R pressed".
+# Watching the policy run matters more than the abort shortcut, so this turns
+# the shortcut off without turning the viewer off.
+_RESET_KEY_ENABLED = {"on": True}
+
+
 def reset_requested() -> bool:
     """True if R was pressed in the MuJoCo viewer window since the last check:
     abandon the current trial and set up a fresh cube and arm poses."""
+    if not _RESET_KEY_ENABLED["on"]:
+        return False
     try:
         from lerobot.robots.mujoco_bi_openarm.viewer_keys import drain_keys
     except Exception:  # noqa: BLE001
         return False
-    return "r" in drain_keys()
+    keys = drain_keys()
+    # With the viewer open this fired on the first tick of every trial, aborting
+    # each one before the arm moved, while the caller reported it as "R pressed".
+    # Twenty trials became an endless loop that scored nothing and looked exactly
+    # like a policy that refuses to act. Say what was actually drained.
+    if keys:
+        print(f"  [viewer keys drained: {keys}]", flush=True)
+    return "r" in keys
 
 
 def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
@@ -268,6 +295,7 @@ def run_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> dict:
     committed = max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none"
     return {
         "reset": reset,
+        "reset_reason": "R pressed in the viewer",
         "success": success,
         "lifted_demo": lifted_demo or success,
         "t_success": t_success,
@@ -327,6 +355,7 @@ def run_color_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> d
     wrong_pad, _ = rcol.on_pad(robot, other_pad)
     return {
         "reset": reset,
+        "reset_reason": "R pressed in the viewer",
         "success": success,
         "lifted_demo": success,
         "t_success": t_success,
@@ -352,6 +381,8 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
     """
     import random_caddy_pick as rc
 
+    rc.QUIET = True   # the eval prints the prompt and the result, nothing else
+
     # The generator overrides these module globals in its main() before it
     # solves any pose. The eval has to do the same, or the scene it builds is
     # not the scene the policy was trained on: the idle arm would tuck to the
@@ -372,15 +403,26 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
             trial = cand
             break
     if trial is None:
-        return {"reset": True, "success": None}
+        return {"reset": True, "success": None,
+                "reset_reason": "no plannable grasp in 8 draws"}
     if not rc.safe_start_pose(robot, iks, trial, rng, fps):
-        return {"reset": True, "success": None}
+        return {"reset": True, "success": None,
+                "reset_reason": "no safe start pose in 12 draws"}
     for a in rcp.ARMS:
         rcp._RETREAT_TARGET[a.side] = rcp.tuck_q(iks[a.side])
 
     # The prompt is per-trial here, unlike the colour task's fixed string.
     policy.task = trial.prompt
+    print(f"  {trial.prompt}", flush=True)
     policy.reset()
+
+    # Drain the key queue HERE, not in the caller. The caller clears it before
+    # setup, and setup then runs ~0.2 s of physics with viewer syncs — so any
+    # key event delivered during setup (a release, an auto-repeat, or a press
+    # made while the previous trial was still on screen) survives into tick 1
+    # and aborts a trial nobody asked to abort. Clearing after setup closes that
+    # window, so only a press made DURING the trial counts.
+    reset_requested()
 
     target = trial.top_bar()
     watch = trial.arranged_bars()
@@ -429,6 +471,7 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
     disturbed = [i for i in moved if i != target and i not in delivered]
     return {
         "reset": reset,
+        "reset_reason": "R pressed in the viewer",
         "success": bool(success and not disturbed),
         "lifted_demo": lifted,
         "t_success": t_success,
@@ -550,6 +593,7 @@ def run_color_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: fl
     wrong_pad, _ = rcol.on_pad(robot, other_pad)
     return {
         "reset": reset,
+        "reset_reason": "R pressed in the viewer",
         "success": success,
         "lifted_demo": success,
         "t_success": t_success,
@@ -699,6 +743,12 @@ def main() -> None:
     parser.add_argument("--cameras", choices=["chest", "all"], default="chest",
                         help="must match what the policy was trained on")
     parser.add_argument("--trials", type=int, default=30)
+    parser.add_argument(
+        "--no-reset-key", action="store_true",
+        help="ignore R from the viewer window. Use it when trials are being "
+             "abandoned that you did not abandon: the viewer stays open and you "
+             "can watch, but the abort shortcut is off.",
+    )
     parser.add_argument("--seed", type=int, default=100,
                         help="use a seed NOT used for training data")
     parser.add_argument("--fps", type=int, default=30)
@@ -764,6 +814,8 @@ def main() -> None:
              "of VRAM — required to run the TRT server and this script on one 24 GB card.",
     )
     args = parser.parse_args()
+    if args.no_reset_key:
+        _RESET_KEY_ENABLED["on"] = False
     if args.tucked_prob is not None:
         rcp.TUCKED_START_PROB = float(args.tucked_prob)
     if args.task is None:
@@ -798,7 +850,10 @@ def main() -> None:
     if args.policy == "zeros":
         policy = ZerosPolicy(robot)
     else:
+        print(f"loading policy from {args.policy} ...", flush=True)
+        _t_load = time.time()
         policy = CheckpointPolicy(args.policy, args.dataset, args.task, device=args.device)
+        print(f"policy ready in {time.time() - _t_load:.0f}s", flush=True)
         if args.replan_every:
             policy.replan_every = args.replan_every
             print(f"  re-planning every {args.replan_every} actions "
@@ -830,8 +885,6 @@ def main() -> None:
                                   device=args.device)
 
     results = []
-    if not args.no_viewer:
-        print("Press R in the MuJoCo window to abandon the current trial and reset the cube and arms.")
     try:
         t = 0
         while t < args.trials:
@@ -874,7 +927,11 @@ def main() -> None:
             else:
                 r = run_trial(robot, iks, rng, policy, args.fps, args.time_limit)
             if r.get("reset") or r["success"] is None:
-                print("  R pressed — resetting cube and arms (trial not counted)")
+                # Not necessarily R: an unplannable grasp and an unsafe start
+                # pose come back the same way, and calling all three "R pressed"
+                # hid a harness bug behind a user action nobody performed.
+                print(f"  trial abandoned ({r.get('reset_reason', 'cause not recorded')})"
+                      " — not counted")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks["right"], 0.0, args.fps, hold_s=0.15)
                 continue

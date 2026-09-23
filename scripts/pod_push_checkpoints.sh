@@ -111,7 +111,17 @@ while true; do
             [ -d "$d" ] || continue
             step=$(basename "$d")
             grep -qx "$step" "$STATE" && continue
-            [ -f "$d/pretrained_model/model.safetensors" ] || continue
+            # A LoRA run writes adapter_model.safetensors; a full fine-tune writes
+            # model.safetensors. Requiring only the latter made this script skip
+            # EVERY checkpoint of the pi0.5 LoRA run, silently, and a completed
+            # 20,000-step run ended with an empty Hub repo. Accept either, and
+            # say so when neither is there instead of `continue`ing in silence.
+            w="$d/pretrained_model/model.safetensors"
+            [ -f "$w" ] || w="$d/pretrained_model/adapter_model.safetensors"
+            if [ ! -f "$w" ]; then
+                echo "[push] $step: no model.safetensors or adapter_model.safetensors — skipping this pass"
+                continue
+            fi
             # Too early to be worth Hub storage: drop it from the pod instead.
             if [ "$((10#$step))" -lt "$MIN_STEP" ]; then
                 echo "[push] $step < MIN_STEP $MIN_STEP — not pushing; freeing $(du -sh "$d" | cut -f1) on the pod"
@@ -120,9 +130,9 @@ while true; do
                 continue
             fi
             # Only push once the file has stopped growing, or we ship a half-written checkpoint.
-            s1=$(stat -c%s "$d/pretrained_model/model.safetensors")
+            s1=$(stat -c%s "$w")
             sleep 20
-            s2=$(stat -c%s "$d/pretrained_model/model.safetensors")
+            s2=$(stat -c%s "$w")
             [ "$s1" = "$s2" ] || { echo "[push] $step still being written, skipping this pass"; continue; }
 
             echo "[push] uploading $step ($(du -sh "$d/pretrained_model" | cut -f1)) ..."
