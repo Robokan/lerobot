@@ -1044,12 +1044,22 @@ def main() -> None:
     ap.add_argument("--snapshot", default=None, metavar="PNG", help="save the ego view of the first trial's scene")
     ap.add_argument("--debug", action="store_true",
                     help="verbose per-trial output; default is one 'episode N' line per saved episode")
+    ap.add_argument("--dart-sigma-deg", type=float, default=0.0, metavar="DEG",
+                    help="DART: perturb the EXECUTED joint targets with OU noise of this "
+                         "stationary std (deg) while recording the planner's clean targets as "
+                         "labels, so the dataset contains recoveries. 0 = off. Start at 0.5: "
+                         "1.5 looked like wobbling on screen. Slow drift (rho 0.98), proximal joints only.")
     args = ap.parse_args()
     if not 2 <= args.stacks <= MAX_STACKS:
         ap.error(f"--stacks must be 2..{MAX_STACKS}")
 
     rng = np.random.default_rng(args.seed)
     rcp._AIM_OVERLAY_ENABLED = bool(args.debug)
+    if args.dart_sigma_deg > 0:
+        rcp._DART["sigma_deg"] = float(args.dart_sigma_deg)
+        rcp._DART["rng"] = np.random.default_rng(args.seed + 7919)  # its own stream: does not disturb scene draws
+        print(f"DART on: slow drift on shoulder+elbow, sigma {args.dart_sigma_deg:.2f} deg "
+              f"(x0.5-1.5 per episode, rho {rcp._DART['rho']}, wrist clean); labels stay clean")
     rcp.TUCK_TIP_TARGET = TUCK_TIP_TARGET  # before any tuck is solved (it is cached)
     rcp._APPROACH_GRIP_FN["fn"] = approach_grip
     rcp._APPROACH_SETTLE_S["s"] = APPROACH_SETTLE_S
@@ -1139,6 +1149,9 @@ def main() -> None:
                 if recorder is not None:
                     recorder.task = trial.prompt
                     recorder.start()
+                    if args.debug and rcp._DART['sigma_deg'] > 0:
+                        print(f"  DART scale this episode: x{rcp._DART['scale']:.2f} "
+                              f"(sigma {rcp._DART['sigma_deg'] * rcp._DART['scale']:.2f} deg)")
                 ok = run_trial(robot, iks, args.fps, trial, rng)
                 have_previous = True
                 per_side[trial.side][1] += 1

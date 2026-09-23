@@ -824,6 +824,63 @@ def _draw_aim_overlay(robot: MujocoBiOpenArm, ik: PositionOnlyIK) -> None:
     scn.ngeom += 1
 
 
+# DART (Laskey et al. 2017): perturb what the robot EXECUTES, record what the
+# planner INTENDED. Three runs on this task — GR00T and two pi0.5 fine-tunes —
+# fit their demonstrations to ~1° open loop and still scored 0/50 closed loop,
+# knocking a neighbouring bar in 17 of 20 trials. The demonstrations came from
+# a planner that never errs, so they contain no recoveries: the first time the
+# policy's own small error puts it a centimetre off the nominal path, it is in
+# a state no demonstration visited and keeps executing the nominal path from
+# the wrong place. A human teleoperator drifts and corrects constantly, and 100
+# teleop episodes on the real robot did produce occasional successes where 300
+# perfect ones here produced none. This puts the drift back in: the arm wanders
+# off the path, the camera sees it off the path, and every label says how to
+# get back on. The noise is an OU process (rho ~0.9 at 30 fps, ~1/3 s memory)
+# rather than i.i.d. per tick, because a stiff position controller filters
+# single-tick jitter into nothing — the perturbation has to persist long enough
+# to actually displace the arm. Gripper and parked arm stay clean. Off unless
+# a generator sets sigma_deg; the eval never sees it.
+# Watched on screen, the first version "wobbled all over the place". Two causes,
+# both fixed here. rho 0.9 at 30 fps is a third-of-a-second memory: that reads
+# as tremor. A person leaning off the path and correcting does it over seconds,
+# so rho is 0.98 (about 1.7 s). And independent noise on all seven joints
+# flops the wrist around; a person's error is a coherent position offset, so
+# only the four proximal joints (shoulder x3, elbow) drift and the wrist stays
+# where the planner put it.
+_DART: dict = {"sigma_deg": 0.0, "rho": 0.98, "scale": 1.0, "state": {},
+               "joints": (0, 1, 2, 3), "rng": np.random.default_rng(0)}
+
+
+def _dart_noise_deg(side: str, n: int) -> np.ndarray | None:
+    d = _DART
+    if d["sigma_deg"] <= 0.0 or _RECORDER is None or not _RECORDER.active:
+        return None
+    prev = d["state"].get(side)
+    if prev is None or prev.shape[0] != n:
+        prev = np.zeros(n)
+    rho = d["rho"]
+    sig = d["sigma_deg"] * d["scale"]
+    cur = rho * prev + sig * math.sqrt(1.0 - rho * rho) * d["rng"].standard_normal(n)
+    mask = np.zeros(n)
+    for j in d["joints"]:
+        if j < n:
+            mask[j] = 1.0
+    cur = cur * mask
+    d["state"][side] = cur
+    return cur
+
+
+def dart_episode_reset(rng: np.random.Generator | None = None) -> None:
+    """New episode: forget the noise history and draw this episode's amplitude.
+    The per-episode scale is what makes the dataset cover both small and large
+    deviations instead of one fixed band. 0.5x-1.5x: a 0.5x-3x range was tried
+    and looked like the arm wobbling all over the place, so the top end is gone.
+    Episodes the noise pushes into failure are simply not saved."""
+    _DART["state"] = {}
+    g = rng if rng is not None else _DART["rng"]
+    _DART["scale"] = float(g.uniform(0.5, 1.5)) if _DART["sigma_deg"] > 0 else 1.0
+
+
 def send_q(
     robot: MujocoBiOpenArm,
     ik: PositionOnlyIK,
@@ -837,9 +894,16 @@ def send_q(
     for i, qi in enumerate(q, start=1):
         action[f"{ik.arm.side}_joint_{i}.pos"] = float(math.degrees(qi))
     action[f"{ik.arm.side}_gripper.pos"] = gripper_m_to_deg(grip_m)
-    robot.send_action(action)
+    noise = _dart_noise_deg(ik.arm.side, len(q))
+    if noise is None:
+        robot.send_action(action)
+    else:
+        executed = dict(action)           # the robot gets the drift ...
+        for i in range(len(q)):
+            executed[f"{ik.arm.side}_joint_{i + 1}.pos"] += float(noise[i])
+        robot.send_action(executed)
     if _RECORDER is not None:
-        _RECORDER.tick(action)
+        _RECORDER.tick(action)            # ... the dataset gets the intention
 
 
 def _set_arm_qpos(robot: MujocoBiOpenArm, side: str, q_rad: np.ndarray) -> None:
@@ -1172,6 +1236,7 @@ class EpisodeRecorder:
 
     def start(self) -> None:
         self.active = True
+        dart_episode_reset()
 
     def drop(self) -> None:
         self.active = False
