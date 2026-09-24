@@ -369,6 +369,9 @@ def run_color_trial(robot, iks, rng, policy, fps: int, time_limit_s: float) -> d
     }
 
 
+EVAL_OBSTACLE_RADIUS_M = 0.055   # see the note inside run_caddy_trial
+
+
 def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
                     stacks: int = 6) -> dict:
     """Caddy picking (random_caddy_pick): stacks of identical brown bars on
@@ -397,6 +400,14 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
 
     rc.hide_legacy_pads(robot)
     rcp.set_cube_xy(robot, -0.90, -0.90)
+    # The benchmark's layout distribution is pinned HERE, not inherited from the
+    # generator. grasp_plannable() filters layouts by rc.BAR_OBSTACLE_RADIUS_M;
+    # if the generator widens that keep-out to give the demonstrations margin,
+    # an eval that shared the constant would silently stop drawing the tight
+    # layouts — exactly the ones the policy fails — and the score would rise
+    # for the wrong reason. 0.055 is the value every result so far was measured
+    # against; a new number here is a new benchmark and must be reported as one.
+    rc.BAR_OBSTACLE_RADIUS_M = EVAL_OBSTACLE_RADIUS_M
     trial = None
     side = None
     for _ in range(8):
