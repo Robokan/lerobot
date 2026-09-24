@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import os
 import sys
@@ -471,6 +472,22 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
     delivered = [i for i in watch if i not in trial.pile_bars and on_pile(i)]
     wrong_pad = bool(delivered) and target not in delivered
     disturbed = [i for i in moved if i != target and i not in delivered]
+    # WHICH bar moved decides the fix. Under the target in its own stack: the
+    # grip is too low / pads too long for the clearance. A neighbouring stack:
+    # the approach or carry sweeps sideways. The centre pile: the drop. After
+    # DART data left the knock-over rate at 18/20, this is the missing fact.
+    where = []
+    for i in disturbed:
+        d_cm = float(np.linalg.norm(rc.bar_pos(robot, i)[:2] - start[i][:2])) * 100
+        if i in trial.pile_bars:
+            kind = "pile"
+        elif i in trial.stack_bars[trial.target]:
+            kind = "own-stack"
+        else:
+            kind = "other-stack"
+        where.append(f"{kind} {d_cm:.0f}cm")
+    if where:
+        print(f"  knocked: {', '.join(where)}", flush=True)
     return {
         "reset": reset,
         "reset_reason": "R pressed in the viewer",
@@ -483,6 +500,7 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
         "committed_arm": max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none",
         "wrong_pad": wrong_pad,
         "knocked": bool(disturbed),
+        "knocked_where": [w.split()[0] for w in where],
         "pile_n": trial.pile_n,
         "final_cube_z": float(rc.bar_pos(robot, target)[2]),
     }
@@ -972,6 +990,9 @@ def main() -> None:
             if args.task_mode == "caddy":
                 print(f"  took a bar from the WRONG pad: {sum(1 for r in results if r.get('wrong_pad'))}/{n}")
                 print(f"  knocked another bar over:      {sum(1 for r in results if r.get('knocked'))}/{n}")
+                kinds = collections.Counter(k for r in results for k in r.get("knocked_where", []))
+                if kinds:
+                    print("     which: " + ", ".join(f"{k} x{v}" for k, v in kinds.most_common()))
                 for colour in sorted({r.get("colour") for r in results if r.get("colour")}):
                     grp = [r for r in results if r.get("colour") == colour]
                     print(f"  {colour:7s}: {sum(r['success'] for r in grp)}/{len(grp)}")
