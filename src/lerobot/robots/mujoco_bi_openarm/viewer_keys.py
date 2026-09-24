@@ -98,6 +98,27 @@ def request_recording_control(control: str) -> None:
         _recording_controls.append(control)
 
 
+# Text shown INSIDE the headset, burned onto the camera frames the OpenXR view
+# composites (never onto the frames the dataset records). The scene robot sets
+# the prompt line at each new episode; the record loop sets the status line as
+# recording starts and stops. A person in a headset cannot see the terminal,
+# and "which pad?" and "am I recording?" are the two things they need to know.
+_hud: dict[str, str] = {"prompt": "", "status": ""}
+
+
+def set_hud_text(prompt: str | None = None, status: str | None = None) -> None:
+    with _lock:
+        if prompt is not None:
+            _hud["prompt"] = prompt
+        if status is not None:
+            _hud["status"] = status
+
+
+def get_hud_text() -> tuple[str, str]:
+    with _lock:
+        return _hud["prompt"], _hud["status"]
+
+
 def drain_recording_controls() -> list[str]:
     """Return and clear pending viewer recording-control requests."""
     with _lock:

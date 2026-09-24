@@ -163,15 +163,22 @@ def apply_recording_control(control: str, events: dict) -> None:
       reserved for keyboard teleop +z and must not discard the episode)
     * ``"esc"`` / ``"q"`` — quit recording entirely
     """
+    try:  # headset HUD: a person wearing it cannot see the terminal
+        from lerobot.robots.mujoco_bi_openarm.viewer_keys import set_hud_text
+    except Exception:  # noqa: BLE001
+        def set_hud_text(**_kw):  # type: ignore[misc]
+            return None
     if control == "y":
         if not events.get("recording_active"):
             events["recording_active"] = True
+            set_hud_text(status="● REC")
             print("\n[Y] Recording STARTED — capturing frames. Press T to stop.\n", flush=True)
         else:
             print("\n[Y] Already recording — press T to stop and save.\n", flush=True)
     elif control == "t":
         if events.get("recording_active"):
             events["recording_active"] = False
+            set_hud_text(status="saved ✓ — next scene…")
             events["exit_early"] = True
             print("\n[T] Recording STOPPED — saving episode…\n", flush=True)
         else:
@@ -184,6 +191,7 @@ def apply_recording_control(control: str, events: dict) -> None:
         else:
             print("\n[n/→] Ignored (not recording; press Y to start).\n", flush=True)
     elif control == "left":
+        set_hud_text(status="redo — scene resets")
         print("\n[←] Re-record last episode (discarding buffer)…\n", flush=True)
         events["recording_active"] = False
         events["rerecord_episode"] = True

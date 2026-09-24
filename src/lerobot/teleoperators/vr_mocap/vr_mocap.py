@@ -52,6 +52,72 @@ SIDES = ["right", "left"]  # right-first, to match the robot
 _RAD2DEG = 180.0 / np.pi
 
 
+_HUD_FONT: dict = {}
+
+
+def _hud_font(px: int):
+    from PIL import ImageFont
+
+    f = _HUD_FONT.get(px)
+    if f is None:
+        try:
+            f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", px)
+        except OSError:
+            f = ImageFont.load_default()
+        _HUD_FONT[px] = f
+    return f
+
+
+def _with_hud(frames: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Burn the HUD lines (episode prompt, recording status) onto COPIES of the
+    frames bound for the headset. The arrays in ``frames`` are the robot's
+    observation images — the same objects the record loop writes to the dataset
+    — so they are never drawn on in place."""
+    try:
+        from lerobot.robots.mujoco_bi_openarm.viewer_keys import get_hud_text
+    except Exception:  # noqa: BLE001
+        return frames
+    prompt, status = get_hud_text()
+    if not prompt and not status:
+        return frames
+    from PIL import Image, ImageDraw
+
+    out = {}
+    for key, img in frames.items():
+        h, w = img.shape[:2]
+        pil = Image.fromarray(np.ascontiguousarray(img[..., :3]))
+        draw = ImageDraw.Draw(pil, "RGBA")
+        big, small = _hud_font(max(18, w // 24)), _hud_font(max(14, w // 30))
+        pad = max(6, w // 80)
+        y = pad
+        if prompt:
+            # Wrap on the " · " separators when the line is wider than the frame
+            # (640 px at the ego camera): the pad colour must never be cut off.
+            lines = [prompt]
+            if draw.textlength(prompt, font=big) > w - 2 * pad and "  ·  " in prompt:
+                parts = prompt.split("  ·  ")
+                lines = [parts[0] + "  ·  " + parts[1], "  ·  ".join(parts[2:])] if len(parts) > 2 else parts
+                if draw.textlength(lines[0], font=big) > w - 2 * pad:
+                    lines = parts
+            bottom = y
+            for line in lines:
+                box = draw.textbbox((pad, bottom), line, font=big)
+                bottom = box[3] + pad // 2
+            draw.rectangle((0, 0, w, bottom + pad // 2), fill=(0, 0, 0, 170))
+            yy = y
+            for line in lines:
+                draw.text((pad, yy), line, font=big, fill=(255, 255, 255, 255))
+                yy = draw.textbbox((pad, yy), line, font=big)[3] + pad // 2
+            y = bottom + pad // 2
+        if status:
+            box = draw.textbbox((pad, y + pad // 2), status, font=small)
+            rec = status.startswith("●")
+            draw.rectangle((0, y, box[2] + pad, box[3] + pad), fill=(200, 40, 30, 200) if rec else (0, 0, 0, 150))
+            draw.text((pad, y + pad // 2), status, font=small, fill=(255, 255, 255, 255))
+        out[key] = np.asarray(pil)
+    return out
+
+
 class VRMocap(Teleoperator):
     """VR mocap -> IK -> joint-position teleoperator (16 right-first *.pos deg)."""
 
@@ -200,7 +266,7 @@ class VRMocap(Teleoperator):
             if isinstance(value, np.ndarray) and getattr(value, "ndim", 0) == 3
         }
         if frames:
-            source.update_camera_frames(frames)
+            source.update_camera_frames(_with_hud(frames))
 
     @check_if_not_connected
     def disconnect(self) -> None:

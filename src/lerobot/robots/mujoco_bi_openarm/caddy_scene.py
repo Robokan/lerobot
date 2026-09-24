@@ -46,6 +46,7 @@ import numpy as np
 
 from lerobot.robots.config import RobotConfig
 
+from . import viewer_keys
 from .config_mujoco_bi_openarm import MujocoBiOpenArmConfig
 from .mujoco_bi_openarm import MujocoBiOpenArm
 
@@ -115,4 +116,7 @@ class MujocoBiOpenArmCaddy(MujocoBiOpenArm):
         logger.info("caddy scene %d: %s", self.episodes_arranged, self.trial.describe())
         print(f"\n=== EPISODE {self.episodes_arranged}:  \"{self.current_task}\"  "
               f"({self.trial.side} arm) ===\n", flush=True)
+        # into the headset: "EP 7 · get bar from purple pad · RIGHT arm"
+        viewer_keys.set_hud_text(prompt=f"EP {self.episodes_arranged}  ·  {self.current_task}"
+                                        f"  ·  {self.trial.side.upper()} arm", status="ready — press B")
         return self.current_task

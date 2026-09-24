@@ -20,6 +20,10 @@
 #      (same Wi-Fi; if the server list is empty: systemctl status avahi-daemon)
 #   3. run this script from a terminal you can see; the MuJoCo window opens too
 #
+# In the headset you also SEE the prompt: a banner on the camera view reads
+# "EP 7 · get bar from purple pad · RIGHT arm", and a red "● REC" while
+# recording. With SPEAK=1 (default) each prompt is spoken as well.
+#
 # In the headset (OpenXR driver):
 #   X            toggle tracking — press once with your hands where you want
 #                the grippers to be; the arms then follow controller DELTAS
@@ -62,6 +66,7 @@ FPS="${FPS:-30}"                 # what the scripted datasets and the policies u
 EPISODE_TIME_S="${EPISODE_TIME_S:-0}"   # 0 = until A / t
 RESET_TIME_S="${RESET_TIME_S:-3}"       # the scene re-lays out at the start of this
 RESUME="${RESUME:-0}"                   # 1 = append to the exact REPO_ID given (no time stamp)
+SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
 
@@ -123,7 +128,7 @@ if [[ "${MODE}" == "record" ]]; then
     --dataset.push_to_hub=false \
     --resume="$([[ "${RESUME}" == "1" ]] && echo true || echo false)" \
     --display_data=false \
-    --play_sounds=false
+    --play_sounds="$([[ "${SPEAK}" == "1" ]] && echo true || echo false)"
 else
   echo "[run_vr_caddy] TELEOP (practice, nothing recorded)  driver=${DRIVER}  Ctrl-C to stop"
   exec .venv/bin/lerobot-teleoperate \
