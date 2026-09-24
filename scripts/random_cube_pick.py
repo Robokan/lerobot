@@ -853,7 +853,11 @@ _DART: dict = {"sigma_deg": 0.0, "rho": 0.98, "scale": 1.0, "state": {},
 
 def _dart_noise_deg(side: str, n: int) -> np.ndarray | None:
     d = _DART
-    if d["sigma_deg"] <= 0.0 or _RECORDER is None or not _RECORDER.active:
+    # sigma 0 is the real safety: the eval never sets it. The recorder test only
+    # confines noise to recorded segments when there IS a recorder; a view-only
+    # run (no --record) must still show the drift, or what you watch is not what
+    # you would record.
+    if d["sigma_deg"] <= 0.0 or (_RECORDER is not None and not _RECORDER.active):
         return None
     prev = d["state"].get(side)
     if prev is None or prev.shape[0] != n:

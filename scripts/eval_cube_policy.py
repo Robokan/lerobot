@@ -397,8 +397,10 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
     rc.hide_legacy_pads(robot)
     rcp.set_cube_xy(robot, -0.90, -0.90)
     trial = None
+    side = None
     for _ in range(8):
-        cand = rc.Trial(robot, rng, stacks)
+        cand = rc.Trial(robot, rng, stacks, side=side)
+        side = cand.side              # same balance fix as the generator
         if rc.grasp_plannable(robot, iks[cand.side], cand, rng):
             trial = cand
             break

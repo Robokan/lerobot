@@ -114,8 +114,12 @@ Two independent mechanisms, because neither alone is trustworthy:
 `runpodctl` 2.14 has no `--stop-after` at pod creation, so without the watchdog
 nothing caps the bill.
 
-**A stopped pod still bills for its volume**, about $1.34 a day for 200 GB.
-Delete it once the checkpoints are on the Hub:
+**A stopped pod still bills for its volume**, about $1.34 a day for 200 GB, and
+two of them sat stopped for days after their runs. The rule is **delete, not
+stop, once the checkpoints are verified on the Hub** — the only thing a stopped
+pod buys is a cached venv, worth about 25 minutes, and the host may refuse to
+restart it anyway ("not enough free GPUs"). Delete it once the checkpoints are
+on the Hub:
 
 ```bash
 runpodctl pod delete <pod-id>

@@ -258,7 +258,7 @@ def stack_top_z(n_bars: int) -> float:
 class Trial:
     """One arranged scene: N stacks on coloured pads, the prompt, the plan."""
 
-    def __init__(self, robot, rng: np.random.Generator, n_stacks: int):
+    def __init__(self, robot, rng: np.random.Generator, n_stacks: int, side: str | None = None):
         import mujoco
 
         self.robot = robot
@@ -328,8 +328,12 @@ class Trial:
 
         # Arm balance the colour picker's way: draw the SIDE from a shuffled
         # two-element bag (so left and right alternate in pairs whatever else
-        # consumes the random stream), then a slot on that side.
-        side = next_side(rng)
+        # consumes the random stream), then a slot on that side. A caller
+        # RESAMPLING an unplannable layout passes the side it was already dealt:
+        # drawing again per candidate ate a bag entry per discard, and since
+        # right-side layouts are unplannable more often, 300 "balanced" episodes
+        # came out 174 left / 126 right.
+        side = side or next_side(rng)
         slots = [i for i in range(self.n) if self.arm_for(i) == side]
         self.target = int(slots[rng.integers(0, len(slots))])
         self.colour = self.colours[self.target][0]
@@ -1055,6 +1059,8 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     rcp._AIM_OVERLAY_ENABLED = bool(args.debug)
+    if args.episodes > 0 and not args.record:
+        print(f"NOTE: --episodes only counts with --record; running --trials {args.trials} instead")
     if args.dart_sigma_deg > 0:
         rcp._DART["sigma_deg"] = float(args.dart_sigma_deg)
         rcp._DART["rng"] = np.random.default_rng(args.seed + 7919)  # its own stream: does not disturb scene draws
@@ -1128,8 +1134,10 @@ def main() -> None:
                        if target_eps else f"{t}/{max_trials}")
                 print(f"\n=== Trial {t} — {hdr} ===")
                 trial = None
+                side = None
                 for _ in range(6):
-                    cand = Trial(robot, rng, args.stacks)
+                    cand = Trial(robot, rng, args.stacks, side=side)
+                    side = cand.side          # keep the dealt side across resamples
                     if grasp_plannable(robot, iks[cand.side], cand, rng):
                         trial = cand
                         break
