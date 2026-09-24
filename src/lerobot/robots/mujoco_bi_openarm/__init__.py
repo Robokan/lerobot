@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .caddy_scene import MujocoBiOpenArmCaddy, MujocoBiOpenArmCaddyConfig
 from .config_mujoco_bi_openarm import MujocoBiOpenArmConfig
 from .mujoco_bi_openarm import (
     BASE_ELBOW_BEND_DEG,
@@ -30,6 +31,8 @@ __all__ = [
     "FINGER_OPEN_M",
     "GRIPPER_OPEN_DEG",
     "MujocoBiOpenArm",
+    "MujocoBiOpenArmCaddy",
+    "MujocoBiOpenArmCaddyConfig",
     "MujocoBiOpenArmConfig",
     "apply_base_pose",
     "gripper_deg_to_m",

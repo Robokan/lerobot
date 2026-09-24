@@ -82,6 +82,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .mujoco_bi_openarm import MujocoBiOpenArm
 
         return MujocoBiOpenArm(config)
+    elif config.type == "mujoco_bi_openarm_caddy":
+        from .mujoco_bi_openarm.caddy_scene import MujocoBiOpenArmCaddy
+
+        return MujocoBiOpenArmCaddy(config)
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 

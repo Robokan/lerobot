@@ -419,7 +419,10 @@ def record_loop(
         # Write to dataset only while recording is armed (Y…T).
         if dataset is not None and events.get("recording_active"):
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
+            # A robot that arranges its own scene (mujoco_bi_openarm_caddy) publishes
+            # the prompt for the current layout; it overrides the run-wide task.
+            frame = {**observation_frame, **action_frame,
+                     "task": getattr(robot, "current_task", None) or single_task}
             dataset.add_frame(frame)
 
         if display_data:
@@ -560,6 +563,7 @@ def record(
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
+            first_pass = True     # connect() already arranged the first scene
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["recording_active"] = False
                 events["exit_early"] = False
@@ -573,7 +577,15 @@ def record(
                     f"letter r is teleop +z, not re-record)\n",
                     flush=True,
                 )
-                log_say(f"Ready for episode {ep_idx}. Press Y to start.", cfg.play_sounds)
+                # Robots that lay out their own scene get a fresh one per episode.
+                # Not on the first: connect() already arranged it.
+                new_episode = getattr(robot, "new_episode", None)
+                if callable(new_episode) and not first_pass:
+                    new_episode()          # also after a re-record: the failed attempt disturbed the table
+                first_pass = False
+                task_hint = getattr(robot, "current_task", None)
+                log_say(f"Ready for episode {ep_idx}. Press Y to start."
+                        + (f"  Task: {task_hint}" if task_hint else ""), cfg.play_sounds)
                 logging.info(
                     "Press Y to start recording episode %s (%s), T to stop and save.",
                     ep_idx,
