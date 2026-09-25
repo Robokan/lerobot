@@ -104,7 +104,7 @@ IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
 #                     turn from the first press (the model's own -90..90); the
 #                     shoulder-first ordering then comes only from the solver's weights.
 WRIST_STOP="${WRIST_STOP:-1}"
-YAW_AXIS="${YAW_AXIS:-vertical}"       # vertical (default) | tool: what j/l turn the gripper about
+YAW_AXIS="${YAW_AXIS:-tool}"           # tool (default, the original) | vertical: what j/l turn the gripper about
 [[ "${WRIST_STOP}" == "0" && -z "${IK_WRIST_LIMIT_DEG}" ]] && IK_WRIST_LIMIT_DEG="-90,90"
 #   (rotation keys: L turns the shoulder first then the wrist, J the wrist first
 #    then the shoulder, each joint to its limit. IK_CHAIN_WEIGHTS is unused now.)
@@ -186,7 +186,7 @@ TELEOP_ARGS=(
 [[ -n "${DLS_LAMBDA}" ]]          && TELEOP_ARGS+=(--teleop.dls_lambda="${DLS_LAMBDA}")
 [[ -n "${TARGET_LEASH_DEG}" ]]    && TELEOP_ARGS+=(--teleop.target_leash_deg="${TARGET_LEASH_DEG}")
 [[ "${STALL}" == "0" ]]            && TELEOP_ARGS+=(--teleop.stall_deg=0 --teleop.stall_pos_m=0)
-[[ "${YAW_AXIS}" == "tool" ]]      && TELEOP_ARGS+=(--teleop.yaw_about_vertical=false)
+[[ "${YAW_AXIS}" == "vertical" ]]  && TELEOP_ARGS+=(--teleop.yaw_about_vertical=true)
 [[ -n "${TARGET_LEASH_M}" ]]      && TELEOP_ARGS+=(--teleop.target_leash_m="${TARGET_LEASH_M}")
 
 if [[ "${MODE}" == "record" ]]; then

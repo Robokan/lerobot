@@ -110,11 +110,12 @@ class VRMocapConfig(TeleoperatorConfig):
     # limit: L goes shoulder-first then wrist, J goes wrist-first then shoulder.
     # Keyboard rotation keys pivot about the gripper TIP (the TCP); False = wrist pivot.
     rotate_about_tip: bool = True    # rotations pivot about the gripper tip (TCP); translations move it
-    # Keyboard j/l: a turn about the world VERTICAL (the axis the shoulder roll
-    # and the hanging forearm share) -- or, False, about the gripper's own
-    # axis as originally. They coincide with the arm hanging; with the elbow
-    # bent the gripper-axis turn is a roll the shoulder cannot serve.
-    yaw_about_vertical: bool = True
+    # Keyboard j/l turn the gripper about its OWN axis (the original, default).
+    # True = about the world vertical instead. They coincide with the arm
+    # hanging. With the elbow bent the gripper-axis turn under the shoulder-
+    # first pins is the case that does not yet return (measured: 37 deg short
+    # of the target, J6 on its limit); the vertical turn only avoids it.
+    yaw_about_vertical: bool = False
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
     # Unused by the sequential rule; kept so older command lines still parse.
     chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])

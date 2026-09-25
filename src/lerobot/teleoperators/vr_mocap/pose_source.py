@@ -217,7 +217,7 @@ class KeyboardPoseSource(PoseSource):
     # chain. The target then re-syncs to wherever the hand ended up.
     chain_rotation: bool = False
     # j/l turn about the world vertical (True) or the gripper's own axis (False, the original)
-    yaw_about_vertical: bool = True
+    yaw_about_vertical: bool = False
     # Rotation keys pivot about the gripper tip (TCP); translation keys move it.
     rotate_about_tip: bool = True
 
