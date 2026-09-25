@@ -36,6 +36,7 @@ the OpenXR backend lives in a separate module and imports its deps lazily).
 import abc
 import logging
 import math
+import os
 import sys
 import threading
 from collections import deque
@@ -211,6 +212,8 @@ class KeyboardPoseSource(PoseSource):
     # rotation request that the teleop splits across the joints as a spring
     # chain. The target then re-syncs to wherever the hand ended up.
     chain_rotation: bool = False
+    # Rotation keys pivot about the gripper tip (TCP); translation keys move it.
+    rotate_about_tip: bool = True
 
     def __init__(self):
         self._pos: dict[str, np.ndarray] = {}
@@ -345,9 +348,10 @@ class KeyboardPoseSource(PoseSource):
         # orientation target many presses ahead of IK in a single tick.
         rot_axis_angle = np.zeros(3)
         rot_synced = False
-        # Pivot for i/k/j/l/u/o: the hand origin (wrist), not the TCP tip.
-        # Holding the tip fixed made the wrist orbit it and the apparent
-        # rotation center jump whenever the axis changed.
+        # Pivot for i/k/j/l/u/o. The operator wants the gripper TIP (the TCP,
+        # 8 cm out from the hand) to be the point that stays put while the
+        # gripper turns, and the point the translation keys move. The older
+        # wrist pivot is kept behind rotate_about_tip=False.
         pivot_hand = hand_pos_from_tcp(act_pos, np.asarray(current_ee[side][1], dtype=float))
 
         def _body_rot(local_axis: np.ndarray, angle: float, world_axis: np.ndarray | None = None) -> None:
@@ -388,7 +392,10 @@ class KeyboardPoseSource(PoseSource):
                 rot_synced = True
             rot_axis_angle[:3] += local_axis * angle
 
-        for ch in self._drain_keys():
+        keys = self._drain_keys()
+        if keys and os.environ.get("VR_TELEOP_DEBUG"):
+            print(f"[teleop] keys drained: {keys}", flush=True)
+        for ch in keys:
             if ch == "w":
                 pos[0] += POS_STEP
             elif ch == "s":
@@ -472,8 +479,11 @@ class KeyboardPoseSource(PoseSource):
                 rot_angle = MAX_ROT_DELTA_PER_TICK_RAD
             quat[:] = quat_mul(quat, axis_angle_to_quat(rot_axis_angle / rot_angle, rot_angle))
             quat[:] = quat / np.linalg.norm(quat)
-            # Keep the wrist/hand pivot fixed; tip follows on a sphere about it.
-            pos[:] = tcp_pos_from_hand(pivot_hand, quat)
+            if self.rotate_about_tip:
+                pos[:] = act_pos                      # the tip stays where it is
+            else:
+                # Keep the wrist/hand pivot fixed; tip follows on a sphere about it.
+                pos[:] = tcp_pos_from_hand(pivot_hand, quat)
         else:
             quat[:] = quat / np.linalg.norm(quat)
 

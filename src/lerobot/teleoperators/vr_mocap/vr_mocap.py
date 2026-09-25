@@ -195,6 +195,8 @@ class VRMocap(Teleoperator):
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)
+        if hasattr(self._source, "rotate_about_tip"):
+            self._source.rotate_about_tip = bool(self.config.rotate_about_tip)
         self._source.reset({s: self._ik.get_ee_pose(s) for s in SIDES})
         self._source.start()
 
@@ -284,7 +286,8 @@ class VRMocap(Teleoperator):
             # VR_TELEOP_DEBUG=<n>: print the right arm's joints every n ticks so a
             # key press can be seen to move joints in the REAL teleop loop
             j = np.degrees(self._ik.joint_positions("right"))
-            print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}", flush=True)
+            tip = np.asarray(self._ik.get_ee_pose("right")[0], float) * 100
+            print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}  tip cm = {np.round(tip, 1).tolist()}", flush=True)
         self._tick += 1
         return self._joint_action()
 
