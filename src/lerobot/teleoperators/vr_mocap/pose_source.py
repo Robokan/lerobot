@@ -396,10 +396,12 @@ class KeyboardPoseSource(PoseSource):
                 _body_rot(np.array([0.0, 1.0, 0.0]), ROT_STEP)
             elif ch == "k":
                 _body_rot(np.array([0.0, 1.0, 0.0]), -ROT_STEP)
+            # world axis is -Z so that L turns the same way it did before the
+            # yaw moved from the hand's axis to vertical (the operator's frame)
             elif ch == "j":
-                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP, world_axis=np.array([0.0, 0.0, 1.0]))
+                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP, world_axis=np.array([0.0, 0.0, -1.0]))
             elif ch == "l":
-                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP, world_axis=np.array([0.0, 0.0, 1.0]))
+                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP, world_axis=np.array([0.0, 0.0, -1.0]))
             elif ch == "u":
                 _body_rot(np.array([1.0, 0.0, 0.0]), ROT_STEP)
             elif ch == "o":
