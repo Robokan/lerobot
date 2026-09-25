@@ -213,7 +213,7 @@ class KeyboardPoseSource(PoseSource):
     # chain. The target then re-syncs to wherever the hand ended up.
     chain_rotation: bool = False
     # Rotation keys pivot about the gripper tip (TCP); translation keys move it.
-    rotate_about_tip: bool = True
+    rotate_about_tip: bool = False
 
     def __init__(self):
         self._pos: dict[str, np.ndarray] = {}

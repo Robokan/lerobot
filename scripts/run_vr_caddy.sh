@@ -76,7 +76,7 @@ RESUME="${RESUME:-0}"                   # 1 = append to the exact REPO_ID given 
 #                     in earlier, e.g. 0.6,0.6,0.6,0.6,1,1,1.
 #   IK_SPRING_WEIGHTS spring stiffness toward the rest pose (default
 #                     1,1,1,0.6,0.02,0.02,0.02: stiff shoulder, slack wrist).
-#   IK_SPRING_GAIN    rest-spring strength. OFF by default (0); 0.15 was the old feel.
+#   IK_SPRING_GAIN    rest-spring strength (default 0.15, the original feel; 0 = off).
 IK_JOINT_WEIGHTS="${IK_JOINT_WEIGHTS:-}"
 IK_SPRING_WEIGHTS="${IK_SPRING_WEIGHTS:-}"
 IK_SPRING_GAIN="${IK_SPRING_GAIN:-}"
