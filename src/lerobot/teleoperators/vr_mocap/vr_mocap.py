@@ -341,8 +341,14 @@ class VRMocap(Teleoperator):
                 # or the keys' turn alike. A shoulder off that axis must not
                 # hold the wrist back (a roll of the gripper at a bent elbow);
                 # one on it turns first as always (the vertical at any elbow).
+                # The requested rotation, as a world-frame axis-angle. mju_subQuat
+                # returns it in the GRIPPER's frame, so it has to be rotated out
+                # before being compared with world-frame joint axes.
+                _qn = np.asarray(ik.get_ee_pose(side)[1], float)
+                _vl = np.zeros(3)
+                ik._mujoco.mju_subQuat(_vl, np.asarray(tgt.quat, float), _qn)
                 _v = np.zeros(3)
-                ik._mujoco.mju_subQuat(_v, np.asarray(tgt.quat, float), np.asarray(ik.get_ee_pose(side)[1], float))
+                ik._mujoco.mju_rotVecQuat(_v, _vl, _qn)
                 _n = float(np.linalg.norm(_v))
                 _c = float(ik.joint_axis_world(side, 2) @ _v) / _n if _n > 1e-9 else 0.0
                 j3_can = _n < math.radians(0.5) or abs(_c) > 0.35
@@ -380,6 +386,24 @@ class VRMocap(Teleoperator):
                 elif not rot_on:
                     self._roll_side[side] = 0.0
                 self._rot_prev[side] = rot_on
+                # Wrist first, shoulder only when the wrist runs out. While the
+                # wrist roll still has travel in the direction THIS turn needs,
+                # the shoulder roll is frozen. With the default stop the wrist
+                # has no travel on the L side, so L still leads with the
+                # shoulder exactly as before; with WRIST_STOP=0 the wrist takes
+                # the whole turn first and the shoulder waits. Without this the
+                # solver shared the turn by weight and the shoulder crept round
+                # from the first tick (-5 deg by the time the wrist reached -45).
+                _c5 = float(ik.joint_axis_world(side, 4) @ _v) / _n if _n > 1e-9 else 0.0
+                _travel5 = (ik.limits_high[side][4] - q5) if _c5 > 0 else (q5 - ik.limits_low[side][4])
+                if abs(_c5) > 0.35:
+                    if _travel5 > math.radians(1.0):
+                        ik.limits_low[side][2] = max(ik.limits_low[side][2], q3 - eps)
+                        ik.limits_high[side][2] = min(ik.limits_high[side][2], q3 + eps)
+
+                if self._debug_every and side == "right" and os.environ.get("PIN_DEBUG"):
+                    print(f"[axis] tick {self._tick} n {math.degrees(_n):.2f} c3 {_c:+.2f} c5 {_c5:+.2f} "
+                          f"trav5 {math.degrees(_travel5):.1f} q3 {math.degrees(q3):.1f} q5 {math.degrees(q5):.1f}", flush=True)
                 sgn = self._roll_side.get(side, 0.0)
                 if self._debug_every and side == "right" and os.environ.get("PIN_DEBUG"):
                     print(f"[pin] tick {self._tick} rot_on {int(rot_on)} sgn {sgn:+.0f} u {math.degrees((q3-d3)+(q5-d5)):.1f} "

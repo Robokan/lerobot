@@ -549,6 +549,11 @@ class IKSolver:
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = np.clip(q[k] + dq[k], lo[k], hi[k])
                     new_pos_err, _, _ = pose_error()
+                    if _IK_DEBUG:
+                        applied = np.array([self.data.qpos[qi] for qi in idx]) - q
+                        print(f"[ikfb] {side} pos {pos_n*100:.2f}->{float(np.linalg.norm(new_pos_err))*100:.2f} cm  "
+                              f"dq_p(deg) {np.round(np.degrees(dq_p), 2).tolist()}  applied {np.round(np.degrees(applied), 2).tolist()}  "
+                              f"w {np.round(weights, 3).tolist()}  lo-hi width(deg) {np.round(np.degrees(hi - lo), 1).tolist()}", flush=True)
                     if float(np.linalg.norm(new_pos_err)) >= pos_n - 1e-5:
                         for k, qi in enumerate(idx):
                             self.data.qpos[qi] = q[k]
