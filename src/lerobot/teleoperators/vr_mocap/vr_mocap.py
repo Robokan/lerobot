@@ -185,7 +185,11 @@ class VRMocap(Teleoperator):
         )
 
         # the DEFAULT pose for the rotation keys: where the arm is at launch
-        self._default_q = {s: self._ik.joint_positions(s).copy() for s in SIDES}
+        # clipped to the solver's limits (the elbow is floored at 3 deg), so
+        # "default" is a pose the arm can actually reach
+        self._default_q = {s: np.clip(self._ik.joint_positions(s), self._ik.limits_low[s], self._ik.limits_high[s])
+                           for s in SIDES}
+        self._homing: set[str] = set()
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)
@@ -240,6 +244,24 @@ class VRMocap(Teleoperator):
             tgt = targets.get(side)
             if tgt is None or not tgt.active:
                 continue  # hold: leave IK qpos (and thus joint output) unchanged
+            take_home = getattr(self._source, "take_home_request", None)
+            if callable(take_home) and take_home(side):
+                self._homing.add(side)
+            if side in self._homing:
+                # h: walk every joint back to the default pose at the speed cap,
+                # then hand control back with the target on the arm
+                q_now = ik.joint_positions(side)
+                delta = self._default_q[side] - q_now
+                lim = ik.max_delta_per_call_rad
+                step = np.clip(delta, -lim, lim)
+                ik.set_joint_positions(side, q_now + step)
+                resync = getattr(self._source, "resync_target", None)
+                if callable(resync):
+                    p, qt = ik.get_ee_pose(side)
+                    resync(side, p, qt)
+                if float(np.max(np.abs(delta))) <= lim + 1e-9:
+                    self._homing.discard(side)
+                continue
             take = getattr(self._source, "take_rotation_request", None)
             req = take(side) if callable(take) else None
             if req is not None:

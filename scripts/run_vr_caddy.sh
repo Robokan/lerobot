@@ -45,6 +45,7 @@
 #   REPO_ID=local/openarm_caddy6_vr_b SEED=2 bash scripts/run_vr_caddy.sh
 #   MODE=teleop bash scripts/run_vr_caddy.sh           # practise, record nothing
 #   DRIVER=keyboard bash scripts/run_vr_caddy.sh       # no headset: keys in the MuJoCo window
+#                                                      #   (h = return the arm to its launch pose)
 #
 # Dataset naming: this fork's lerobot-record stamps the time onto the repo id,
 # so each session writes a NEW dataset, e.g. local/openarm_caddy6_vr_20260924_183012.

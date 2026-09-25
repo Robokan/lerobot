@@ -216,6 +216,7 @@ class KeyboardPoseSource(PoseSource):
         self._pos: dict[str, np.ndarray] = {}
         self._quat: dict[str, np.ndarray] = {}
         self._rot_request: dict[str, tuple[np.ndarray, float]] = {}
+        self._home_request: set[str] = set()
         self._grip: dict[str, float] = {s: 0.0 for s in SIDES}
         self._active_side = "right"
         self._queue: deque[str] = deque()
@@ -236,6 +237,7 @@ class KeyboardPoseSource(PoseSource):
   [ / ]     gripper open / close
   Tab       switch active hand
   Space     reset targets to current pose
+  h         return the arm to the default (launch) pose
   c         cycle viewer cam (ego / right / left / free)
   y / t     start / stop recording (record mode)
   n / q     end episode early / quit recording
@@ -290,6 +292,13 @@ class KeyboardPoseSource(PoseSource):
         holds the new pose instead of dragging the hand back a step."""
         self._pos[side] = np.asarray(pos, dtype=float).copy()
         self._quat[side] = np.asarray(quat, dtype=float).copy()
+
+    def take_home_request(self, side) -> bool:
+        """True once if h was pressed for this hand since the last check."""
+        if side in self._home_request:
+            self._home_request.discard(side)
+            return True
+        return False
 
     def take_rotation_request(self, side):
         """(axis_world, angle) queued by the rotation keys this tick, or None."""
@@ -398,6 +407,8 @@ class KeyboardPoseSource(PoseSource):
                 _body_rot(np.array([0.0, 1.0, 0.0]), -ROT_STEP)
             # world axis is -Z so that L turns the same way it did before the
             # yaw moved from the hand's axis to vertical (the operator's frame)
+            elif ch == "h":
+                self._home_request.add(side)          # go back to the default pose
             elif ch == "j":
                 _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP, world_axis=np.array([0.0, 0.0, -1.0]))
             elif ch == "l":
