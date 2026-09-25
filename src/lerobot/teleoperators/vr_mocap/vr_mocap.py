@@ -36,7 +36,7 @@ import os
 
 import numpy as np
 
-from lerobot.robots.mujoco_bi_openarm import gripper_m_to_deg
+from lerobot.robots.mujoco_bi_openarm import FINGER_OPEN_M, gripper_m_to_deg
 from lerobot.lerobot_types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -189,7 +189,6 @@ class VRMocap(Teleoperator):
         # "default" is a pose the arm can actually reach
         self._default_q = {s: np.clip(self._ik.joint_positions(s), self._ik.limits_low[s], self._ik.limits_high[s])
                            for s in SIDES}
-        self._homing: set[str] = set()
         self._tick = 0
         self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
         self._source = self._make_source()
@@ -250,21 +249,22 @@ class VRMocap(Teleoperator):
                 continue  # hold: leave IK qpos (and thus joint output) unchanged
             take_home = getattr(self._source, "take_home_request", None)
             if callable(take_home) and take_home(side):
-                self._homing.add(side)
-            if side in self._homing:
-                # h: walk every joint back to the default pose at the speed cap,
-                # then hand control back with the target on the arm
-                q_now = ik.joint_positions(side)
-                delta = self._default_q[side] - q_now
-                lim = ik.max_delta_per_call_rad
-                step = np.clip(delta, -lim, lim)
-                ik.set_joint_positions(side, q_now + step)
+                # h: TELEPORT to the default pose -- the IK copy jumps, the
+                # gripper opens, the target re-syncs, and the sim robot is told
+                # to set its joints rather than swing there.
+                from lerobot.robots.mujoco_bi_openarm import viewer_keys as _vk
+
+                ik.set_joint_positions(side, self._default_q[side])
+                ik.set_finger(side, FINGER_OPEN_M)
+                self._grip_m[side] = float(FINGER_OPEN_M)
                 resync = getattr(self._source, "resync_target", None)
                 if callable(resync):
                     p, qt = ik.get_ee_pose(side)
                     resync(side, p, qt)
-                if float(np.max(np.abs(delta))) <= lim + 1e-9:
-                    self._homing.discard(side)
+                reset_grip = getattr(self._source, "reset_grip", None)
+                if callable(reset_grip):
+                    reset_grip(side, FINGER_OPEN_M)
+                _vk.request_teleport()
                 continue
             take = getattr(self._source, "take_rotation_request", None)
             req = take(side) if callable(take) else None

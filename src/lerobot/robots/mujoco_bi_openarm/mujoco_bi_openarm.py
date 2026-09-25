@@ -389,6 +389,21 @@ class MujocoBiOpenArm(Robot):
                 grip_targets[side] = gripper_deg_to_m(goal_deg[gkey])
 
         d = self._data
+        from .viewer_keys import take_teleport
+
+        if take_teleport():
+            # h in teleop: set the joints to the commanded targets outright and
+            # kill their velocity -- a jump to the default pose, not a swing
+            for (side, motor), tgt in arm_targets.items():
+                info = self._arm_ctrl[(side, motor)]
+                d.qpos[info["qadr"]] = tgt
+                d.qvel[info["dadr"]] = 0.0
+            for side, tgt_m in grip_targets.items():
+                for f in self._gripper_ctrl[side]["fingers"]:
+                    if "qadr" in f:
+                        d.qpos[f["qadr"]] = tgt_m
+                        d.qvel[f["dadr"]] = 0.0
+            mujoco.mj_forward(self._model, d)
         for _ in range(self._substeps):
             for (side, motor), tgt in arm_targets.items():
                 info = self._arm_ctrl[(side, motor)]

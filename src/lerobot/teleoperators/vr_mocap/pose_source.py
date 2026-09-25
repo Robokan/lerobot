@@ -296,6 +296,9 @@ class KeyboardPoseSource(PoseSource):
         self._pos[side] = np.asarray(pos, dtype=float).copy()
         self._quat[side] = np.asarray(quat, dtype=float).copy()
 
+    def reset_grip(self, side, grip_m):
+        self._grip[side] = float(grip_m)
+
     def take_home_request(self, side) -> bool:
         """True once if h was pressed for this hand since the last check."""
         if side in self._home_request:
@@ -415,7 +418,7 @@ class KeyboardPoseSource(PoseSource):
             # world axis is -Z so that L turns the same way it did before the
             # yaw moved from the hand's axis to vertical (the operator's frame)
             elif ch == "h":
-                self._home_request.add(side)          # go back to the default pose
+                self._home_request.update(SIDES)      # session reset: BOTH arms to default
             elif ch == "j":
                 _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP, world_axis=np.array([0.0, 0.0, -1.0]))
             elif ch == "l":

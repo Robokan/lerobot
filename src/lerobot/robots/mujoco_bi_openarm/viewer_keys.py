@@ -119,6 +119,24 @@ def get_hud_text() -> tuple[str, str]:
         return _hud["prompt"], _hud["status"]
 
 
+# Teleport request (teleop -> sim robot): on the next send_action the robot
+# SETS its joints to the commanded targets instead of driving toward them, so
+# an "h" home is a jump, not a swing across the table.
+_teleport: dict[str, bool] = {"pending": False}
+
+
+def request_teleport() -> None:
+    with _lock:
+        _teleport["pending"] = True
+
+
+def take_teleport() -> bool:
+    with _lock:
+        v = _teleport["pending"]
+        _teleport["pending"] = False
+    return v
+
+
 def drain_recording_controls() -> list[str]:
     """Return and clear pending viewer recording-control requests."""
     with _lock:
