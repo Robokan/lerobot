@@ -66,6 +66,19 @@ FPS="${FPS:-30}"                 # what the scripted datasets and the policies u
 EPISODE_TIME_S="${EPISODE_TIME_S:-0}"   # 0 = until A / t
 RESET_TIME_S="${RESET_TIME_S:-3}"       # the scene re-lays out at the start of this
 RESUME="${RESUME:-0}"                   # 1 = append to the exact REPO_ID given (no time stamp)
+# IK feel (see src/lerobot/teleoperators/vr_mocap/ik.py). Seven values, J1..J7
+# = shoulder(3), elbow, wrist(3). Leave unset for the defaults.
+#   IK_JOINT_WEIGHTS  willingness of each joint to serve ORIENTATION changes
+#                     (default 0.15,0.15,0.15,0.35,1,1,1: the wrist does the
+#                     turning, the shoulder barely helps until the wrist hits
+#                     its limit). Raise the first three to bring the shoulder
+#                     in earlier, e.g. 0.6,0.6,0.6,0.6,1,1,1.
+#   IK_SPRING_WEIGHTS spring stiffness toward the rest pose (default
+#                     1,1,1,0.6,0.02,0.02,0.02: stiff shoulder, slack wrist).
+#   IK_SPRING_GAIN    overall spring strength (default 0.15).
+IK_JOINT_WEIGHTS="${IK_JOINT_WEIGHTS:-}"
+IK_SPRING_WEIGHTS="${IK_SPRING_WEIGHTS:-}"
+IK_SPRING_GAIN="${IK_SPRING_GAIN:-}"
 SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
@@ -113,6 +126,9 @@ TELEOP_ARGS=(
   --teleop.driver="${DRIVER}"
   --teleop.vr_hz="${FPS}"
 )
+[[ -n "${IK_JOINT_WEIGHTS}" ]]  && TELEOP_ARGS+=(--teleop.joint_weights="[${IK_JOINT_WEIGHTS}]")
+[[ -n "${IK_SPRING_WEIGHTS}" ]] && TELEOP_ARGS+=(--teleop.spring_weights="[${IK_SPRING_WEIGHTS}]")
+[[ -n "${IK_SPRING_GAIN}" ]]    && TELEOP_ARGS+=(--teleop.spring_gain="${IK_SPRING_GAIN}")
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"
