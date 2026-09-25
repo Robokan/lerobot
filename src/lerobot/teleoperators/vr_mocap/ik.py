@@ -31,8 +31,11 @@ quaternion helpers below) stay import-safe in environments without the
 """
 
 import math
+import os
 
 import numpy as np
+
+_IK_DEBUG = os.environ.get("IK_DEBUG", "") not in ("", "0")
 
 # Body / joint names in the OpenArm MuJoCo model.
 LEFT_TCP_BODY = "openarm_left_hand_tcp"
@@ -480,6 +483,8 @@ class IKSolver:
             pos_n = float(np.linalg.norm(pos_err))
             ori_n = float(np.linalg.norm(ori_err))
             hold_pos = pos_n < 0.008 and ori_n > 1e-4
+            if _IK_DEBUG:
+                print(f"[ik] {side} pos_cm {pos_n * 100:.3f} ori_deg {math.degrees(ori_n):.3f} hold {int(hold_pos)}", flush=True)
             if hold_pos:
                 ori_err = _clamp_norm(ori_err, min(self.max_ori_err_rad * 1.6, math.radians(8.0)))
                 N = _nullspace_projector(Jp)

@@ -35,7 +35,16 @@ class VRMocapConfig(TeleoperatorConfig):
 
     # IK model + solver params.
     model_path: str = DEFAULT_MODEL_PATH
-    dls_lambda: float = 0.05
+    # Damped-least-squares damping. 0.05 was under-damped near the reach
+    # limit: with the elbow on its floor the commanded wrist reversed
+    # direction on 169 of 180 consecutive ticks and the arm visibly shook
+    # (J6/J7 reversing 33 and 51 times by more than half a degree). 0.15
+    # removes it with no measured cost -- every translation moves the same
+    # distance, the reach is unchanged and the roll ordering is intact --
+    # and it makes sideways moves at full extension cleaner (a 14.6 cm pure
+    # -y move where 0.05 gave 13.8 cm plus cross-axis error). 0.25 is too
+    # much: the solver stops tracking (a 240-tick lift did not move at all).
+    dls_lambda: float = 0.15
     max_iter: int = 10
 
     # Redundancy resolution. joint_weights is J1..J7 (shoulder -> wrist): a

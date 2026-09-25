@@ -105,6 +105,8 @@ IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
+HOMING_BOOST="${HOMING_BOOST:-}"        # solver: extra willingness for joints heading back to the rest pose
+DLS_LAMBDA="${DLS_LAMBDA:-}"            # solver: damping (raise near singularities)
 TARGET_LEASH_DEG="${TARGET_LEASH_DEG:-}"   # how far the pose target may lead the commanded tip
 TARGET_LEASH_M="${TARGET_LEASH_M:-}"
 ELBOW_DEG="${ELBOW_DEG:-}"              # starting elbow bend (deg). The launch pose is also the h pose and the springs' rest.
@@ -173,6 +175,8 @@ TELEOP_ARGS=(
 [[ -n "${IK_WRIST_LIMIT_DEG}" ]]  && TELEOP_ARGS+=(--teleop.wrist_limit_deg="[${IK_WRIST_LIMIT_DEG}]")
 [[ -n "${IK_CHAIN_WEIGHTS}" ]]    && TELEOP_ARGS+=(--teleop.chain_weights="[${IK_CHAIN_WEIGHTS}]")
 [[ "${CHAIN_ROTATION}" == "1" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=true)
+[[ -n "${HOMING_BOOST}" ]]        && TELEOP_ARGS+=(--teleop.homing_boost="${HOMING_BOOST}")
+[[ -n "${DLS_LAMBDA}" ]]          && TELEOP_ARGS+=(--teleop.dls_lambda="${DLS_LAMBDA}")
 [[ -n "${TARGET_LEASH_DEG}" ]]    && TELEOP_ARGS+=(--teleop.target_leash_deg="${TARGET_LEASH_DEG}")
 [[ -n "${TARGET_LEASH_M}" ]]      && TELEOP_ARGS+=(--teleop.target_leash_m="${TARGET_LEASH_M}")
 
