@@ -293,14 +293,11 @@ class KeyboardPoseSource(PoseSource):
 
     def take_rotation_request(self, side):
         """(axis_world, angle) queued by the rotation keys this tick, or None."""
-        v, _ = self._rot_request.pop(side, (None, 0.0))
-        if v is None:
+        axis, ang = self._rot_request.pop(side, (None, 0.0))
+        if axis is None or abs(ang) < 1e-12:
             return None
-        ang = float(np.linalg.norm(v))
-        if ang < 1e-12:
-            return None
-        ang = min(ang, MAX_ROT_DELTA_PER_TICK_RAD)
-        return v / float(np.linalg.norm(v)), ang
+        ang = math.copysign(min(abs(ang), MAX_ROT_DELTA_PER_TICK_RAD), ang)
+        return axis / max(float(np.linalg.norm(axis)), 1e-9), ang
 
     def _drain_keys(self) -> list[str]:
         with self._lock:
@@ -344,19 +341,30 @@ class KeyboardPoseSource(PoseSource):
         # rotation center jump whenever the axis changed.
         pivot_hand = hand_pos_from_tcp(act_pos, np.asarray(current_ee[side][1], dtype=float))
 
-        def _body_rot(local_axis: np.ndarray, angle: float) -> None:
+        def _body_rot(local_axis: np.ndarray, angle: float, world_axis: np.ndarray | None = None) -> None:
             """Queue a body-fixed rotation about the hand / wrist origin.
 
             World-fixed pitch about +Y is singular at the hang pose and IK
             rejects it; body-fixed axes track. The hand pivot stays fixed and
             the TCP target is rewritten to match the new orientation.
+
+            In chain mode a ``world_axis`` overrides the body axis: yaw is
+            about VERTICAL, as the key help says ("rot Z"), not about the
+            hand's own axis. With the arm hanging, the hand's axis points
+            forward and the base yaw joint is perpendicular to it -- so a
+            body-fixed yaw could only ever roll the forearm, and the shoulder
+            never turned with the wrist.
             """
             nonlocal pos, quat, rot_synced
             if self.chain_rotation:
-                # world-frame axis of the requested body-fixed rotation
-                axis_w = quat_rotate(np.asarray(current_ee[side][1], dtype=float), local_axis)
-                prev_axis, prev_ang = self._rot_request.get(side, (np.zeros(3), 0.0))
-                self._rot_request[side] = (prev_axis * prev_ang + axis_w * angle, 1.0)
+                if world_axis is not None:
+                    axis_w = np.asarray(world_axis, dtype=float)
+                else:
+                    axis_w = quat_rotate(np.asarray(current_ee[side][1], dtype=float), local_axis)
+                # keep the axis and a SIGNED angle: the sign is the key direction
+                # (L negative, J positive) and decides the joint order
+                prev_axis, prev_ang = self._rot_request.get(side, (axis_w, 0.0))
+                self._rot_request[side] = (axis_w, prev_ang + angle)
                 if not rot_synced:            # keep the target ON the hand, not ahead of it
                     quat = np.asarray(current_ee[side][1], dtype=float).copy()
                     pos = np.asarray(current_ee[side][0], dtype=float).copy()
@@ -389,9 +397,9 @@ class KeyboardPoseSource(PoseSource):
             elif ch == "k":
                 _body_rot(np.array([0.0, 1.0, 0.0]), -ROT_STEP)
             elif ch == "j":
-                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP)
+                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP, world_axis=np.array([0.0, 0.0, 1.0]))
             elif ch == "l":
-                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP)
+                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP, world_axis=np.array([0.0, 0.0, 1.0]))
             elif ch == "u":
                 _body_rot(np.array([1.0, 0.0, 0.0]), ROT_STEP)
             elif ch == "o":

@@ -59,22 +59,18 @@ class VRMocapConfig(TeleoperatorConfig):
     spring_weights: list[float] = field(
         default_factory=lambda: [1.0, 1.0, 1.0, 0.6, 0.02, 0.02, 0.02]
     )
-    spring_gain: float = 0.15
+    spring_gain: float = 0.0     # rest springs OFF (was 0.15); IK_SPRING_GAIN re-enables
     # Wind-up hardening per joint (deg, 0 = off): a joint's willingness fades as
     # it winds away from rest, handing the motion to the next joint. Default
     # hardens only the wrist, over 45 deg = halfway through its travel.
-    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 45.0, 45.0, 45.0])
-    # Keyboard rotation keys as a spring chain: the requested rotation is split
-    # across the joints in joint space by alignment / stiffness, so wrist AND
-    # shoulder turn together from the first degree, the softer one more. A
-    # joint at its limit in the needed direction has no compliance there.
+    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])   # off with the springs
+    # Bias toward joints that are coming home (part of the rest-spring feel). 0 = off.
+    homing_boost: float = 0.0
+    # Keyboard rotation keys turn the aligned joints ONE AT A TIME, each to its
+    # limit: L goes shoulder-first then wrist, J goes wrist-first then shoulder.
     chain_rotation: bool = True
-    # Stiffness J1..J7 for the OUTBOUND split (relative; lower = moves more).
-    # Shoulder softer than the wrist, so the shoulder visibly turns with the
-    # wrist and, with equal ranges, reaches its limit first; the wrist then
-    # continues alone. The return order is fixed (wrist, elbow, shoulder) and
-    # does not depend on these.
-    chain_weights: list[float] = field(default_factory=lambda: [0.6, 0.6, 0.6, 1.0, 1.0, 1.0, 1.0])
+    # Unused by the sequential rule; kept so older command lines still parse.
+    chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 
     # Elbow bend (deg) of the pose the springs pull toward. Purely a *desire*: the
     # arm boots with the elbow straight (as the real robot does) and is never

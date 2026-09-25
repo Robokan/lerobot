@@ -75,7 +75,7 @@ RESUME="${RESUME:-0}"                   # 1 = append to the exact REPO_ID given 
 #                     in earlier, e.g. 0.6,0.6,0.6,0.6,1,1,1.
 #   IK_SPRING_WEIGHTS spring stiffness toward the rest pose (default
 #                     1,1,1,0.6,0.02,0.02,0.02: stiff shoulder, slack wrist).
-#   IK_SPRING_GAIN    overall spring strength (default 0.15).
+#   IK_SPRING_GAIN    rest-spring strength. OFF by default (0); 0.15 was the old feel.
 IK_JOINT_WEIGHTS="${IK_JOINT_WEIGHTS:-}"
 IK_SPRING_WEIGHTS="${IK_SPRING_WEIGHTS:-}"
 IK_SPRING_GAIN="${IK_SPRING_GAIN:-}"
@@ -89,11 +89,8 @@ IK_LIMIT_MARGIN_DEG="${IK_LIMIT_MARGIN_DEG:-}"
 #                     degrees from rest, so the shoulder takes over progressively.
 #                     Smaller = shoulder joins sooner. 0 = off for that joint.
 IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
-#   IK_CHAIN_WEIGHTS  keyboard rotation keys as a spring chain: stiffness J1..J7,
-#                     lower = moves more (default 0.6,0.6,0.6,1,1,1,1: shoulder
-#                     turns ~1.7x the wrist outbound, reaches its limit first,
-#                     wrist continues; return is always wrist first). A joint
-#                     at its limit in the needed direction drops out.
+#   (rotation keys: L turns the shoulder first then the wrist, J the wrist first
+#    then the shoulder, each joint to its limit. IK_CHAIN_WEIGHTS is unused now.)
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-1}"
