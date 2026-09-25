@@ -63,7 +63,11 @@ class VRMocapConfig(TeleoperatorConfig):
     # Wind-up hardening per joint (deg, 0 = off): a joint's willingness fades as
     # it winds away from rest, handing the motion to the next joint. Default
     # hardens only the wrist, over 45 deg = halfway through its travel.
-    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])   # off with the springs
+    # Wrist wind-up hardening: the wrist's willingness to keep turning fades
+    # over 45 deg from rest, so the shoulder joins a turn from about halfway
+    # through the wrist's travel instead of at its 90 deg stop. Measured on
+    # the real launch: shoulder onset at wrist 90 deg -> 44 deg. Wrist only.
+    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 45.0, 45.0, 45.0])
     # Bias toward joints that are coming home (part of the rest-spring feel). 0 = off.
     homing_boost: float = 6.0
     # Keyboard rotation keys turn the aligned joints ONE AT A TIME, each to its
