@@ -351,6 +351,12 @@ class IKSolver:
         # powers up with the elbow straight, which is a singularity, so capturing
         # the start pose would make the springs hold the arm in the one
         # configuration it most needs to leave.
+        # Per-side mask (7 values, or None) limiting which joints may serve
+        # ORIENTATION. The caller sets it for a gesture whose turn belongs to
+        # named joints; without it the solver happily rolls the tool with the
+        # elbow and wrist pitch once the intended joints are pinned, which
+        # contorts the arm and does not retrace on the way back.
+        self.ori_joint_mask: dict[str, np.ndarray | None] = {}
         self._rest_q: dict[str, np.ndarray] = {}
         for side in self.joint_ids:
             r = np.zeros(7)
@@ -483,6 +489,9 @@ class IKSolver:
                 w_ori = (self.joint_weights
                          * self._handover_taper(q, q_rest)
                          * self._limit_taper(q, lo, hi, np.sign(self._weighted_dls(Jr, ori_err, self.joint_weights, self.dls_lambda))))
+                mask = self.ori_joint_mask.get(side)
+                if mask is not None:
+                    w_ori = w_ori * mask
                 dq_ori = N @ self._weighted_dls(Jr, ori_err, w_ori, self.dls_lambda)
                 dq = dq_pos + dq_ori
             else:
@@ -704,6 +713,20 @@ class IKSolver:
         val = float(np.clip(val, 0.0, FINGER_OPEN_M))
         for idx in self.finger_qpos_idx[side]:
             self.data.qpos[idx] = val
+
+    def tool_axis_alignment(self, side, k: int) -> float:
+        """|cos| between arm joint ``k``'s world axis and the tool's own z axis.
+
+        1 = the joint turns the tool about its own axis (it can serve a roll
+        of the tool); 0 = it is perpendicular and cannot contribute at all.
+        With the elbow bent the upper-arm roll leaves the tool axis, so a rule
+        written for the straight arm has to know to stop waiting for it.
+        """
+        j = self.joint_ids[side][k]
+        a = self.data.xmat[self.model.jnt_bodyid[j]].reshape(3, 3) @ self.model.jnt_axis[j]
+        body_id = self.left_tcp_id if side == "left" else self.right_tcp_id
+        z = self.data.xmat[body_id].reshape(3, 3)[:, 2]
+        return abs(float(a @ z) / max(float(np.linalg.norm(a) * np.linalg.norm(z)), 1e-9))
 
     def rest_pose(self, side):
         """The pose the springs pull toward, for ``side`` (7 joint angles, rad)."""

@@ -314,6 +314,16 @@ class KeyboardPoseSource(PoseSource):
             return True
         return False
 
+    def rotation_axis(self, side) -> str | None:
+        """Which rotation gesture is in progress for ``side``: 'yaw' (j/l),
+        'pitch' (i/k), 'roll' (u/o), or None. Only the active hand answers."""
+        if side != self._active_side:
+            return None
+        for keys, name in ((("j", "l"), "yaw"), (("i", "k"), "pitch"), (("u", "o"), "roll")):
+            if any(k in self._held for k in keys):
+                return name
+        return None
+
     def rotation_active(self, side) -> bool:
         """True while a rotation gesture (i/k/j/l/u/o held) is in progress for
         ``side`` -- the ticks the tip anchor is alive."""

@@ -45,6 +45,9 @@ from .config_vr_mocap import VRMocapConfig
 
 logger = logging.getLogger(__name__)
 
+# J3 (upper-arm roll) and J5 (forearm roll): the two joints a yaw gesture turns.
+_ROLL_PAIR_MASK = np.array([0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0])
+
 ARM_JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7"]
 MOTOR_NAMES = ARM_JOINT_NAMES + ["gripper"]
 SIDES = ["right", "left"]  # right-first, to match the robot
@@ -200,6 +203,8 @@ class VRMocap(Teleoperator):
         self._tick = 0
         self._actual_q: dict = {}
         self._last_tgt: dict = {}
+        self._rot_prev: dict = {}
+        self._roll_side: dict = {}
         self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
         # artificial wrist-roll range (see config.wrist_limit_deg)
         lo_deg, hi_deg = self.config.wrist_limit_deg
@@ -307,6 +312,7 @@ class VRMocap(Teleoperator):
             # -85/+85. The freeze once blamed on the pins was the solver's
             # no-twist guard (see IKSolver.solve_ik best-effort step).
             model_lo, model_hi = self._limits_model[side]
+            rot_active = getattr(self._source, "rotation_active", None)
             if True:
                 qj = ik.joint_positions(side)
                 q3, q5 = float(qj[2]), float(qj[4])
@@ -318,7 +324,12 @@ class VRMocap(Teleoperator):
                 lo_cfg = max(float(model_lo[2]), math.radians(self.config.shoulder_roll_limit_deg[0]))
                 shi_cfg = min(float(model_hi[2]), math.radians(self.config.shoulder_roll_limit_deg[1]))
                 j3_home = abs(q3 - d3) < tol
-                j3_at_stop = abs(q3 - lo_cfg) < tol
+                # The shoulder roll only shares the tool's axis while the arm
+                # is straight. Bend the elbow and it cannot serve a yaw at all,
+                # so "wrist waits for the shoulder to reach its stop" waits
+                # forever -- at a 90 deg elbow that left L doing nothing.
+                j3_useful = ik.tool_axis_alignment(side, 2) > 0.35
+                j3_at_stop = abs(q3 - lo_cfg) < tol or not j3_useful
                 # wrist, J side: free once the shoulder is home, else only unwind
                 ik.limits_high[side][4] = max(hi_cfg, q5) + eps if j3_home else min(hi_cfg, max(q5, d5) + eps)
                 # wrist, L side: the stop holds until the shoulder is at ITS
@@ -329,6 +340,38 @@ class VRMocap(Teleoperator):
                 ik.limits_low[side][2] = q3 - eps if q5 > d5 + tol else min(lo_cfg, q3) - eps
                 # shoulder, J side: held while the wrist is below rest; home is its stop
                 ik.limits_high[side][2] = q3 + eps if q5 < d5 - tol else max(shi_cfg, q3) + eps
+
+                # Detent at the default pose. ONE held gesture may not pass
+                # THROUGH it: out and back within a press lands exactly where
+                # the press started, and carrying on out the other side takes
+                # a new press. Without this, returning ran straight through
+                # home and out again -- j to the stop then l for the same time
+                # came back to the wrist's 0 but left the shoulder at -18.
+                # u = (J3-d3) + (J5-d5) is monotone along the whole path: 0 at
+                # default, -180 at the L end, +90 at the J end, so "which side
+                # of default" is just its sign.
+                # A yaw gesture is the roll pair's turn and nobody else's.
+                # Held past their limits the solver otherwise keeps rolling the
+                # tool with J2/J4/J6/J7 -- measured: the elbow walked 49 -> 15
+                # deg and J6 -18 -> 35 while the pair sat on its stop, and none
+                # of it came back on the return.
+                rot_axis = getattr(self._source, "rotation_axis", None)
+                ik.ori_joint_mask[side] = (_ROLL_PAIR_MASK
+                                           if callable(rot_axis) and rot_axis(side) == "yaw" else None)
+                rot_on = bool(rot_active(side)) if callable(rot_active) else False
+                if rot_on and not self._rot_prev.get(side):
+                    u0 = (q3 - d3) + (q5 - d5)
+                    self._roll_side[side] = 0.0 if abs(u0) < tol else math.copysign(1.0, u0)
+                elif not rot_on:
+                    self._roll_side[side] = 0.0
+                self._rot_prev[side] = rot_on
+                sgn = self._roll_side.get(side, 0.0)
+                if sgn > 0:      # started on the J side: may not fall below default
+                    ik.limits_low[side][2] = max(ik.limits_low[side][2], min(d3, q3) - eps)
+                    ik.limits_low[side][4] = max(ik.limits_low[side][4], min(d5, q5) - eps)
+                elif sgn < 0:    # started on the L side: may not rise above default
+                    ik.limits_high[side][2] = min(ik.limits_high[side][2], max(d3, q3) + eps)
+                    ik.limits_high[side][4] = min(ik.limits_high[side][4], max(d5, q5) + eps)
             take = getattr(self._source, "take_rotation_request", None)
             req = take(side) if callable(take) else None
             if req is not None:

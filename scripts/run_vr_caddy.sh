@@ -105,6 +105,8 @@ IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
+TARGET_LEASH_DEG="${TARGET_LEASH_DEG:-}"   # how far the pose target may lead the commanded tip
+TARGET_LEASH_M="${TARGET_LEASH_M:-}"
 ELBOW_DEG="${ELBOW_DEG:-}"              # starting elbow bend (deg). The launch pose is also the h pose and the springs' rest.
 ARM_KP="${ARM_KP:-}"                    # sim PD gains, 7 values J1..J7 (see config_mujoco_bi_openarm.py)
 ARM_KD="${ARM_KD:-}"
@@ -171,6 +173,8 @@ TELEOP_ARGS=(
 [[ -n "${IK_WRIST_LIMIT_DEG}" ]]  && TELEOP_ARGS+=(--teleop.wrist_limit_deg="[${IK_WRIST_LIMIT_DEG}]")
 [[ -n "${IK_CHAIN_WEIGHTS}" ]]    && TELEOP_ARGS+=(--teleop.chain_weights="[${IK_CHAIN_WEIGHTS}]")
 [[ "${CHAIN_ROTATION}" == "1" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=true)
+[[ -n "${TARGET_LEASH_DEG}" ]]    && TELEOP_ARGS+=(--teleop.target_leash_deg="${TARGET_LEASH_DEG}")
+[[ -n "${TARGET_LEASH_M}" ]]      && TELEOP_ARGS+=(--teleop.target_leash_m="${TARGET_LEASH_M}")
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"
