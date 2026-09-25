@@ -637,10 +637,10 @@ class IKSolver:
             # a joint is unwinding if this rotation moves it back toward ref
             unwinding = (np.abs(c) >= 0.05) & (np.abs(disp) > math.radians(0.5)) & (direction * disp < 0)
             if np.any(unwinding):
-                # Softest joint first (the wrist), then the next: the return
-                # retraces the turn wrist-first, and NOTHING winds the other way
-                # until every wound joint is home.
-                order = [i for i in np.argsort(k, kind="stable") if unwinding[i]]
+                # Distal first -- wrist, then elbow, then shoulder -- regardless of
+                # stiffness: the return always retraces the turn wrist-first, and
+                # NOTHING winds the other way until every wound joint is home.
+                order = [i for i in (6, 5, 4, 3, 2, 1, 0) if unwinding[i]]
                 dq = np.zeros(7)
                 remaining = angle
                 for i in order:

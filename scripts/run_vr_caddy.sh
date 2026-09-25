@@ -89,10 +89,11 @@ IK_LIMIT_MARGIN_DEG="${IK_LIMIT_MARGIN_DEG:-}"
 #                     degrees from rest, so the shoulder takes over progressively.
 #                     Smaller = shoulder joins sooner. 0 = off for that joint.
 IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
-#   IK_CHAIN_WEIGHTS  keyboard rotation keys as a spring chain: stiffness J1..J7
-#                     (default 1,1,1,1,0.33,0.33,0.33 = wrist takes 3x the
-#                     shoulder's share, both from the first degree). A joint at
-#                     its limit in the needed direction drops out automatically.
+#   IK_CHAIN_WEIGHTS  keyboard rotation keys as a spring chain: stiffness J1..J7,
+#                     lower = moves more (default 0.6,0.6,0.6,1,1,1,1: shoulder
+#                     turns ~1.7x the wrist outbound, reaches its limit first,
+#                     wrist continues; return is always wrist first). A joint
+#                     at its limit in the needed direction drops out.
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-1}"

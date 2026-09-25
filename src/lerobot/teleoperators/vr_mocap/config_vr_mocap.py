@@ -69,9 +69,12 @@ class VRMocapConfig(TeleoperatorConfig):
     # shoulder turn together from the first degree, the softer one more. A
     # joint at its limit in the needed direction has no compliance there.
     chain_rotation: bool = True
-    # Stiffness J1..J7 for that split (relative). 1 vs 0.33 = the wrist takes
-    # three times the shoulder's share.
-    chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
+    # Stiffness J1..J7 for the OUTBOUND split (relative; lower = moves more).
+    # Shoulder softer than the wrist, so the shoulder visibly turns with the
+    # wrist and, with equal ranges, reaches its limit first; the wrist then
+    # continues alone. The return order is fixed (wrist, elbow, shoulder) and
+    # does not depend on these.
+    chain_weights: list[float] = field(default_factory=lambda: [0.6, 0.6, 0.6, 1.0, 1.0, 1.0, 1.0])
 
     # Elbow bend (deg) of the pose the springs pull toward. Purely a *desire*: the
     # arm boots with the elbow straight (as the real robot does) and is never
