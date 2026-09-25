@@ -184,6 +184,8 @@ class VRMocap(Teleoperator):
             rest_elbow_bend_rad=math.radians(self.config.rest_elbow_bend_deg),
         )
 
+        # the DEFAULT pose for the rotation keys: where the arm is at launch
+        self._default_q = {s: self._ik.joint_positions(s).copy() for s in SIDES}
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)
@@ -244,7 +246,7 @@ class VRMocap(Teleoperator):
                 # rotation keys: sequential joint-space turn (L shoulder-first,
                 # J wrist-first, each to its limit); IK skipped this tick so it
                 # does not drag the hand back, then re-targeted on the result
-                ik.chain_step(side, req[0], req[1])
+                ik.chain_step(side, req[0], req[1], ref_q=self._default_q.get(side))
                 resync = getattr(self._source, "resync_target", None)
                 if callable(resync):
                     p, qt = ik.get_ee_pose(side)

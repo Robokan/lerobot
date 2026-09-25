@@ -600,42 +600,73 @@ class IKSolver:
         return _WEIGHT_FLOOR + (1.0 - _WEIGHT_FLOOR) * t
 
     def chain_step(self, side, axis_world, angle, stiffness=None, max_step_rad=None, ref_q=None):
-        """Sequential rotation about ``axis_world`` by ``angle`` (rad), applied in
-        JOINT SPACE to the joints whose axes align with it, ONE AT A TIME, each
-        to its limit before the next takes over. The direction sets the order:
-        negative angle (the L key) goes proximal-first -- shoulder, then wrist;
-        positive (J) goes distal-first -- wrist, then shoulder. The hand goes
-        where that takes it; the caller re-targets IK on the result.
-        ``stiffness`` / ``ref_q`` are accepted for compatibility and unused.
-        Returns the per-joint step (rad)."""
+        """Rotation about ``axis_world`` by signed ``angle`` (rad), applied in
+        JOINT SPACE to the joints whose axes align with it, one at a time.
+
+        ``ref_q`` is the DEFAULT pose (the arm at launch). The rule:
+          * unwinding (a joint moving back toward default) goes first,
+            wrist-first (distal to proximal), each only as far as default;
+          * then winding (away from default) goes shoulder-first (proximal to
+            distal), each to its joint limit;
+          * the shoulder joints (J1-J3) wind only on the L key (negative
+            angle): default is their stop in the J direction, so past default
+            the wrist turns instead.
+        The per-tick speed cap never passes motion to the next joint; only
+        running out of travel does. The hand goes where this takes it and the
+        caller re-targets IK on the result. Returns the per-joint step (rad)."""
         idx = self.qpos_idx[side]
         jids = self.joint_ids[side]
         lo, hi = self.limits_low[side], self.limits_high[side]
         q = np.array([self.data.qpos[qi] for qi in idx])
+        ref = q.copy() if ref_q is None else np.asarray(ref_q, dtype=float)
         axis = np.asarray(axis_world, dtype=float)
         axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
         c = np.array([float((self.data.xmat[self.model.jnt_bodyid[j]].reshape(3, 3)
                              @ self.model.jnt_axis[j]) @ axis) for j in jids])
         lim = self.max_delta_per_call_rad if max_step_rad is None else float(max_step_rad)
-        order = range(7) if angle < 0 else range(6, -1, -1)
+        eps = math.radians(0.2)
         dq = np.zeros(7)
         remaining = float(angle)
-        for i in order:
+
+        def serve(i, room):
+            """Give this joint as much of the remaining request as it has room
+            for. Returns True if it was speed-capped (nothing passes on)."""
+            nonlocal remaining
+            step = remaining / c[i]
+            if abs(step) > room:                       # out of travel: the rest passes on
+                step = math.copysign(min(room, lim), step)
+                dq[i] += step
+                remaining -= c[i] * step
+                return False
+            dq[i] += math.copysign(min(abs(step), lim), step)
+            remaining = 0.0
+            return True
+
+        # 1. unwinding, wrist first, each only back to default
+        for i in (6, 5, 4, 3, 2, 1, 0):
             if abs(remaining) < 1e-9:
                 break
             if abs(c[i]) < 0.05:
-                continue                                    # this joint cannot serve the turn
-            step = remaining / c[i]
-            room = (hi[i] - q[i]) if step > 0 else (q[i] - lo[i])
-            if room <= 1e-6:
-                continue                                    # at its limit this way: next joint
-            if abs(step) > room:
-                step = math.copysign(min(room, lim), step)   # runs out of travel: rest passes on
-                dq[i] = step
-                remaining -= c[i] * step
                 continue
-            dq[i] = math.copysign(min(abs(step), lim), step)  # speed-capped: nothing passes on
-            remaining = 0.0
+            step_dir = math.copysign(1.0, remaining / c[i])
+            disp = q[i] - ref[i]
+            if abs(disp) > eps and step_dir * disp < 0:        # moving toward default
+                if serve(i, abs(disp)):
+                    break
+        # 2. winding, shoulder first, each to its limit; shoulder only on L
+        for i in (0, 1, 2, 3, 4, 5, 6):
+            if abs(remaining) < 1e-9:
+                break
+            if abs(c[i]) < 0.05:
+                continue
+            if i <= 2 and angle > 0:
+                continue                                     # default is the shoulder's stop for J
+            step_dir = math.copysign(1.0, remaining / c[i])
+            room = (hi[i] - q[i] - dq[i]) if step_dir > 0 else (q[i] + dq[i] - lo[i])
+            if room <= 1e-6:
+                continue
+            if serve(i, room):
+                break
         q_new = np.clip(q + dq, lo, hi)
         for kk, qi in enumerate(idx):
             self.data.qpos[qi] = float(q_new[kk])
