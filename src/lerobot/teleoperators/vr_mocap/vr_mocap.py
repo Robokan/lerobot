@@ -191,6 +191,11 @@ class VRMocap(Teleoperator):
                            for s in SIDES}
         self._tick = 0
         self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
+        # artificial wrist-roll range (see config.wrist_limit_deg)
+        lo_deg, hi_deg = self.config.wrist_limit_deg
+        for s in SIDES:
+            self._ik.limits_low[s][4] = max(float(self._ik.limits_low[s][4]), math.radians(lo_deg))
+            self._ik.limits_high[s][4] = min(float(self._ik.limits_high[s][4]), math.radians(hi_deg))
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)

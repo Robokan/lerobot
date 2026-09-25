@@ -90,6 +90,10 @@ IK_LIMIT_MARGIN_DEG="${IK_LIMIT_MARGIN_DEG:-}"
 #                     degrees from rest, so the shoulder takes over progressively.
 #                     Smaller = shoulder joins sooner. 0 = off for that joint.
 IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
+#   IK_WRIST_LIMIT_DEG  artificial wrist-roll range "lo,hi" (default 0,90: L is
+#                     handed to the shoulder immediately; J turns the wrist).
+#                     -90,90 restores the model's full range.
+IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
 #   (rotation keys: L turns the shoulder first then the wrist, J the wrist first
 #    then the shoulder, each joint to its limit. IK_CHAIN_WEIGHTS is unused now.)
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
@@ -147,6 +151,7 @@ TELEOP_ARGS=(
 [[ -n "${IK_SPRING_GAIN}" ]]    && TELEOP_ARGS+=(--teleop.spring_gain="${IK_SPRING_GAIN}")
 [[ -n "${IK_LIMIT_MARGIN_DEG}" ]] && TELEOP_ARGS+=(--teleop.limit_margin_deg="${IK_LIMIT_MARGIN_DEG}")
 [[ -n "${IK_HANDOVER_DEG}" ]]     && TELEOP_ARGS+=(--teleop.handover_deg="[${IK_HANDOVER_DEG}]")
+[[ -n "${IK_WRIST_LIMIT_DEG}" ]]  && TELEOP_ARGS+=(--teleop.wrist_limit_deg="[${IK_WRIST_LIMIT_DEG}]")
 [[ -n "${IK_CHAIN_WEIGHTS}" ]]    && TELEOP_ARGS+=(--teleop.chain_weights="[${IK_CHAIN_WEIGHTS}]")
 [[ "${CHAIN_ROTATION}" == "1" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=true)
 

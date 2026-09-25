@@ -60,6 +60,13 @@ class VRMocapConfig(TeleoperatorConfig):
         default_factory=lambda: [1.0, 1.0, 1.0, 0.6, 0.02, 0.02, 0.02]
     )
     spring_gain: float = 0.15
+    # Artificial range for the wrist roll (J5), degrees [lo, hi]. With the rest
+    # position (0) as the lower limit, an L press finds the wrist already at
+    # its stop in that direction, so the limit taper hands the turn to the
+    # shoulder roll from the first press; J still has the wrist's full range
+    # the other way, and an L after a J unwinds the wrist to 0 first, then
+    # the shoulder. Model range is [-90, 90]; set that to restore it.
+    wrist_limit_deg: list[float] = field(default_factory=lambda: [0.0, 90.0])
     # Wind-up hardening per joint (deg, 0 = off): a joint's willingness fades as
     # it winds away from rest, handing the motion to the next joint. Default
     # hardens only the wrist, over 45 deg = halfway through its travel.
@@ -67,7 +74,7 @@ class VRMocapConfig(TeleoperatorConfig):
     # over 45 deg from rest, so the shoulder joins a turn from about halfway
     # through the wrist's travel instead of at its 90 deg stop. Measured on
     # the real launch: shoulder onset at wrist 90 deg -> 44 deg. Wrist only.
-    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 45.0, 45.0, 45.0])
+    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     # Bias toward joints that are coming home (part of the rest-spring feel). 0 = off.
     homing_boost: float = 6.0
     # Keyboard rotation keys turn the aligned joints ONE AT A TIME, each to its
