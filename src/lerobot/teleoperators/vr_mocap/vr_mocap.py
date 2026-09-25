@@ -203,6 +203,10 @@ class VRMocap(Teleoperator):
         self._tick = 0
         self._actual_q: dict = {}
         self._last_tgt: dict = {}
+        self._prev_tip: dict = {}
+        self._stall: dict = {}
+        self._prev_err: dict = {}
+        self._last_tgt_quat: dict = {}
         self._rot_prev: dict = {}
         self._roll_side: dict = {}
         self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
@@ -222,6 +226,8 @@ class VRMocap(Teleoperator):
             self._source.chain_rotation = bool(self.config.chain_rotation)
         if hasattr(self._source, "rotate_about_tip"):
             self._source.rotate_about_tip = bool(self.config.rotate_about_tip)
+        if hasattr(self._source, "yaw_about_vertical"):
+            self._source.yaw_about_vertical = bool(self.config.yaw_about_vertical)
         self._source.reset({s: self._ik.get_ee_pose(s) for s in SIDES})
         self._source.start()
 
@@ -273,6 +279,7 @@ class VRMocap(Teleoperator):
             if tgt is not None:
                 _vk_mark(side, tgt.pos, tgt.quat)
                 self._last_tgt[side] = np.asarray(tgt.pos, float).copy()
+                self._last_tgt_quat[side] = np.asarray(tgt.quat, float).copy()
 
         for side in SIDES:
             tgt = targets.get(side)
@@ -328,8 +335,19 @@ class VRMocap(Teleoperator):
                 # is straight. Bend the elbow and it cannot serve a yaw at all,
                 # so "wrist waits for the shoulder to reach its stop" waits
                 # forever -- at a 90 deg elbow that left L doing nothing.
-                j3_useful = ik.tool_axis_alignment(side, 2) > 0.35
-                j3_at_stop = abs(q3 - lo_cfg) < tol or not j3_useful
+                # The shoulder-first rule applies to the part of the requested
+                # rotation the shoulder can serve. The requested axis is the
+                # attitude error (target vs achieved) -- the controller's twist
+                # or the keys' turn alike. A shoulder off that axis must not
+                # hold the wrist back (a roll of the gripper at a bent elbow);
+                # one on it turns first as always (the vertical at any elbow).
+                _v = np.zeros(3)
+                ik._mujoco.mju_subQuat(_v, np.asarray(tgt.quat, float), np.asarray(ik.get_ee_pose(side)[1], float))
+                _n = float(np.linalg.norm(_v))
+                _c = float(ik.joint_axis_world(side, 2) @ _v) / _n if _n > 1e-9 else 0.0
+                j3_can = _n < math.radians(0.5) or abs(_c) > 0.35
+                j3_at_stop = abs(q3 - lo_cfg) < tol or not j3_can
+                ik.ori_joint_mask[side] = None
                 # wrist, J side: free once the shoulder is home, else only unwind
                 ik.limits_high[side][4] = max(hi_cfg, q5) + eps if j3_home else min(hi_cfg, max(q5, d5) + eps)
                 # wrist, L side: the stop holds until the shoulder is at ITS
@@ -355,9 +373,6 @@ class VRMocap(Teleoperator):
                 # tool with J2/J4/J6/J7 -- measured: the elbow walked 49 -> 15
                 # deg and J6 -18 -> 35 while the pair sat on its stop, and none
                 # of it came back on the return.
-                rot_axis = getattr(self._source, "rotation_axis", None)
-                ik.ori_joint_mask[side] = (_ROLL_PAIR_MASK
-                                           if callable(rot_axis) and rot_axis(side) == "yaw" else None)
                 rot_on = bool(rot_active(side)) if callable(rot_active) else False
                 if rot_on and not self._rot_prev.get(side):
                     u0 = (q3 - d3) + (q5 - d5)
@@ -366,6 +381,10 @@ class VRMocap(Teleoperator):
                     self._roll_side[side] = 0.0
                 self._rot_prev[side] = rot_on
                 sgn = self._roll_side.get(side, 0.0)
+                if self._debug_every and side == "right" and os.environ.get("PIN_DEBUG"):
+                    print(f"[pin] tick {self._tick} rot_on {int(rot_on)} sgn {sgn:+.0f} u {math.degrees((q3-d3)+(q5-d5)):.1f} "
+                          f"q3 {math.degrees(q3):.1f} q5 {math.degrees(q5):.1f} lo3 {math.degrees(ik.limits_low[side][2]):.1f} "
+                          f"hi3 {math.degrees(ik.limits_high[side][2]):.1f} lo5 {math.degrees(ik.limits_low[side][4]):.1f} hi5 {math.degrees(ik.limits_high[side][4]):.1f}", flush=True)
                 if sgn > 0:      # started on the J side: may not fall below default
                     ik.limits_low[side][2] = max(ik.limits_low[side][2], min(d3, q3) - eps)
                     ik.limits_low[side][4] = max(ik.limits_low[side][4], min(d5, q5) - eps)
@@ -400,6 +419,12 @@ class VRMocap(Teleoperator):
             tip = np.asarray(self._ik.get_ee_pose("right")[0], float) * 100
             tg = self._last_tgt.get("right")
             tg = "" if tg is None else f"  tgt cm = {np.round(np.asarray(tg, float) * 100, 1).tolist()}"
+            _qa = np.asarray(self._ik.get_ee_pose("right")[1], float)
+            _qt = self._last_tgt_quat.get("right")
+            if _qt is not None:
+                _v = np.zeros(3); self._ik._mujoco.mju_subQuat(_v, np.asarray(_qt, float), _qa)
+                tg += f"  ori_err_deg = {math.degrees(float(np.linalg.norm(_v))):.2f}"
+            tg += f"  quat = {np.round(_qa, 4).tolist()}"
             print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}  tip cm = {np.round(tip, 1).tolist()}{tg}", flush=True)
         self._tick += 1
         return self._joint_action()
@@ -444,14 +469,44 @@ class VRMocap(Teleoperator):
         new_p, new_q = np.asarray(tgt.pos, float).copy(), np.asarray(tgt.quat, float).copy()
         changed = False
         err = new_p - p_tip; d = float(np.linalg.norm(err))
-        if d > self.config.target_leash_m:
-            new_p = p_tip + err * (self.config.target_leash_m / d); changed = True
         v = np.zeros(3)
         mujoco.mju_subQuat(v, new_q, q_tip)          # rotation from the tip attitude to the target
-        a = float(np.linalg.norm(v)); lim = math.radians(self.config.target_leash_deg)
-        if a > lim:
+        a = float(np.linalg.norm(v))
+        # Stall rule: the target may run ahead of the tip only while the tip
+        # is still following. When the arm is blocked (a joint stop, the
+        # table, the home detent) and the target keeps going, the extra would
+        # have to be unwound before a reversed key moved anything, and the
+        # solver would serve it with whatever joints are left (the elbow
+        # walked 49 -> 15 deg behind a wrist stop). So: target ahead and tip
+        # not moving -> the target is put back on the tip. The controller is
+        # unaffected: it rewrites its target from the hand every tick.
+        # Stall = the target is RUNNING AWAY from the arm: the error has grown
+        # for stall_ticks consecutive ticks. ("The tip did not move" was
+        # defeated by creep through other joints while the roll pair sat on
+        # the home detent: 15 deg wound up and was served by the shoulder the
+        # moment the key was released.) Once stalled the target is put on the
+        # arm EVERY tick until the error shrinks again (the key reversed, or
+        # the arm caught up), so nothing accumulates behind a stop.
+        prev = self._prev_err.get(side, (d, a))
+        st = self._stall.setdefault(side, [0, 0, False, False])
+        if self.config.stall_pos_m > 0:
+            st[0] = st[0] + 1 if d > prev[0] + 1e-6 and d > self.config.stall_pos_m * 4 else 0
+            if st[0] >= self.config.stall_ticks: st[2] = True
+            if d < prev[0] - 1e-6 or d < self.config.stall_pos_m: st[2] = False
+        if self.config.stall_deg > 0:
+            st[1] = st[1] + 1 if a > prev[1] + 1e-6 and a > math.radians(self.config.stall_deg * 4) else 0
+            if st[1] >= self.config.stall_ticks: st[3] = True
+            if a < prev[1] - 1e-6 or a < math.radians(self.config.stall_deg): st[3] = False
+        self._prev_err[side] = (d, a)
+        stall_p, stall_a = st[2], st[3]
+        if stall_p or d > self.config.target_leash_m:
+            new_p = p_tip.copy() if stall_p else p_tip + err * (self.config.target_leash_m / d); changed = True
+        lim = math.radians(self.config.target_leash_deg)
+        if stall_a or a > lim:
             new_q = q_tip.copy()
-            mujoco.mju_quatIntegrate(new_q, v * (lim / a), 1.0); changed = True
+            if not stall_a:
+                mujoco.mju_quatIntegrate(new_q, v * (lim / a), 1.0)
+            changed = True
         if changed:
             resync(side, new_p, new_q)
 

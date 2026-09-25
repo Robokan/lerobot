@@ -100,6 +100,12 @@ IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
 #                     handed to the shoulder immediately; J turns the wrist).
 #                     -90,90 restores the model's full range.
 IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
+#   WRIST_STOP=0      turn the artificial wrist stop OFF: on L the wrist roll may
+#                     turn from the first press (the model's own -90..90); the
+#                     shoulder-first ordering then comes only from the solver's weights.
+WRIST_STOP="${WRIST_STOP:-1}"
+YAW_AXIS="${YAW_AXIS:-vertical}"       # vertical (default) | tool: what j/l turn the gripper about
+[[ "${WRIST_STOP}" == "0" && -z "${IK_WRIST_LIMIT_DEG}" ]] && IK_WRIST_LIMIT_DEG="-90,90"
 #   (rotation keys: L turns the shoulder first then the wrist, J the wrist first
 #    then the shoulder, each joint to its limit. IK_CHAIN_WEIGHTS is unused now.)
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
@@ -107,6 +113,7 @@ IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
 HOMING_BOOST="${HOMING_BOOST:-}"        # solver: extra willingness for joints heading back to the rest pose
 DLS_LAMBDA="${DLS_LAMBDA:-}"            # solver: damping (raise near singularities)
+STALL="${STALL:-1}"                     # 0 = no stall rule (pure accumulating target; tests)
 TARGET_LEASH_DEG="${TARGET_LEASH_DEG:-}"   # how far the pose target may lead the commanded tip
 TARGET_LEASH_M="${TARGET_LEASH_M:-}"
 ELBOW_DEG="${ELBOW_DEG:-}"              # starting elbow bend (deg). The launch pose is also the h pose and the springs' rest.
@@ -178,6 +185,8 @@ TELEOP_ARGS=(
 [[ -n "${HOMING_BOOST}" ]]        && TELEOP_ARGS+=(--teleop.homing_boost="${HOMING_BOOST}")
 [[ -n "${DLS_LAMBDA}" ]]          && TELEOP_ARGS+=(--teleop.dls_lambda="${DLS_LAMBDA}")
 [[ -n "${TARGET_LEASH_DEG}" ]]    && TELEOP_ARGS+=(--teleop.target_leash_deg="${TARGET_LEASH_DEG}")
+[[ "${STALL}" == "0" ]]            && TELEOP_ARGS+=(--teleop.stall_deg=0 --teleop.stall_pos_m=0)
+[[ "${YAW_AXIS}" == "tool" ]]      && TELEOP_ARGS+=(--teleop.yaw_about_vertical=false)
 [[ -n "${TARGET_LEASH_M}" ]]      && TELEOP_ARGS+=(--teleop.target_leash_m="${TARGET_LEASH_M}")
 
 if [[ "${MODE}" == "record" ]]; then

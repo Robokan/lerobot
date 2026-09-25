@@ -216,6 +216,8 @@ class KeyboardPoseSource(PoseSource):
     # rotation request that the teleop splits across the joints as a spring
     # chain. The target then re-syncs to wherever the hand ended up.
     chain_rotation: bool = False
+    # j/l turn about the world vertical (True) or the gripper's own axis (False, the original)
+    yaw_about_vertical: bool = True
     # Rotation keys pivot about the gripper tip (TCP); translation keys move it.
     rotate_about_tip: bool = True
 
@@ -373,6 +375,7 @@ class KeyboardPoseSource(PoseSource):
         # frame, then apply once (capped) so a key-repeat flood cannot wind the
         # orientation target many presses ahead of IK in a single tick.
         rot_axis_angle = np.zeros(3)
+        rot_world_axis_angle = np.zeros(3)   # world-fixed part (j/l: about the vertical)
         rot_synced = False
         # Pivot for i/k/j/l/u/o. The operator wants the gripper TIP (the TCP,
         # 8 cm out from the hand) to be the point that stays put while the
@@ -411,12 +414,22 @@ class KeyboardPoseSource(PoseSource):
                     rot_synced = True
                 return
             if not rot_synced:
-                quat = np.asarray(current_ee[side][1], dtype=float).copy()
-                pos = tcp_pos_from_hand(pivot_hand, quat)
-                self._pos[side] = pos
-                self._quat[side] = quat
+                # The attitude target ACCUMULATES, like the position target and
+                # like a controller's absolute pose: re-basing it on the achieved
+                # attitude every tick threw away whatever the arm had not yet
+                # done that tick, so out and back never cancelled (6.5 deg off
+                # at the hang, 12 deg with the elbow bent, tracking error 0.0).
+                # Wind-up behind a stop is handled by the stall rule in VRMocap.
+                if not self.rotate_about_tip:      # legacy hand-pivot mode only
+                    quat = np.asarray(current_ee[side][1], dtype=float).copy()
+                    pos = tcp_pos_from_hand(pivot_hand, quat)
+                    self._pos[side] = pos
+                    self._quat[side] = quat
                 rot_synced = True
-            rot_axis_angle[:3] += local_axis * angle
+            if world_axis is not None:
+                rot_world_axis_angle[:3] += np.asarray(world_axis, dtype=float) * angle
+            else:
+                rot_axis_angle[:3] += local_axis * angle
 
         keys = self._drain_keys()
         if keys and os.environ.get("VR_TELEOP_DEBUG"):
@@ -464,10 +477,17 @@ class KeyboardPoseSource(PoseSource):
                     pass
             elif ch == "h":
                 self._home_request.update(SIDES)      # session reset: BOTH arms to default
+            # j/l: a turn about the VERTICAL, the axis the shoulder roll and the
+            # hanging forearm share. About the gripper's own axis instead, a
+            # bent elbow made it a roll the shoulder cannot serve at all: the
+            # solver contorted the arm 37 deg short of the target and never came
+            # back. -Z so the direction is unchanged at the hang (tool z down).
             elif ch == "j":
-                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP / KEY_HOLD_TICKS)
+                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP / KEY_HOLD_TICKS,
+                          world_axis=np.array([0.0, 0.0, -1.0]) if self.yaw_about_vertical else None)
             elif ch == "l":
-                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP / KEY_HOLD_TICKS)
+                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP / KEY_HOLD_TICKS,
+                          world_axis=np.array([0.0, 0.0, -1.0]) if self.yaw_about_vertical else None)
             elif ch == "u":
                 _body_rot(np.array([1.0, 0.0, 0.0]), ROT_STEP / KEY_HOLD_TICKS)
             elif ch == "o":
@@ -521,11 +541,18 @@ class KeyboardPoseSource(PoseSource):
             self._grip[side] = grip_before + math.copysign(MAX_GRIP_DELTA_PER_TICK_M, grip_delta)
 
         rot_angle = float(np.linalg.norm(rot_axis_angle))
-        if rot_angle > 1e-12:
+        wrot_angle = float(np.linalg.norm(rot_world_axis_angle))
+        if rot_angle > 1e-12 or wrot_angle > 1e-12:
             if rot_angle > MAX_ROT_DELTA_PER_TICK_RAD:
                 rot_axis_angle *= MAX_ROT_DELTA_PER_TICK_RAD / rot_angle
                 rot_angle = MAX_ROT_DELTA_PER_TICK_RAD
-            quat[:] = quat_mul(quat, axis_angle_to_quat(rot_axis_angle / rot_angle, rot_angle))
+            if wrot_angle > MAX_ROT_DELTA_PER_TICK_RAD:
+                rot_world_axis_angle *= MAX_ROT_DELTA_PER_TICK_RAD / wrot_angle
+                wrot_angle = MAX_ROT_DELTA_PER_TICK_RAD
+            if rot_angle > 1e-12:      # body-fixed (right-multiply)
+                quat[:] = quat_mul(quat, axis_angle_to_quat(rot_axis_angle / rot_angle, rot_angle))
+            if wrot_angle > 1e-12:     # world-fixed (left-multiply)
+                quat[:] = quat_mul(axis_angle_to_quat(rot_world_axis_angle / wrot_angle, wrot_angle), quat)
             quat[:] = quat / np.linalg.norm(quat)
             if self.rotate_about_tip:
                 # The tip stays where the gesture STARTED, not wherever it has

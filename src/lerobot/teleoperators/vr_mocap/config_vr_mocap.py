@@ -79,6 +79,12 @@ class VRMocapConfig(TeleoperatorConfig):
     # a reversed key answers within a second instead of after the backlog.
     target_leash_m: float = 0.04
     target_leash_deg: float = 20.0
+    # Stall rule (see VRMocap._leash_target): if the tip moved less than this
+    # in a tick while the target is more than 4x this ahead, the target is
+    # put back on the tip. Sized to the per-tick command (0.09 cm, 1.3 deg).
+    stall_pos_m: float = 0.0003
+    stall_deg: float = 0.25
+    stall_ticks: int = 6           # consecutive stalled ticks before the target is put back (0 threshold = off)
     # Artificial range for the wrist roll (J5), degrees [lo, hi]. With the rest
     # position (0) as the lower limit, an L press finds the wrist already at
     # its stop in that direction, so the limit taper hands the turn to the
@@ -104,6 +110,11 @@ class VRMocapConfig(TeleoperatorConfig):
     # limit: L goes shoulder-first then wrist, J goes wrist-first then shoulder.
     # Keyboard rotation keys pivot about the gripper TIP (the TCP); False = wrist pivot.
     rotate_about_tip: bool = True    # rotations pivot about the gripper tip (TCP); translations move it
+    # Keyboard j/l: a turn about the world VERTICAL (the axis the shoulder roll
+    # and the hanging forearm share) -- or, False, about the gripper's own
+    # axis as originally. They coincide with the arm hanging; with the elbow
+    # bent the gripper-axis turn is a roll the shoulder cannot serve.
+    yaw_about_vertical: bool = True
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
     # Unused by the sequential rule; kept so older command lines still parse.
     chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])

@@ -719,6 +719,12 @@ class IKSolver:
         for idx in self.finger_qpos_idx[side]:
             self.data.qpos[idx] = val
 
+    def joint_axis_world(self, side, k: int) -> np.ndarray:
+        """Unit world-frame axis of arm joint ``k`` at the current pose."""
+        j = self.joint_ids[side][k]
+        a = self.data.xmat[self.model.jnt_bodyid[j]].reshape(3, 3) @ self.model.jnt_axis[j]
+        return a / max(float(np.linalg.norm(a)), 1e-9)
+
     def tool_axis_alignment(self, side, k: int) -> float:
         """|cos| between arm joint ``k``'s world axis and the tool's own z axis.
 
