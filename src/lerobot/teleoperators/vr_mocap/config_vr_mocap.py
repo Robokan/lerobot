@@ -60,6 +60,10 @@ class VRMocapConfig(TeleoperatorConfig):
         default_factory=lambda: [1.0, 1.0, 1.0, 0.6, 0.02, 0.02, 0.02]
     )
     spring_gain: float = 0.15
+    # Wind-up hardening per joint (deg, 0 = off): a joint's willingness fades as
+    # it winds away from rest, handing the motion to the next joint. Default
+    # hardens only the wrist, over 45 deg = halfway through its travel.
+    handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 45.0, 45.0, 45.0])
 
     # Elbow bend (deg) of the pose the springs pull toward. Purely a *desire*: the
     # arm boots with the elbow straight (as the real robot does) and is never

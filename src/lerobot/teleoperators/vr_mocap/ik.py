@@ -136,6 +136,15 @@ DEFAULT_REACH_SPAN_M = 0.07
 # at all. Scaled per joint by spring_weights, so the same stiff-shoulder/weak-wrist
 # gradient decides the ordering. Being a weight and not a force, it changes which
 # joints do the work without costing any steady-state accuracy.
+# Wind-up hardening, J1..J7, degrees; 0 = off. A joint's willingness to take
+# MORE of the task fades as it winds away from the rest pose, reaching the floor
+# at this displacement, so the motion is handed to the next joint in the chain.
+# This is the spring-chain feel the rest-pose springs were meant to give but
+# cannot, because during a turn they are confined to the task nullspace: the
+# light wrist twists first, and from about halfway through its travel the
+# shoulder takes over progressively. Wrist joints have +-90 deg of travel, so
+# 45 = halfway. Shoulder and elbow do not harden: they are the end of the chain.
+DEFAULT_HANDOVER_DEG = (0.0, 0.0, 0.0, 0.0, 45.0, 45.0, 45.0)
 DEFAULT_HOMING_BOOST = 6.0
 DEFAULT_HOMING_SCALE_RAD = math.radians(45.0)
 
@@ -277,6 +286,7 @@ class IKSolver:
         reach_tol_m: float = DEFAULT_REACH_TOL_M,
         reach_span_m: float = DEFAULT_REACH_SPAN_M,
         homing_boost: float = DEFAULT_HOMING_BOOST,
+        handover_deg=DEFAULT_HANDOVER_DEG,
         homing_scale_rad: float = DEFAULT_HOMING_SCALE_RAD,
         rest_elbow_bend_rad: float = DEFAULT_REST_ELBOW_BEND_RAD,
         ori_pos_tradeoff: float = _ORI_TO_POS_M_PER_RAD,
@@ -304,6 +314,9 @@ class IKSolver:
                 f"spring_weights must have 7 entries (J1..J7), got {self.spring_weights.shape}"
             )
         self.spring_gain = float(spring_gain)
+        self.handover_rad = np.radians(np.asarray(handover_deg, dtype=float))
+        if self.handover_rad.shape != (7,):
+            raise ValueError(f"handover_deg must have 7 entries (J1..J7), got {self.handover_rad.shape}")
         self.spring_score_m_per_rad2 = float(spring_score_m_per_rad2)
         self.reach_tol_m = float(reach_tol_m)
         self.reach_span_m = float(reach_span_m)
@@ -465,7 +478,12 @@ class IKSolver:
                 ori_err = _clamp_norm(ori_err, min(self.max_ori_err_rad * 1.6, math.radians(8.0)))
                 N = _nullspace_projector(Jp)
                 dq_pos = self._weighted_dls(Jp, pos_err, np.ones(7), self.dls_lambda)
-                dq_ori = N @ self._weighted_dls(Jr, ori_err, self.joint_weights, self.dls_lambda)
+                # The bare joint_weights here were why a wrist turn ran to the
+                # joint limit before the shoulder moved: nothing faded the wrist.
+                w_ori = (self.joint_weights
+                         * self._handover_taper(q, q_rest)
+                         * self._limit_taper(q, lo, hi, np.sign(self._weighted_dls(Jr, ori_err, self.joint_weights, self.dls_lambda))))
+                dq_ori = N @ self._weighted_dls(Jr, ori_err, w_ori, self.dls_lambda)
                 dq = dq_pos + dq_ori
             else:
                 # Orientation rows weighted up so translation prefers solutions
@@ -476,6 +494,7 @@ class IKSolver:
                 dq = self._weighted_dls(J, dx, self.joint_weights, self.dls_lambda)
                 weights = (
                     self.joint_weights
+                    * self._handover_taper(q, q_rest)
                     * self._limit_taper(q, lo, hi, dq)
                     * self._homing_boost(q, q_rest, dq)
                 )
@@ -565,6 +584,20 @@ class IKSolver:
         coming_home = (disp * dq) < 0.0
         mag = np.clip(np.abs(disp) / max(self.homing_scale_rad, 1e-9), 0.0, 1.0)
         return 1.0 + self.homing_boost * self.spring_weights * np.where(coming_home, mag, 0.0)
+
+    def _handover_taper(self, q, q_rest):
+        """Per-joint willingness that fades with displacement from the rest pose
+        (smoothstep to the same floor as the limit taper). Joints with
+        handover 0 never fade. Direction-agnostic: a wound-up wrist is equally
+        reluctant to wind further either way; unwinding is served by the
+        homing boost, which prefers it."""
+        t = np.ones(7)
+        active = self.handover_rad > 1e-9
+        if np.any(active):
+            frac = np.clip(np.abs(q - q_rest)[active] / self.handover_rad[active], 0.0, 1.0)
+            keep = 1.0 - frac
+            t[active] = keep * keep * (3.0 - 2.0 * keep)
+        return _WEIGHT_FLOOR + (1.0 - _WEIGHT_FLOOR) * t
 
     def _limit_taper(self, q, lo, hi, dq):
         """Scale factor per joint that fades out as it approaches a limit.

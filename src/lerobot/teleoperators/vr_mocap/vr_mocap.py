@@ -179,6 +179,7 @@ class VRMocap(Teleoperator):
             max_step_rad=math.radians(self.config.max_step_deg),
             spring_weights=self.config.spring_weights,
             spring_gain=self.config.spring_gain,
+            handover_deg=self.config.handover_deg,
             rest_elbow_bend_rad=math.radians(self.config.rest_elbow_bend_deg),
         )
 
