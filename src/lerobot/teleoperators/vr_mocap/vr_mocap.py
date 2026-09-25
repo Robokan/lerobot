@@ -425,8 +425,24 @@ class VRMocap(Teleoperator):
             for side in SIDES:
                 act = [feedback.get(f"{side}_{m}.pos") for m in ARM_JOINT_NAMES]
                 if all(a is not None for a in act):
+                    first = side not in self._actual_q
                     self._actual_q[side] = np.radians(np.asarray(act, float))
-                    self._clip_to_actual(side)
+                    if first:
+                        # First contact with the robot: adopt ITS launch pose as
+                        # the solver state, the h pose and the pose target. The
+                        # solver's own model boots hanging straight; with
+                        # --robot.start_elbow_bend_deg the robot does not, and
+                        # the stale hanging-attitude target made the first key
+                        # press swing the arm 21 cm up to point the hand down.
+                        self._ik.limits_low[side][:], self._ik.limits_high[side][:] = self._limits_model[side]
+                        self._ik.set_joint_positions(side, self._actual_q[side])
+                        self._default_q[side] = self._ik.joint_positions(side).copy()
+                        resync = getattr(self._source, "resync_target", None)
+                        if callable(resync):
+                            p0, q0 = self._ik.get_ee_pose(side)
+                            resync(side, p0, q0)
+                    else:
+                        self._clip_to_actual(side)
         source = self._source
         if source is None or not hasattr(source, "update_camera_frames"):
             return

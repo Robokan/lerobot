@@ -46,6 +46,10 @@
 #   MODE=teleop bash scripts/run_vr_caddy.sh           # practise, record nothing
 #   DRIVER=keyboard bash scripts/run_vr_caddy.sh       # no headset: keys in the MuJoCo window
 #                                                      #   (h = return the arm to its launch pose)
+#   ELBOW_DEG=90 DRIVER=keyboard MODE=teleop bash scripts/run_vr_caddy.sh
+#                                                      # start with the elbows bent: the hands begin
+#                                                      #   above the table instead of hanging below it
+#   FAST=1 COLLISIONS=0 ...                            # tests: headless, unpaced, contacts off
 #
 # Dataset naming: this fork's lerobot-record stamps the time onto the repo id,
 # so each session writes a NEW dataset, e.g. local/openarm_caddy6_vr_20260924_183012.
@@ -101,6 +105,7 @@ IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
+ELBOW_DEG="${ELBOW_DEG:-}"              # starting elbow bend (deg). The launch pose is also the h pose and the springs' rest.
 ARM_KP="${ARM_KP:-}"                    # sim PD gains, 7 values J1..J7 (see config_mujoco_bi_openarm.py)
 ARM_KD="${ARM_KD:-}"
 ARM_ARMATURE="${ARM_ARMATURE:-}"        # reflected motor inertia per joint, 7 values (sim only)
@@ -147,6 +152,7 @@ ROBOT_ARGS=(
 [[ "${VIEWER}" == "1" ]] && ROBOT_ARGS+=(--robot.viewer=true)
 [[ "${FAST}" == "1" ]] && ROBOT_ARGS+=(--robot.cameras={})    # no camera renders in the test loop
 [[ "${COLLISIONS}" == "0" ]] && ROBOT_ARGS+=(--robot.disable_collisions=true)
+[[ -n "${ELBOW_DEG}" ]] && ROBOT_ARGS+=(--robot.start_elbow_bend_deg="${ELBOW_DEG}")
 [[ -n "${ARM_KP}" ]] && ROBOT_ARGS+=(--robot.arm_kp="[${ARM_KP}]")
 [[ -n "${ARM_KD}" ]] && ROBOT_ARGS+=(--robot.arm_kd="[${ARM_KD}]")
 [[ -n "${ARM_ARMATURE}" ]] && ROBOT_ARGS+=(--robot.arm_armature="[${ARM_ARMATURE}]")
