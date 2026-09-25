@@ -64,6 +64,14 @@ class VRMocapConfig(TeleoperatorConfig):
     # it winds away from rest, handing the motion to the next joint. Default
     # hardens only the wrist, over 45 deg = halfway through its travel.
     handover_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 45.0, 45.0, 45.0])
+    # Keyboard rotation keys as a spring chain: the requested rotation is split
+    # across the joints in joint space by alignment / stiffness, so wrist AND
+    # shoulder turn together from the first degree, the softer one more. A
+    # joint at its limit in the needed direction has no compliance there.
+    chain_rotation: bool = True
+    # Stiffness J1..J7 for that split (relative). 1 vs 0.33 = the wrist takes
+    # three times the shoulder's share.
+    chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
     # Elbow bend (deg) of the pose the springs pull toward. Purely a *desire*: the
     # arm boots with the elbow straight (as the real robot does) and is never

@@ -49,6 +49,7 @@ from .ik import (
     hand_pos_from_tcp,
     quat_inv,
     quat_mul,
+    quat_rotate,
     tcp_pos_from_hand,
 )
 
@@ -205,9 +206,16 @@ class KeyboardPoseSource(PoseSource):
         n / q   end episode early / quit recording
     """
 
+    # When set (by VRMocap from config.chain_rotation), the rotation keys do
+    # not rotate the IK target about a pinned wrist; they queue a world-frame
+    # rotation request that the teleop splits across the joints as a spring
+    # chain. The target then re-syncs to wherever the hand ended up.
+    chain_rotation: bool = False
+
     def __init__(self):
         self._pos: dict[str, np.ndarray] = {}
         self._quat: dict[str, np.ndarray] = {}
+        self._rot_request: dict[str, tuple[np.ndarray, float]] = {}
         self._grip: dict[str, float] = {s: 0.0 for s in SIDES}
         self._active_side = "right"
         self._queue: deque[str] = deque()
@@ -277,6 +285,23 @@ class KeyboardPoseSource(PoseSource):
         self._pos = {s: np.asarray(initial_ee[s][0], dtype=float).copy() for s in initial_ee}
         self._quat = {s: np.asarray(initial_ee[s][1], dtype=float).copy() for s in initial_ee}
 
+    def resync_target(self, side, pos, quat):
+        """After a chain step the hand has moved: put the target ON it, so IK
+        holds the new pose instead of dragging the hand back a step."""
+        self._pos[side] = np.asarray(pos, dtype=float).copy()
+        self._quat[side] = np.asarray(quat, dtype=float).copy()
+
+    def take_rotation_request(self, side):
+        """(axis_world, angle) queued by the rotation keys this tick, or None."""
+        v, _ = self._rot_request.pop(side, (None, 0.0))
+        if v is None:
+            return None
+        ang = float(np.linalg.norm(v))
+        if ang < 1e-12:
+            return None
+        ang = min(ang, MAX_ROT_DELTA_PER_TICK_RAD)
+        return v / float(np.linalg.norm(v)), ang
+
     def _drain_keys(self) -> list[str]:
         with self._lock:
             keys = list(self._queue)
@@ -327,6 +352,17 @@ class KeyboardPoseSource(PoseSource):
             the TCP target is rewritten to match the new orientation.
             """
             nonlocal pos, quat, rot_synced
+            if self.chain_rotation:
+                # world-frame axis of the requested body-fixed rotation
+                axis_w = quat_rotate(np.asarray(current_ee[side][1], dtype=float), local_axis)
+                prev_axis, prev_ang = self._rot_request.get(side, (np.zeros(3), 0.0))
+                self._rot_request[side] = (prev_axis * prev_ang + axis_w * angle, 1.0)
+                if not rot_synced:            # keep the target ON the hand, not ahead of it
+                    quat = np.asarray(current_ee[side][1], dtype=float).copy()
+                    pos = np.asarray(current_ee[side][0], dtype=float).copy()
+                    self._pos[side], self._quat[side] = pos, quat
+                    rot_synced = True
+                return
             if not rot_synced:
                 quat = np.asarray(current_ee[side][1], dtype=float).copy()
                 pos = tcp_pos_from_hand(pivot_hand, quat)

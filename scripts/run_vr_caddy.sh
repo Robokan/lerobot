@@ -89,6 +89,13 @@ IK_LIMIT_MARGIN_DEG="${IK_LIMIT_MARGIN_DEG:-}"
 #                     degrees from rest, so the shoulder takes over progressively.
 #                     Smaller = shoulder joins sooner. 0 = off for that joint.
 IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
+#   IK_CHAIN_WEIGHTS  keyboard rotation keys as a spring chain: stiffness J1..J7
+#                     (default 1,1,1,1,0.33,0.33,0.33 = wrist takes 3x the
+#                     shoulder's share, both from the first degree). A joint at
+#                     its limit in the needed direction drops out automatically.
+#   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
+IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
+CHAIN_ROTATION="${CHAIN_ROTATION:-1}"
 SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
@@ -141,6 +148,8 @@ TELEOP_ARGS=(
 [[ -n "${IK_SPRING_GAIN}" ]]    && TELEOP_ARGS+=(--teleop.spring_gain="${IK_SPRING_GAIN}")
 [[ -n "${IK_LIMIT_MARGIN_DEG}" ]] && TELEOP_ARGS+=(--teleop.limit_margin_deg="${IK_LIMIT_MARGIN_DEG}")
 [[ -n "${IK_HANDOVER_DEG}" ]]     && TELEOP_ARGS+=(--teleop.handover_deg="[${IK_HANDOVER_DEG}]")
+[[ -n "${IK_CHAIN_WEIGHTS}" ]]    && TELEOP_ARGS+=(--teleop.chain_weights="[${IK_CHAIN_WEIGHTS}]")
+[[ "${CHAIN_ROTATION}" == "0" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=false)
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"

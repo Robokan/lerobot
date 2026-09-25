@@ -599,6 +599,75 @@ class IKSolver:
             t[active] = keep * keep * (3.0 - 2.0 * keep)
         return _WEIGHT_FLOOR + (1.0 - _WEIGHT_FLOOR) * t
 
+    def chain_step(self, side, axis_world, angle, stiffness, max_step_rad=None, ref_q=None):
+        """Spring-chain rotation: split a requested hand rotation of ``angle``
+        about ``axis_world`` across the joints IN JOINT SPACE and apply it.
+
+        Each joint's share is its alignment with the axis over its stiffness --
+        the minimum-energy solution of a series spring chain -- times its
+        limit taper in the direction it would move, so a joint against its
+        limit has no compliance there and the others take its share. The hand
+        goes where the chain takes it; the caller re-targets IK on the result.
+        This is what "turn the wrist and the shoulder joins in proportion,
+        from the first degree" needs: IK at a pinned wrist can only ever use
+        the one joint that rotates the hand without moving it.
+
+        With ``ref_q`` (the joints when the current turning gesture began),
+        UNWINDING is last-in-first-out: if the rotation would bring any
+        aligned joint back toward its reference, the most-wound such joint
+        gives the whole step back until it is home, then the next -- so a
+        return retraces the outbound turn (wrist first, then shoulder).
+        Winding shares by stiffness as above.
+        Returns the per-joint step (rad)."""
+        idx = self.qpos_idx[side]
+        jids = self.joint_ids[side]
+        lo, hi = self.limits_low[side], self.limits_high[side]
+        q = np.array([self.data.qpos[qi] for qi in idx])
+        axis = np.asarray(axis_world, dtype=float)
+        axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
+        c = np.array([float((self.data.xmat[self.model.jnt_bodyid[j]].reshape(3, 3)
+                             @ self.model.jnt_axis[j]) @ axis) for j in jids])
+        k = np.asarray(stiffness, dtype=float)
+        direction = np.sign(c * angle)                      # which way each joint would turn
+        comp = self._limit_taper(q, lo, hi, direction) / np.maximum(k, 1e-6)
+        comp = np.where(np.abs(c) < 0.05, 0.0, comp)        # axes that cannot serve the turn
+        dq = None
+        if ref_q is not None:
+            disp = q - np.asarray(ref_q, dtype=float)
+            # a joint is unwinding if this rotation moves it back toward ref
+            unwinding = (np.abs(c) >= 0.05) & (np.abs(disp) > math.radians(0.5)) & (direction * disp < 0)
+            if np.any(unwinding):
+                # Softest joint first (the wrist), then the next: the return
+                # retraces the turn wrist-first, and NOTHING winds the other way
+                # until every wound joint is home.
+                order = [i for i in np.argsort(k, kind="stable") if unwinding[i]]
+                dq = np.zeros(7)
+                remaining = angle
+                for i in order:
+                    if abs(remaining) < 1e-9:
+                        break
+                    step_i = remaining / c[i]                # this joint alone serves the rest
+                    step_i = -np.sign(disp[i]) * min(abs(step_i), abs(disp[i]))   # stop at home
+                    dq[i] = step_i
+                    remaining -= c[i] * step_i
+                # Whatever is left of THIS tick's request when a joint arrives
+                # home is dropped, not shared: sharing it spilled a few degrees
+                # into the next joint in the same tick. The next tick, with no
+                # unwinding joint left, takes the normal stiffness split.
+        if dq is None:
+            denom = float(np.sum(c * c * comp))
+            if denom < 1e-9:
+                return np.zeros(7)
+            dq = angle * c * comp / denom                   # sum_i c_i dq_i == angle
+        lim = self.max_delta_per_call_rad if max_step_rad is None else float(max_step_rad)
+        scale = min(1.0, lim / max(float(np.max(np.abs(dq))), 1e-12))
+        dq = dq * scale
+        q_new = np.clip(q + dq, lo, hi)
+        for kk, qi in enumerate(idx):
+            self.data.qpos[qi] = float(q_new[kk])
+        self._mujoco.mj_forward(self.model, self.data)
+        return q_new - q
+
     def _limit_taper(self, q, lo, hi, dq):
         """Scale factor per joint that fades out as it approaches a limit.
 

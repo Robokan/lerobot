@@ -183,7 +183,13 @@ class VRMocap(Teleoperator):
             rest_elbow_bend_rad=math.radians(self.config.rest_elbow_bend_deg),
         )
 
+        # spring-chain gesture state: a rotation request after this many ticks
+        # without one starts a new gesture and captures its reference pose
+        self._chain_ref: dict[str, np.ndarray] = {}      # joints before the turn began
+        self._chain_last_q: dict[str, np.ndarray] = {}   # joints right after the last chain step
         self._source = self._make_source()
+        if hasattr(self._source, "chain_rotation"):
+            self._source.chain_rotation = bool(self.config.chain_rotation)
         self._source.reset({s: self._ik.get_ee_pose(s) for s in SIDES})
         self._source.start()
 
@@ -235,7 +241,32 @@ class VRMocap(Teleoperator):
             tgt = targets.get(side)
             if tgt is None or not tgt.active:
                 continue  # hold: leave IK qpos (and thus joint output) unchanged
-            ik.solve_ik(side, tgt.pos, tgt.quat, max_iter=self.config.max_iter)
+            take = getattr(self._source, "take_rotation_request", None)
+            req = take(side) if callable(take) else None
+            if req is not None:
+                # spring-chain turn: joint-space split, IK skipped this tick so it
+                # does not drag the hand back to where it was. The gesture
+                # reference (joints when turning began) makes a return retrace
+                # the outbound turn, wrist first.
+                # The reference is "where the joints were before the turn", and
+                # it survives pauses: a return after any wait still retraces the
+                # turn. It is refreshed only when the arm has moved by OTHER
+                # means since the last chain step (position keys, IK), so a
+                # return never undoes positioning.
+                q_now = ik.joint_positions(side)
+                last = self._chain_last_q.get(side)
+                if side not in self._chain_ref or last is None or \
+                        float(np.max(np.abs(q_now - last))) > math.radians(1.0):
+                    self._chain_ref[side] = q_now.copy()
+                ik.chain_step(side, req[0], req[1], self.config.chain_weights,
+                              ref_q=self._chain_ref.get(side))
+                self._chain_last_q[side] = ik.joint_positions(side).copy()
+                resync = getattr(self._source, "resync_target", None)
+                if callable(resync):
+                    p, qt = ik.get_ee_pose(side)
+                    resync(side, p, qt)
+            else:
+                ik.solve_ik(side, tgt.pos, tgt.quat, max_iter=self.config.max_iter)
             ik.set_finger(side, tgt.gripper_m)
             self._grip_m[side] = float(tgt.gripper_m)
 
