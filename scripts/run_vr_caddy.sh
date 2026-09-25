@@ -94,7 +94,7 @@ IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
 #    then the shoulder, each joint to its limit. IK_CHAIN_WEIGHTS is unused now.)
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
-CHAIN_ROTATION="${CHAIN_ROTATION:-1}"
+CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
 SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
@@ -148,7 +148,7 @@ TELEOP_ARGS=(
 [[ -n "${IK_LIMIT_MARGIN_DEG}" ]] && TELEOP_ARGS+=(--teleop.limit_margin_deg="${IK_LIMIT_MARGIN_DEG}")
 [[ -n "${IK_HANDOVER_DEG}" ]]     && TELEOP_ARGS+=(--teleop.handover_deg="[${IK_HANDOVER_DEG}]")
 [[ -n "${IK_CHAIN_WEIGHTS}" ]]    && TELEOP_ARGS+=(--teleop.chain_weights="[${IK_CHAIN_WEIGHTS}]")
-[[ "${CHAIN_ROTATION}" == "0" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=false)
+[[ "${CHAIN_ROTATION}" == "1" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=true)
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"

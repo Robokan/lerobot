@@ -68,7 +68,7 @@ class VRMocapConfig(TeleoperatorConfig):
     homing_boost: float = 0.0
     # Keyboard rotation keys turn the aligned joints ONE AT A TIME, each to its
     # limit: L goes shoulder-first then wrist, J goes wrist-first then shoulder.
-    chain_rotation: bool = True
+    chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
     # Unused by the sequential rule; kept so older command lines still parse.
     chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 

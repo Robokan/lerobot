@@ -190,6 +190,8 @@ class VRMocap(Teleoperator):
         self._default_q = {s: np.clip(self._ik.joint_positions(s), self._ik.limits_low[s], self._ik.limits_high[s])
                            for s in SIDES}
         self._homing: set[str] = set()
+        self._tick = 0
+        self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)
@@ -278,6 +280,12 @@ class VRMocap(Teleoperator):
             ik.set_finger(side, tgt.gripper_m)
             self._grip_m[side] = float(tgt.gripper_m)
 
+        if self._debug_every and (self._tick % self._debug_every == 0):
+            # VR_TELEOP_DEBUG=<n>: print the right arm's joints every n ticks so a
+            # key press can be seen to move joints in the REAL teleop loop
+            j = np.degrees(self._ik.joint_positions("right"))
+            print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}", flush=True)
+        self._tick += 1
         return self._joint_action()
 
     def _joint_action(self) -> RobotAction:
