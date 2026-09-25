@@ -79,6 +79,11 @@ RESUME="${RESUME:-0}"                   # 1 = append to the exact REPO_ID given 
 IK_JOINT_WEIGHTS="${IK_JOINT_WEIGHTS:-}"
 IK_SPRING_WEIGHTS="${IK_SPRING_WEIGHTS:-}"
 IK_SPRING_GAIN="${IK_SPRING_GAIN:-}"
+#   IK_LIMIT_MARGIN_DEG  how far before a joint's limit its willingness starts
+#                     fading so the next joint out takes over (default 15).
+#                     Widen it to bring the shoulder in EARLIER in a wrist turn:
+#                     45 = about halfway through the wrist's travel.
+IK_LIMIT_MARGIN_DEG="${IK_LIMIT_MARGIN_DEG:-}"
 SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
@@ -129,6 +134,7 @@ TELEOP_ARGS=(
 [[ -n "${IK_JOINT_WEIGHTS}" ]]  && TELEOP_ARGS+=(--teleop.joint_weights="[${IK_JOINT_WEIGHTS}]")
 [[ -n "${IK_SPRING_WEIGHTS}" ]] && TELEOP_ARGS+=(--teleop.spring_weights="[${IK_SPRING_WEIGHTS}]")
 [[ -n "${IK_SPRING_GAIN}" ]]    && TELEOP_ARGS+=(--teleop.spring_gain="${IK_SPRING_GAIN}")
+[[ -n "${IK_LIMIT_MARGIN_DEG}" ]] && TELEOP_ARGS+=(--teleop.limit_margin_deg="${IK_LIMIT_MARGIN_DEG}")
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"
