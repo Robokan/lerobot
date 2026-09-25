@@ -85,13 +85,14 @@ class VRMocapConfig(TeleoperatorConfig):
     stall_pos_m: float = 0.0003
     stall_deg: float = 0.25
     stall_ticks: int = 6           # consecutive stalled ticks before the target is put back (0 threshold = off)
-    # Artificial range for the wrist roll (J5), degrees [lo, hi]. With the rest
-    # position (0) as the lower limit, an L press finds the wrist already at
-    # its stop in that direction, so the limit taper hands the turn to the
-    # shoulder roll from the first press; J still has the wrist's full range
-    # the other way, and an L after a J unwinds the wrist to 0 first, then
-    # the shoulder. Model range is [-90, 90]; set that to restore it.
-    wrist_limit_deg: list[float] = field(default_factory=lambda: [0.0, 90.0])
+    # Range for the wrist roll (J5), degrees [lo, hi]. The model's own range is
+    # [-90, 90] and that is the default: L turns the wrist first and hands over
+    # to the shoulder roll when the wrist runs out, the same way J does (the
+    # shoulder is held while the wrist still has travel -- see VRMocap).
+    # [0, 90] puts an artificial stop at the wrist's rest position, so an L
+    # press finds it already stopped and the shoulder leads from the first
+    # tick; that was the default until the wrist-first rule was in place.
+    wrist_limit_deg: list[float] = field(default_factory=lambda: [-90.0, 90.0])
     # Mirror for the shoulder roll (J3): home (0) is its stop in the J direction,
     # so once J has brought the shoulder home it turns the wrist instead of
     # driving the shoulder on past home. Model range is [-90, 90].

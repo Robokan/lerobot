@@ -45,6 +45,7 @@
 #   REPO_ID=local/openarm_caddy6_vr_b SEED=2 bash scripts/run_vr_caddy.sh
 #   MODE=teleop bash scripts/run_vr_caddy.sh           # practise, record nothing
 #   DRIVER=keyboard bash scripts/run_vr_caddy.sh       # no headset: keys in the MuJoCo window
+#   WRIST_STOP=1 bash scripts/run_vr_caddy.sh          # L leads with the shoulder (old default)
 #                                                      #   (h = return the arm to its launch pose)
 #   ELBOW_DEG=90 DRIVER=keyboard MODE=teleop bash scripts/run_vr_caddy.sh
 #                                                      # start with the elbows bent: the hands begin
@@ -96,18 +97,20 @@ IK_LIMIT_MARGIN_DEG="${IK_LIMIT_MARGIN_DEG:-}"
 #                     degrees from rest, so the shoulder takes over progressively.
 #                     Smaller = shoulder joins sooner. 0 = off for that joint.
 IK_HANDOVER_DEG="${IK_HANDOVER_DEG:-}"
-#   IK_WRIST_LIMIT_DEG  artificial wrist-roll range "lo,hi" (default 0,90: L is
-#                     handed to the shoulder immediately; J turns the wrist).
-#                     -90,90 restores the model's full range.
+#   IK_WRIST_LIMIT_DEG  wrist-roll range "lo,hi" (default -90,90, the model's own:
+#                     L turns the wrist first and hands over to the shoulder roll
+#                     when the wrist runs out, the same way J does). 0,90 puts an
+#                     artificial stop at the wrist's rest position instead.
 IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
-#   WRIST_STOP=0      turn the artificial wrist stop OFF: on L the wrist roll may
-#                     turn from the first press (the model's own -90..90); the
-#                     shoulder-first ordering then comes only from the solver's weights.
-WRIST_STOP="${WRIST_STOP:-1}"
+#   WRIST_STOP=1      put the artificial stop back at the wrist's rest position, so
+#                     L hands the turn to the shoulder from the first tick instead
+#                     of turning the wrist first (the old default).
+WRIST_STOP="${WRIST_STOP:-0}"
 YAW_AXIS="${YAW_AXIS:-tool}"           # tool (default, the original) | vertical: what j/l turn the gripper about
-[[ "${WRIST_STOP}" == "0" && -z "${IK_WRIST_LIMIT_DEG}" ]] && IK_WRIST_LIMIT_DEG="-90,90"
-#   (rotation keys: L turns the shoulder first then the wrist, J the wrist first
-#    then the shoulder, each joint to its limit. IK_CHAIN_WEIGHTS is unused now.)
+[[ "${WRIST_STOP}" == "1" && -z "${IK_WRIST_LIMIT_DEG}" ]] && IK_WRIST_LIMIT_DEG="0,90"
+#   (rotation keys: L and J both turn the wrist roll first and hand over to the
+#    shoulder roll when the wrist runs out; WRIST_STOP=1 makes L lead with the
+#    shoulder instead. IK_CHAIN_WEIGHTS is unused now.)
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
