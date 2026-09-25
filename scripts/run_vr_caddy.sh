@@ -58,6 +58,8 @@ set -euo pipefail
 MODE="${MODE:-record}"
 DRIVER="${DRIVER:-openxr}"
 MODEL_PATH="${MODEL_PATH:-$HOME/sparkpack/openarm_mujoco/v1/scene.xml}"
+FAST="${FAST:-0}"                # 1 = headless, no frame pacing (tests): sim step per tick unchanged
+[[ "${FAST}" == "1" ]] && { VIEWER=0; export LEROBOT_FAST=1; }
 VIEWER="${VIEWER:-1}"
 STACKS="${STACKS:-6}"
 SEED="${SEED:-0}"
@@ -99,6 +101,10 @@ IK_WRIST_LIMIT_DEG="${IK_WRIST_LIMIT_DEG:-}"
 #   CHAIN_ROTATION=0  turn the chain off (rotation keys pin the wrist again).
 IK_CHAIN_WEIGHTS="${IK_CHAIN_WEIGHTS:-}"
 CHAIN_ROTATION="${CHAIN_ROTATION:-0}"   # 0 = basic IK (default now); 1 = the arm-like turn rule
+ARM_KP="${ARM_KP:-}"                    # sim PD gains, 7 values J1..J7 (see config_mujoco_bi_openarm.py)
+ARM_KD="${ARM_KD:-}"
+ARM_ARMATURE="${ARM_ARMATURE:-}"        # reflected motor inertia per joint, 7 values (sim only)
+COLLISIONS="${COLLISIONS:-1}"           # 0 = no contacts at all (table, bars, self) -- for isolating IK feel from contact
 SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
@@ -139,6 +145,11 @@ ROBOT_ARGS=(
   --robot.seed="${SEED}"
 )
 [[ "${VIEWER}" == "1" ]] && ROBOT_ARGS+=(--robot.viewer=true)
+[[ "${FAST}" == "1" ]] && ROBOT_ARGS+=(--robot.cameras={})    # no camera renders in the test loop
+[[ "${COLLISIONS}" == "0" ]] && ROBOT_ARGS+=(--robot.disable_collisions=true)
+[[ -n "${ARM_KP}" ]] && ROBOT_ARGS+=(--robot.arm_kp="[${ARM_KP}]")
+[[ -n "${ARM_KD}" ]] && ROBOT_ARGS+=(--robot.arm_kd="[${ARM_KD}]")
+[[ -n "${ARM_ARMATURE}" ]] && ROBOT_ARGS+=(--robot.arm_armature="[${ARM_ARMATURE}]")
 TELEOP_ARGS=(
   --teleop.type=vr_mocap
   --teleop.id=vr_mocap

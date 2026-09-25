@@ -199,6 +199,13 @@ class MujocoBiOpenArm(Robot):
         if self.config.disable_collisions:
             self._model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
             logger.info("MuJoCo contacts disabled (disable_collisions=True).")
+        if self.config.arm_armature is not None:
+            for side in ("left", "right"):
+                for i, arm in enumerate(self.config.arm_armature[:7]):
+                    jid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint{i + 1}")
+                    if jid >= 0:
+                        self._model.dof_armature[self._model.jnt_dofadr[jid]] = float(arm)
+            logger.info("arm joint armature set to %s", self.config.arm_armature)
         mujoco.mj_forward(self._model, self._data)
         if self.config.start_elbow_bend_deg:
             apply_base_pose(mujoco, self._model, self._data, self.config.start_elbow_bend_deg)

@@ -198,15 +198,20 @@ class VRMocap(Teleoperator):
         self._default_q = {s: np.clip(self._ik.joint_positions(s), self._ik.limits_low[s], self._ik.limits_high[s])
                            for s in SIDES}
         self._tick = 0
+        self._actual_q: dict = {}
+        self._last_tgt: dict = {}
         self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
         # artificial wrist-roll range (see config.wrist_limit_deg)
         lo_deg, hi_deg = self.config.wrist_limit_deg
         s_lo, s_hi = self.config.shoulder_roll_limit_deg
-        for s in SIDES:
-            self._ik.limits_low[s][4] = max(float(self._ik.limits_low[s][4]), math.radians(lo_deg))
-            self._ik.limits_high[s][4] = min(float(self._ik.limits_high[s][4]), math.radians(hi_deg))
-            self._ik.limits_low[s][2] = max(float(self._ik.limits_low[s][2]), math.radians(s_lo))
-            self._ik.limits_high[s][2] = min(float(self._ik.limits_high[s][2]), math.radians(s_hi))
+        # The model's own ranges. The artificial stops (wrist_limit_deg,
+        # shoulder_roll_limit_deg) and the return-home pins are applied ONLY
+        # while a rotation key is held (see get_action); translation and the
+        # hold get the full ranges, otherwise a w/s/a/d move that takes the
+        # shoulder roll off home left the wrist pinned and the shoulder frozen
+        # -- a five-joint arm that locked up and chattered.
+        self._limits_model = {s: (self._ik.limits_low[s].copy(), self._ik.limits_high[s].copy()) for s in SIDES}
+        del lo_deg, hi_deg, s_lo, s_hi
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)
@@ -262,6 +267,7 @@ class VRMocap(Teleoperator):
         for side, tgt in targets.items():
             if tgt is not None:
                 _vk_mark(side, tgt.pos, tgt.quat)
+                self._last_tgt[side] = np.asarray(tgt.pos, float).copy()
 
         for side in SIDES:
             tgt = targets.get(side)
@@ -274,6 +280,7 @@ class VRMocap(Teleoperator):
                 # to set its joints rather than swing there.
                 from lerobot.robots.mujoco_bi_openarm import viewer_keys as _vk
 
+                ik.limits_low[side][:], ik.limits_high[side][:] = self._limits_model[side]
                 ik.set_joint_positions(side, self._default_q[side])
                 ik.set_finger(side, FINGER_OPEN_M)
                 self._grip_m[side] = float(FINGER_OPEN_M)
@@ -286,21 +293,42 @@ class VRMocap(Teleoperator):
                     reset_grip(side, FINGER_OPEN_M)
                 _vk.request_teleport()
                 continue
-            # Return-home rule, by joint limits alone: while the shoulder roll (J3)
-            # is away from its launch value, the wrist roll (J5) may only UNWIND
-            # toward 0 -- its upper limit is pinned at its current value -- so J
-            # has to bring the shoulder home before the wrist gets its range, and
-            # an L after a J brings the wrist to 0 before the shoulder moves.
-            # Together with wrist_limit_deg this retraces every turn.
-            qj = ik.joint_positions(side)
-            j3_home = abs(float(qj[2] - self._default_q[side][2])) < math.radians(2.0)
-            j5_home = abs(float(qj[4] - self._default_q[side][4])) < math.radians(2.0)
-            hi_cfg = math.radians(self.config.wrist_limit_deg[1])
-            lo_cfg = math.radians(self.config.shoulder_roll_limit_deg[0])
-            # shoulder away from home -> the wrist may only unwind (upper pinned)
-            ik.limits_high[side][4] = hi_cfg if j3_home else min(hi_cfg, max(float(qj[4]), ik.limits_low[side][4]) + 1e-6)
-            # wrist away from home -> the shoulder may only unwind (lower pinned)
-            ik.limits_low[side][2] = lo_cfg if j5_home else max(lo_cfg, min(float(qj[2]), ik.limits_high[side][2]) - 1e-6)
+            # Return-home rule, by joint limits alone, applied EVERY tick. The
+            # states the rotation keys walk through form one path, (shoulder
+            # roll J3, wrist roll J5):  (0,+90) <-j- (0,0) -l-> (-90,0) -l->
+            # (-90,-90). L: the shoulder to its stop first, then the wrist; J:
+            # the wrist back to rest first, then the shoulder home, then the
+            # wrist the other way. Off the path the same rules walk back onto
+            # it. The pins stay on between gestures too: the two roll joints
+            # share an axis when the arm is straight, so with them free the
+            # shoulder spring traded its roll into the wrist after every turn
+            # (-89/-61 drifted to -59/-90 in a second of settle), and with the
+            # roll springs off instead, plain translation wandered the pair to
+            # -85/+85. The freeze once blamed on the pins was the solver's
+            # no-twist guard (see IKSolver.solve_ik best-effort step).
+            model_lo, model_hi = self._limits_model[side]
+            if True:
+                qj = ik.joint_positions(side)
+                q3, q5 = float(qj[2]), float(qj[4])
+                d3, d5 = float(self._default_q[side][2]), float(self._default_q[side][4])
+                tol = math.radians(2.0)
+                eps = 1e-6
+                hi_cfg = min(float(model_hi[4]), math.radians(self.config.wrist_limit_deg[1]))
+                wlo_cfg = max(float(model_lo[4]), math.radians(self.config.wrist_limit_deg[0]))
+                lo_cfg = max(float(model_lo[2]), math.radians(self.config.shoulder_roll_limit_deg[0]))
+                shi_cfg = min(float(model_hi[2]), math.radians(self.config.shoulder_roll_limit_deg[1]))
+                j3_home = abs(q3 - d3) < tol
+                j3_at_stop = abs(q3 - lo_cfg) < tol
+                # wrist, J side: free once the shoulder is home, else only unwind
+                ik.limits_high[side][4] = max(hi_cfg, q5) + eps if j3_home else min(hi_cfg, max(q5, d5) + eps)
+                # wrist, L side: the stop holds until the shoulder is at ITS
+                # stop, then the model's range; below the stop only unwind
+                ik.limits_low[side][4] = (min(float(model_lo[4]), q5) - eps if j3_at_stop
+                                          else max(float(model_lo[4]), min(wlo_cfg, q5) - eps))
+                # shoulder, L side: held while the wrist is above rest
+                ik.limits_low[side][2] = q3 - eps if q5 > d5 + tol else min(lo_cfg, q3) - eps
+                # shoulder, J side: held while the wrist is below rest; home is its stop
+                ik.limits_high[side][2] = q3 + eps if q5 < d5 - tol else max(shi_cfg, q3) + eps
             take = getattr(self._source, "take_rotation_request", None)
             req = take(side) if callable(take) else None
             if req is not None:
@@ -314,6 +342,11 @@ class VRMocap(Teleoperator):
                     resync(side, p, qt)
             else:
                 ik.solve_ik(side, tgt.pos, tgt.quat, max_iter=self.config.max_iter)
+                # clip AFTER the solve too, so against an obstacle the command
+                # sits steadily at the leash instead of stepping 3 deg past it
+                # and being pulled back every tick (a sawtooth the PD chased)
+                self._clip_to_actual(side)
+                self._leash_target(side, tgt)
             ik.set_finger(side, tgt.gripper_m)
             self._grip_m[side] = float(tgt.gripper_m)
 
@@ -322,7 +355,9 @@ class VRMocap(Teleoperator):
             # key press can be seen to move joints in the REAL teleop loop
             j = np.degrees(self._ik.joint_positions("right"))
             tip = np.asarray(self._ik.get_ee_pose("right")[0], float) * 100
-            print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}  tip cm = {np.round(tip, 1).tolist()}", flush=True)
+            tg = self._last_tgt.get("right")
+            tg = "" if tg is None else f"  tgt cm = {np.round(np.asarray(tg, float) * 100, 1).tolist()}"
+            print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}  tip cm = {np.round(tip, 1).tolist()}{tg}", flush=True)
         self._tick += 1
         return self._joint_action()
 
@@ -341,6 +376,42 @@ class VRMocap(Teleoperator):
         drain = getattr(self._source, "drain_recording_controls", None)
         return drain() if callable(drain) else []
 
+    def _clip_to_actual(self, side) -> None:
+        """Keep the commanded joints within actual_leash_deg of the last ACTUAL
+        joints reported by the robot (no-op until the first feedback)."""
+        a = self._actual_q.get(side)
+        leash = math.radians(self.config.actual_leash_deg)
+        if a is None or leash <= 0:
+            return
+        q = self._ik.joint_positions(side)
+        qc = np.clip(q, a - leash, a + leash)
+        if np.any(np.abs(qc - q) > 1e-9):
+            self._ik.set_joint_positions(side, qc)
+
+    def _leash_target(self, side, tgt) -> None:
+        """Pull the pose target back to within target_leash_m / _deg of the
+        commanded tip (see config). Only the source's stored target moves; a
+        rotation gesture's tip anchor is untouched."""
+        resync = getattr(self._source, "resync_target", None)
+        if not callable(resync):
+            return
+        mujoco = self._ik._mujoco
+        p_tip, q_tip = self._ik.get_ee_pose(side)
+        p_tip = np.asarray(p_tip, float); q_tip = np.asarray(q_tip, float)
+        new_p, new_q = np.asarray(tgt.pos, float).copy(), np.asarray(tgt.quat, float).copy()
+        changed = False
+        err = new_p - p_tip; d = float(np.linalg.norm(err))
+        if d > self.config.target_leash_m:
+            new_p = p_tip + err * (self.config.target_leash_m / d); changed = True
+        v = np.zeros(3)
+        mujoco.mju_subQuat(v, new_q, q_tip)          # rotation from the tip attitude to the target
+        a = float(np.linalg.norm(v)); lim = math.radians(self.config.target_leash_deg)
+        if a > lim:
+            new_q = q_tip.copy()
+            mujoco.mju_quatIntegrate(new_q, v * (lim / a), 1.0); changed = True
+        if changed:
+            resync(side, new_p, new_q)
+
     def send_feedback(self, feedback: dict) -> None:
         """Forward robot observation images to the OpenXR headset view."""
         if self._debug_every and (self._tick % self._debug_every == 0):
@@ -348,6 +419,14 @@ class VRMocap(Teleoperator):
             act = [feedback.get(f"right_{m}.pos") for m in ARM_JOINT_NAMES]
             if all(a is not None for a in act):
                 print(f"[teleop] tick {self._tick}  right ACTUAL J1..J7 = {np.round(act, 1).tolist()}", flush=True)
+        # Leash the commanded arm to the actual one (see config.actual_leash_deg)
+        leash = math.radians(self.config.actual_leash_deg)
+        if leash > 0:
+            for side in SIDES:
+                act = [feedback.get(f"{side}_{m}.pos") for m in ARM_JOINT_NAMES]
+                if all(a is not None for a in act):
+                    self._actual_q[side] = np.radians(np.asarray(act, float))
+                    self._clip_to_actual(side)
         source = self._source
         if source is None or not hasattr(source, "update_camera_frames"):
             return

@@ -518,14 +518,27 @@ class IKSolver:
             else:
                 # Soft no-twist: allow motion, but undo a step that makes the
                 # wrist attitude clearly worse than before.
-                if float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0):
+                if (float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0)
+                        or new_score > score):
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = q[k]
-                    break
-                if new_score > score:
+                    # Best effort instead of a freeze. With wrist joints on
+                    # their limits no step can translate AND hold the attitude,
+                    # and rejecting every step left the arm dead to w/s/a/d/r/f
+                    # (measured: zero motion on all six until a rotation key
+                    # took the wrist off its limits). So translate first and
+                    # serve the attitude only in the nullspace of that; keep
+                    # the step only if the tip actually got closer.
+                    dq_p = self._weighted_dls(Jp, pos_err, weights, self.dls_lambda)
+                    dq_r = _nullspace_projector(Jp) @ self._weighted_dls(Jr, ori_err, weights, self.dls_lambda)
+                    dq = np.clip(dq_p + dq_r, -self.max_step_rad, self.max_step_rad)
                     for k, qi in enumerate(idx):
-                        self.data.qpos[qi] = q[k]
-                    break
+                        self.data.qpos[qi] = np.clip(q[k] + dq[k], lo[k], hi[k])
+                    new_pos_err, _, _ = pose_error()
+                    if float(np.linalg.norm(new_pos_err)) >= pos_n - 1e-5:
+                        for k, qi in enumerate(idx):
+                            self.data.qpos[qi] = q[k]
+                        break
 
         # Rate-limit the tick as a whole, then settle the model on the result.
         lim = self.max_delta_per_call_rad

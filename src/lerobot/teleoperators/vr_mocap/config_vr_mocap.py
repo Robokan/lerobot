@@ -60,6 +60,16 @@ class VRMocapConfig(TeleoperatorConfig):
         default_factory=lambda: [1.0, 1.0, 1.0, 0.6, 0.02, 0.02, 0.02]
     )
     spring_gain: float = 0.15
+    # Leashes. The commanded arm (the solver's own kinematic state) may lead
+    # the ACTUAL sim arm by at most this much per joint: when the table stops
+    # the arm the command used to run 190-208 deg away and the arm snapped
+    # when contact released. Normal tracking lag is 4-5 deg.
+    actual_leash_deg: float = 10.0
+    # The pose target may lead the commanded tip by at most this much, so a
+    # target that stalls (out of reach, joint limits) does not run away and
+    # a reversed key answers within a second instead of after the backlog.
+    target_leash_m: float = 0.04
+    target_leash_deg: float = 20.0
     # Artificial range for the wrist roll (J5), degrees [lo, hi]. With the rest
     # position (0) as the lower limit, an L press finds the wrist already at
     # its stop in that direction, so the limit taper hands the turn to the

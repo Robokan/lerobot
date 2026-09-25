@@ -314,6 +314,11 @@ class KeyboardPoseSource(PoseSource):
             return True
         return False
 
+    def rotation_active(self, side) -> bool:
+        """True while a rotation gesture (i/k/j/l/u/o held) is in progress for
+        ``side`` -- the ticks the tip anchor is alive."""
+        return self._rot_anchor_ttl.get(side, 0) > 0
+
     def take_rotation_request(self, side):
         """(axis_world, angle) queued by the rotation keys this tick, or None."""
         axis, ang = self._rot_request.pop(side, (None, 0.0))

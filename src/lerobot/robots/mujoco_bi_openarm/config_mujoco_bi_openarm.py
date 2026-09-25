@@ -89,6 +89,15 @@ class MujocoBiOpenArmConfig(RobotConfig):
     # the model forcerange). Mirrors the real follower's MIT-control gains.
     arm_kp: list[float] = field(default_factory=lambda: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0])
     arm_kd: list[float] = field(default_factory=lambda: [5.0, 5.0, 3.0, 5.0, 0.3, 0.3, 0.3])
+    # Reflected rotor inertia added to each arm joint (kg m^2, J1..J7), a
+    # sim-only stand-in for the geared motors the model leaves out (its joints
+    # carry no armature). Without it the roll joints -- a slender link turning
+    # about its own axis has almost no inertia -- sit at the stability edge of
+    # the explicit 500 Hz PD above and ring: 150-300 direction reversals per
+    # roll gesture with a perfectly smooth command. 0.005 (about a 10:1-geared
+    # wrist motor's reflected inertia) brought that to zero on every joint with
+    # unchanged end states; larger values gained nothing. None = model as is.
+    arm_armature: list[float] | None = field(default_factory=lambda: [0.005] * 7)
 
     # Gains for finger joints that are driven as `motor` (torque) actuators in
     # the model (the left fingers). Position-type finger actuators (right
