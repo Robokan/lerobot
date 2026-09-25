@@ -25,6 +25,8 @@ them each tick.
 from __future__ import annotations
 
 import threading
+
+import numpy as np
 from collections import deque
 
 # GLFW letter keycodes are uppercase ASCII (e.g. GLFW_KEY_E == 69 == ord('E')).
@@ -135,6 +137,27 @@ def take_teleport() -> bool:
         v = _teleport["pending"]
         _teleport["pending"] = False
     return v
+
+
+# Commanded-pose markers (teleop -> viewer): the IK target pose per hand, drawn
+# as an x/y/z triad by the robot when the viewer syncs. m toggles them.
+_markers: dict = {"enabled": False, "targets": {}}
+
+
+def set_target_marker(side: str, pos, quat) -> None:
+    with _lock:
+        _markers["targets"][side] = (np.asarray(pos, dtype=float).copy(), np.asarray(quat, dtype=float).copy())
+
+
+def toggle_markers() -> bool:
+    with _lock:
+        _markers["enabled"] = not _markers["enabled"]
+        return _markers["enabled"]
+
+
+def get_markers():
+    with _lock:
+        return (_markers["enabled"], dict(_markers["targets"]))
 
 
 def drain_recording_controls() -> list[str]:

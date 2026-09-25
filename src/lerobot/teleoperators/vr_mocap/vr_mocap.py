@@ -118,6 +118,14 @@ def _with_hud(frames: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return out
 
 
+def _vk_mark(side, pos, quat):
+    try:
+        from lerobot.robots.mujoco_bi_openarm.viewer_keys import set_target_marker
+    except Exception:  # noqa: BLE001
+        return
+    set_target_marker(side, pos, quat)
+
+
 class VRMocap(Teleoperator):
     """VR mocap -> IK -> joint-position teleoperator (16 right-first *.pos deg)."""
 
@@ -193,9 +201,12 @@ class VRMocap(Teleoperator):
         self._debug_every = int(os.environ.get("VR_TELEOP_DEBUG", "0") or 0)
         # artificial wrist-roll range (see config.wrist_limit_deg)
         lo_deg, hi_deg = self.config.wrist_limit_deg
+        s_lo, s_hi = self.config.shoulder_roll_limit_deg
         for s in SIDES:
             self._ik.limits_low[s][4] = max(float(self._ik.limits_low[s][4]), math.radians(lo_deg))
             self._ik.limits_high[s][4] = min(float(self._ik.limits_high[s][4]), math.radians(hi_deg))
+            self._ik.limits_low[s][2] = max(float(self._ik.limits_low[s][2]), math.radians(s_lo))
+            self._ik.limits_high[s][2] = min(float(self._ik.limits_high[s][2]), math.radians(s_hi))
         self._source = self._make_source()
         if hasattr(self._source, "chain_rotation"):
             self._source.chain_rotation = bool(self.config.chain_rotation)
@@ -247,6 +258,10 @@ class VRMocap(Teleoperator):
         ik = self._ik
         current_ee = {s: ik.get_ee_pose(s) for s in SIDES}
         targets = self._source.get_targets(current_ee)
+        # commanded-pose markers for the viewer (m toggles them)
+        for side, tgt in targets.items():
+            if tgt is not None:
+                _vk_mark(side, tgt.pos, tgt.quat)
 
         for side in SIDES:
             tgt = targets.get(side)
@@ -271,6 +286,21 @@ class VRMocap(Teleoperator):
                     reset_grip(side, FINGER_OPEN_M)
                 _vk.request_teleport()
                 continue
+            # Return-home rule, by joint limits alone: while the shoulder roll (J3)
+            # is away from its launch value, the wrist roll (J5) may only UNWIND
+            # toward 0 -- its upper limit is pinned at its current value -- so J
+            # has to bring the shoulder home before the wrist gets its range, and
+            # an L after a J brings the wrist to 0 before the shoulder moves.
+            # Together with wrist_limit_deg this retraces every turn.
+            qj = ik.joint_positions(side)
+            j3_home = abs(float(qj[2] - self._default_q[side][2])) < math.radians(2.0)
+            j5_home = abs(float(qj[4] - self._default_q[side][4])) < math.radians(2.0)
+            hi_cfg = math.radians(self.config.wrist_limit_deg[1])
+            lo_cfg = math.radians(self.config.shoulder_roll_limit_deg[0])
+            # shoulder away from home -> the wrist may only unwind (upper pinned)
+            ik.limits_high[side][4] = hi_cfg if j3_home else min(hi_cfg, max(float(qj[4]), ik.limits_low[side][4]) + 1e-6)
+            # wrist away from home -> the shoulder may only unwind (lower pinned)
+            ik.limits_low[side][2] = lo_cfg if j5_home else max(lo_cfg, min(float(qj[2]), ik.limits_high[side][2]) - 1e-6)
             take = getattr(self._source, "take_rotation_request", None)
             req = take(side) if callable(take) else None
             if req is not None:
@@ -313,6 +343,11 @@ class VRMocap(Teleoperator):
 
     def send_feedback(self, feedback: dict) -> None:
         """Forward robot observation images to the OpenXR headset view."""
+        if self._debug_every and (self._tick % self._debug_every == 0):
+            # the ACTUAL sim joints next to the commanded ones, to see ringing
+            act = [feedback.get(f"right_{m}.pos") for m in ARM_JOINT_NAMES]
+            if all(a is not None for a in act):
+                print(f"[teleop] tick {self._tick}  right ACTUAL J1..J7 = {np.round(act, 1).tolist()}", flush=True)
         source = self._source
         if source is None or not hasattr(source, "update_camera_frames"):
             return

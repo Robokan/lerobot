@@ -67,6 +67,10 @@ class VRMocapConfig(TeleoperatorConfig):
     # the other way, and an L after a J unwinds the wrist to 0 first, then
     # the shoulder. Model range is [-90, 90]; set that to restore it.
     wrist_limit_deg: list[float] = field(default_factory=lambda: [0.0, 90.0])
+    # Mirror for the shoulder roll (J3): home (0) is its stop in the J direction,
+    # so once J has brought the shoulder home it turns the wrist instead of
+    # driving the shoulder on past home. Model range is [-90, 90].
+    shoulder_roll_limit_deg: list[float] = field(default_factory=lambda: [-90.0, 0.0])
     # Wind-up hardening per joint (deg, 0 = off): a joint's willingness fades as
     # it winds away from rest, handing the motion to the next joint. Default
     # hardens only the wrist, over 45 deg = halfway through its travel.
@@ -80,7 +84,7 @@ class VRMocapConfig(TeleoperatorConfig):
     # Keyboard rotation keys turn the aligned joints ONE AT A TIME, each to its
     # limit: L goes shoulder-first then wrist, J goes wrist-first then shoulder.
     # Keyboard rotation keys pivot about the gripper TIP (the TCP); False = wrist pivot.
-    rotate_about_tip: bool = False   # the original wrist pivot; the tip pivot bound the arm up
+    rotate_about_tip: bool = True    # rotations pivot about the gripper tip (TCP); translations move it
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
     # Unused by the sequential rule; kept so older command lines still parse.
     chain_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])

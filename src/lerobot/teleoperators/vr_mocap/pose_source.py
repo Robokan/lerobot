@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 # at ~50 Hz; our keyboard driver applies one step per discrete press/repeat, so
 # rotation needs a larger step or i/k/j/l/u/o feel almost still.
 POS_STEP = 0.005
+# A held movement key is a steady velocity: each repeat event arms the key for
+# this many ticks and every tick applies 1/KEY_HOLD_TICKS of the step.
+KEY_HOLD_TICKS = 6
+_VELOCITY_KEYS = set("wsadrfikjluo[]")
 ROT_STEP = 0.15  # ~8.6 deg per press
 GRIP_STEP = 0.005
 
@@ -213,13 +217,16 @@ class KeyboardPoseSource(PoseSource):
     # chain. The target then re-syncs to wherever the hand ended up.
     chain_rotation: bool = False
     # Rotation keys pivot about the gripper tip (TCP); translation keys move it.
-    rotate_about_tip: bool = False
+    rotate_about_tip: bool = True
 
     def __init__(self):
         self._pos: dict[str, np.ndarray] = {}
         self._quat: dict[str, np.ndarray] = {}
         self._rot_request: dict[str, tuple[np.ndarray, float]] = {}
         self._home_request: set[str] = set()
+        self._held: dict[str, int] = {}
+        self._rot_anchor: dict[str, np.ndarray | None] = {}
+        self._rot_anchor_ttl: dict[str, int] = {}
         self._grip: dict[str, float] = {s: 0.0 for s in SIDES}
         self._active_side = "right"
         self._queue: deque[str] = deque()
@@ -241,6 +248,7 @@ class KeyboardPoseSource(PoseSource):
   Tab       switch active hand
   Space     reset targets to current pose
   h         return the arm to the default (launch) pose
+  m         show / hide x,y,z markers at the commanded gripper poses
   c         cycle viewer cam (ego / right / left / free)
   y / t     start / stop recording (record mode)
   n / q     end episode early / quit recording
@@ -398,39 +406,61 @@ class KeyboardPoseSource(PoseSource):
         keys = self._drain_keys()
         if keys and os.environ.get("VR_TELEOP_DEBUG"):
             print(f"[teleop] keys drained: {keys}", flush=True)
+        ttl = self._rot_anchor_ttl.get(side, 0)
+        if ttl > 0:
+            self._rot_anchor_ttl[side] = ttl - 1
+        elif self._rot_anchor.get(side) is not None:
+            self._rot_anchor[side] = None          # gesture over: next rotation re-anchors
+        # held-key velocity: (re)arm on each event, apply a fraction every tick
+        for ch in keys:
+            if ch in _VELOCITY_KEYS:
+                self._held[ch] = KEY_HOLD_TICKS
+        keys = [ch for ch in keys if ch not in _VELOCITY_KEYS]
+        for ch, left in list(self._held.items()):
+            if left <= 0:
+                del self._held[ch]
+                continue
+            self._held[ch] = left - 1
+            keys.append(ch)
         for ch in keys:
             if ch == "w":
-                pos[0] += POS_STEP
+                pos[0] += POS_STEP / KEY_HOLD_TICKS
             elif ch == "s":
-                pos[0] -= POS_STEP
+                pos[0] -= POS_STEP / KEY_HOLD_TICKS
             elif ch == "a":
-                pos[1] += POS_STEP
+                pos[1] += POS_STEP / KEY_HOLD_TICKS
             elif ch == "d":
-                pos[1] -= POS_STEP
+                pos[1] -= POS_STEP / KEY_HOLD_TICKS
             elif ch == "r":
-                pos[2] += POS_STEP
+                pos[2] += POS_STEP / KEY_HOLD_TICKS
             elif ch == "f":
-                pos[2] -= POS_STEP
+                pos[2] -= POS_STEP / KEY_HOLD_TICKS
             elif ch == "i":
-                _body_rot(np.array([0.0, 1.0, 0.0]), ROT_STEP)
+                _body_rot(np.array([0.0, 1.0, 0.0]), ROT_STEP / KEY_HOLD_TICKS)
             elif ch == "k":
-                _body_rot(np.array([0.0, 1.0, 0.0]), -ROT_STEP)
+                _body_rot(np.array([0.0, 1.0, 0.0]), -ROT_STEP / KEY_HOLD_TICKS)
             # world axis is -Z so that L turns the same way it did before the
             # yaw moved from the hand's axis to vertical (the operator's frame)
+            elif ch == "m":
+                try:
+                    from lerobot.robots.mujoco_bi_openarm.viewer_keys import toggle_markers
+                    print(f"[teleop] target markers {'ON' if toggle_markers() else 'off'}", flush=True)
+                except Exception:  # noqa: BLE001
+                    pass
             elif ch == "h":
                 self._home_request.update(SIDES)      # session reset: BOTH arms to default
             elif ch == "j":
-                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP, world_axis=np.array([0.0, 0.0, -1.0]))
+                _body_rot(np.array([0.0, 0.0, 1.0]), ROT_STEP / KEY_HOLD_TICKS)
             elif ch == "l":
-                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP, world_axis=np.array([0.0, 0.0, -1.0]))
+                _body_rot(np.array([0.0, 0.0, 1.0]), -ROT_STEP / KEY_HOLD_TICKS)
             elif ch == "u":
-                _body_rot(np.array([1.0, 0.0, 0.0]), ROT_STEP)
+                _body_rot(np.array([1.0, 0.0, 0.0]), ROT_STEP / KEY_HOLD_TICKS)
             elif ch == "o":
-                _body_rot(np.array([1.0, 0.0, 0.0]), -ROT_STEP)
+                _body_rot(np.array([1.0, 0.0, 0.0]), -ROT_STEP / KEY_HOLD_TICKS)
             elif ch == "[":
-                self._grip[side] = min(self._grip[side] + GRIP_STEP, FINGER_OPEN_M)
+                self._grip[side] = min(self._grip[side] + GRIP_STEP / KEY_HOLD_TICKS, FINGER_OPEN_M)
             elif ch == "]":
-                self._grip[side] = max(self._grip[side] - GRIP_STEP, 0.0)
+                self._grip[side] = max(self._grip[side] - GRIP_STEP / KEY_HOLD_TICKS, 0.0)
             elif ch in ("\t", ";"):
                 self._active_side = "left" if side == "right" else "right"
                 logger.info("Active hand: %s", self._active_side.upper())
@@ -483,7 +513,15 @@ class KeyboardPoseSource(PoseSource):
             quat[:] = quat_mul(quat, axis_angle_to_quat(rot_axis_angle / rot_angle, rot_angle))
             quat[:] = quat / np.linalg.norm(quat)
             if self.rotate_about_tip:
-                pos[:] = act_pos                      # the tip stays where it is
+                # The tip stays where the gesture STARTED, not wherever it has
+                # drifted to: re-syncing to the actual tip each tick let 1.5 cm
+                # of drift accumulate over a 33 deg turn. The anchor is taken on
+                # the first rotation tick after a pause and held while keys
+                # keep coming, so the solver pulls the tip back every tick.
+                if self._rot_anchor.get(side) is None:
+                    self._rot_anchor[side] = act_pos.copy()
+                self._rot_anchor_ttl[side] = KEY_HOLD_TICKS + 2
+                pos[:] = self._rot_anchor[side]
             else:
                 # Keep the wrist/hand pivot fixed; tip follows on a sphere about it.
                 pos[:] = tcp_pos_from_hand(pivot_hand, quat)
