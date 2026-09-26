@@ -112,8 +112,12 @@ def apply_base_pose(mujoco, model, data, elbow_bend_deg: float = BASE_ELBOW_BEND
             # (J1 is -80..200 right and -200..80 left, so the same posture is
             # the negated angle). The elbow runs 0..140 on both, so negating it
             # would just clip to 0 and flatten the arm.
+            # Mirror where the two ranges are negatives of each other. That
+            # covers the swept joints (J1 is -80..200 right, -200..80 left) AND
+            # the symmetric ones (-90..90 is its own mirror), and excludes the
+            # elbow, which runs 0..140 on both arms so negating it clips flat.
             rl, ll = model.jnt_range[ids["right"]], model.jnt_range[ids["left"]]
-            mirrored = abs(ll[0] + rl[1]) < 1e-6 and abs(ll[1] + rl[0]) < 1e-6 and abs(rl[0] + rl[1]) > 1e-6
+            mirrored = abs(ll[0] + rl[1]) < 1e-6 and abs(ll[1] + rl[0]) < 1e-6
             for sd in SIDES:
                 sign = -1.0 if (sd == "left" and mirrored) else 1.0
                 lo, hi = model.jnt_range[ids[sd]]

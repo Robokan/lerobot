@@ -373,8 +373,7 @@ class IKSolver:
                     lo_l, hi_l = self.limits_low["left"], self.limits_high["left"]
                     lo_r, hi_r = self.limits_low["right"], self.limits_high["right"]
                     for k in range(7):
-                        if abs(lo_l[k] + hi_r[k]) < 1e-6 and abs(hi_l[k] + lo_r[k]) < 1e-6 \
-                                and abs(lo_r[k] + hi_r[k]) > 1e-6:
+                        if abs(lo_l[k] + hi_r[k]) < 1e-6 and abs(hi_l[k] + lo_r[k]) < 1e-6:
                             r[k] = -r[k]
             else:
                 r = np.zeros(7)
