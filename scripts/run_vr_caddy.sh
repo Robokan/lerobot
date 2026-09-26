@@ -124,6 +124,7 @@ ARM_KP="${ARM_KP:-}"                    # sim PD gains, 7 values J1..J7 (see con
 ARM_KD="${ARM_KD:-}"
 ARM_ARMATURE="${ARM_ARMATURE:-}"        # reflected motor inertia per joint, 7 values (sim only)
 COLLISIONS="${COLLISIONS:-1}"           # 0 = no contacts at all (table, bars, self) -- for isolating IK feel from contact
+CAMERAS="${CAMERAS:-1}"                 # 0 = no robot cameras (no MuJoCo offscreen GL contexts)
 SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
 
 cd "$(dirname "$0")/.."
@@ -164,7 +165,7 @@ ROBOT_ARGS=(
   --robot.seed="${SEED}"
 )
 [[ "${VIEWER}" == "1" ]] && ROBOT_ARGS+=(--robot.viewer=true)
-[[ "${FAST}" == "1" ]] && ROBOT_ARGS+=(--robot.cameras={})    # no camera renders in the test loop
+[[ "${FAST}" == "1" || "${CAMERAS}" == "0" ]] && ROBOT_ARGS+=(--robot.cameras={})
 [[ "${COLLISIONS}" == "0" ]] && ROBOT_ARGS+=(--robot.disable_collisions=true)
 [[ -n "${ELBOW_DEG}" ]] && ROBOT_ARGS+=(--robot.start_elbow_bend_deg="${ELBOW_DEG}")
 [[ -n "${ARM_KP}" ]] && ROBOT_ARGS+=(--robot.arm_kp="[${ARM_KP}]")
