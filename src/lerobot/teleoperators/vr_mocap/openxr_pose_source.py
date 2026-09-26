@@ -176,8 +176,10 @@ class OpenXRPoseSource(PoseSource):
         self._thread = threading.Thread(target=self._xr_loop, daemon=True)
         self._thread.start()
         logger.info(
-            "OpenXRPoseSource started; Y=tracking, B=passthrough/camera, "
-            "X=ego/right, A=ego/left."
+            "OpenXRPoseSource started. LEFT X = tracking on/off (the arms do NOT "
+            "follow until this is on; the triggers still work either way). "
+            "LEFT Y = passthrough / camera view. thumbstick = pick camera. "
+            "RIGHT B = start recording, RIGHT A = stop & save, right grip = redo."
         )
 
     def stop(self):

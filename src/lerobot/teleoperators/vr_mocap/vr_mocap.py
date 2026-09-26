@@ -228,6 +228,13 @@ class VRMocap(Teleoperator):
             self._source.rotate_about_tip = bool(self.config.rotate_about_tip)
         if hasattr(self._source, "yaw_about_vertical"):
             self._source.yaw_about_vertical = bool(self.config.yaw_about_vertical)
+        # The roll ordering (shoulder/wrist hand-over, the home detent) is a KEY
+        # affordance: it decides what a single-axis key press should turn. A
+        # source that gives a full 6-DoF pose (the headset) commands the wrist
+        # attitude directly and does not need it.
+        self._roll_ordering = callable(getattr(self._source, "rotation_active", None))
+        logger.info("roll ordering pins %s",
+                    "ON (key driver)" if self._roll_ordering else "off (6-DoF pose driver)")
         self._source.reset({s: self._ik.get_ee_pose(s) for s in SIDES})
         self._source.start()
 

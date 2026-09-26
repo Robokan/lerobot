@@ -125,7 +125,7 @@ ARM_KD="${ARM_KD:-}"
 ARM_ARMATURE="${ARM_ARMATURE:-}"        # reflected motor inertia per joint, 7 values (sim only)
 COLLISIONS="${COLLISIONS:-1}"           # 0 = no contacts at all (table, bars, self) -- for isolating IK feel from contact
 CAMERAS="${CAMERAS:-1}"                 # 0 = no robot cameras (no MuJoCo offscreen GL contexts)
-SPEAK="${SPEAK:-1}"                     # 1 = say each prompt aloud (spd-say); route audio to the WiVRn sink to hear it in the headset
+SPEAK="${SPEAK:-0}"                     # 1 = say each prompt aloud (spd-say); off by default, the prompt is on screen in the headset
 
 cd "$(dirname "$0")/.."
 
