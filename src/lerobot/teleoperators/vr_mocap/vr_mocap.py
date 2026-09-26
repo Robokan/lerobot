@@ -495,7 +495,8 @@ class VRMocap(Teleoperator):
             tl = np.asarray(self._ik.get_ee_pose("left")[0], float) * 100
             tgl = self._last_tgt.get("left")
             tgl = "" if tgl is None else f"  tgt cm = {np.round(np.asarray(tgl, float) * 100, 1).tolist()}"
-            print(f"[teleop] tick {self._tick}  left  J1..J7 = {np.round(jl, 1).tolist()}  tip cm = {np.round(tl, 1).tolist()}{tgl}", flush=True)
+            stopl = self._ik.last_stop.get("left", "?"); stopr = self._ik.last_stop.get("right", "?")
+            print(f"[teleop] tick {self._tick}  left  J1..J7 = {np.round(jl, 1).tolist()}  tip cm = {np.round(tl, 1).tolist()}{tgl}  stop = {stopl} / right {stopr}", flush=True)
         self._tick += 1
         return self._joint_action()
 

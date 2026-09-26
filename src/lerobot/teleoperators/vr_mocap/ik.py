@@ -363,6 +363,8 @@ class IKSolver:
         # elbow and wrist pitch once the intended joints are pinned, which
         # contorts the arm and does not retrace on the way back.
         self.ori_joint_mask: dict[str, np.ndarray | None] = {}
+        # why solve_ik stopped iterating, per side (diagnostics)
+        self.last_stop: dict[str, str] = {}
         self._rest_q: dict[str, np.ndarray] = {}
         for side in self.joint_ids:
             if self.rest_pose_rad is not None:
@@ -417,33 +419,36 @@ class IKSolver:
         for k, qi in enumerate(idx):
             self.data.qpos[qi] = np.clip(self.data.qpos[qi], lo[k], hi[k])
         q_start = np.array([self.data.qpos[qi] for qi in idx])
+        self.last_stop[side] = "ran-out"
 
         tgt_mat = np.zeros(9)
         mujoco.mju_quat2Mat(tgt_mat, target_quat)
         tgt_mat = tgt_mat.reshape(3, 3)
 
         def pose_error():
-            """(pos_err, ori_err, scalar score) at the current qpos.
+            """(pos_err, ori_err, pose_score, spring_score) at the current qpos.
 
-            The score is what the progress guard minimizes, so it has to include
-            the spring energy as well as the pose error -- otherwise every step
-            that relaxes the arm toward the base pose reads as a pose regression
-            and gets reverted.
+            Pose and springs are kept APART and compared lexicographically by
+            the progress guard below: getting nearer the target comes first,
+            relaxing toward the rest pose only breaks ties. Added together (as
+            they were) the spring term vetoes real progress -- any step that
+            reaches toward the target while stretching a spring scores worse
+            and is reverted, and with one solver call per control tick that
+            means the arm does not move at all. Measured live: the score guard
+            fired on every frozen sample, 49 times on the left arm and 6 on
+            the right, with the target 6-28 cm away and the joints stock still.
             """
             mujoco.mj_forward(self.model, self.data)
             p = target_pos - self.data.xpos[body_id]
             o = mat_to_axis_angle(tgt_mat @ self.data.xmat[body_id].reshape(3, 3).T)
             disp = np.array([self.data.qpos[qi] for qi in idx]) - q_rest
             spring = self.spring_score_m_per_rad2 * float(np.sum(self.spring_weights * disp**2))
-            score = (
-                float(np.linalg.norm(p))
-                + self.ori_pos_tradeoff * float(np.linalg.norm(o))
-                + spring
-            )
-            return p.copy(), o, score
+            pose = (float(np.linalg.norm(p))
+                    + self.ori_pos_tradeoff * float(np.linalg.norm(o)))
+            return p.copy(), o, pose, spring
 
         for _ in range(max_iter):
-            pos_err, ori_err, score = pose_error()
+            pos_err, ori_err, score, spring_score = pose_error()
             # Converged only when the pose is reached AND the springs are satisfied.
             # Testing the pose alone would exit on the first iteration whenever the
             # hand already sits on its target -- which is the state the arm boots
@@ -456,6 +461,7 @@ class IKSolver:
                 np.linalg.norm(np.concatenate([pos_err, ori_err])) < 1e-4
                 and np.linalg.norm(spring_disp) < 1e-3
             ):
+                self.last_stop[side] = "converged"
                 break
 
             # How far out of reach the target is, 0 (tracking fine) .. 1 (hopeless).
@@ -551,17 +557,26 @@ class IKSolver:
             for k, qi in enumerate(idx):
                 self.data.qpos[qi] = np.clip(q[k] + dq[k], lo[k], hi[k])
 
-            new_pos_err, new_ori_err, new_score = pose_error()
+            new_pos_err, new_ori_err, new_score, new_spring = pose_error()
             if hold_pos:
                 if float(np.linalg.norm(new_pos_err)) > pos_n + 0.003:
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = q[k]
+                    self.last_stop[side] = "holdpos-worse"
                     break
             else:
                 # Soft no-twist: allow motion, but undo a step that makes the
                 # wrist attitude clearly worse than before.
-                if (float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0)
-                        or new_score > score):
+                # Pose first; springs only break a tie. The tolerance is what
+                # "the pose did not really change" means: a nullspace spring
+                # step moves the tip by a few tens of microns, so at 1e-6 m the
+                # arm could never relax toward its rest pose at all. 1e-4 m is
+                # a tenth of a millimetre -- far below anything visible, and
+                # still far below the progress a real reaching step makes.
+                _tol = 1e-4
+                _worse = (new_score > score + _tol
+                          or (abs(new_score - score) <= _tol and new_spring > spring_score))
+                if float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0) or _worse:
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = q[k]
                     # Best effort instead of a freeze. With wrist joints on
@@ -576,7 +591,7 @@ class IKSolver:
                     dq = np.clip(dq_p + dq_r, -self.max_step_rad, self.max_step_rad)
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = np.clip(q[k] + dq[k], lo[k], hi[k])
-                    new_pos_err, _, _ = pose_error()
+                    new_pos_err = pose_error()[0]
                     if _IK_DEBUG:
                         applied = np.array([self.data.qpos[qi] for qi in idx]) - q
                         print(f"[ikfb] {side} pos {pos_n*100:.2f}->{float(np.linalg.norm(new_pos_err))*100:.2f} cm  "
@@ -585,6 +600,8 @@ class IKSolver:
                     if float(np.linalg.norm(new_pos_err)) >= pos_n - 1e-5:
                         for k, qi in enumerate(idx):
                             self.data.qpos[qi] = q[k]
+                        self.last_stop[side] = ("twist-guard" if float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0)
+                                                else "score-guard")
                         break
 
         # Rate-limit the tick as a whole, then settle the model on the result.
