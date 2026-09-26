@@ -36,6 +36,9 @@ import os
 import numpy as np
 
 _IK_DEBUG = os.environ.get("IK_DEBUG", "") not in ("", "0")
+# One line per solve that ENDS on a guard: the numbers that say whether the
+# fallback was blocked by the weights, by the joint limits, or by geometry.
+_GUARD_DEBUG = os.environ.get("IK_GUARD_DEBUG", "") not in ("", "0")
 
 # Body / joint names in the OpenArm MuJoCo model.
 LEFT_TCP_BODY = "openarm_left_hand_tcp"
@@ -447,7 +450,7 @@ class IKSolver:
                     + self.ori_pos_tradeoff * float(np.linalg.norm(o)))
             return p.copy(), o, pose, spring
 
-        for _ in range(max_iter):
+        for _it in range(max_iter):
             pos_err, ori_err, score, spring_score = pose_error()
             # Converged only when the pose is reached AND the springs are satisfied.
             # Testing the pose alone would exit on the first iteration whenever the
@@ -563,6 +566,10 @@ class IKSolver:
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = q[k]
                     self.last_stop[side] = "holdpos-worse"
+                    if _GUARD_DEBUG:
+                        print(f"[ikguard] {side} holdpos-worse it{_it} "
+                              f"pos {pos_n * 100:.2f}->{float(np.linalg.norm(new_pos_err)) * 100:.2f}cm "
+                              f"ori {math.degrees(ori_n):.1f}deg", flush=True)
                     break
             else:
                 # Soft no-twist: allow motion, but undo a step that makes the
@@ -603,6 +610,18 @@ class IKSolver:
                             self.data.qpos[qi] = q[k]
                         self.last_stop[side] = ("twist-guard" if float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0)
                                                 else "score-guard")
+                        if _GUARD_DEBUG:
+                            # what the fallback ACTUALLY applied (the revert
+                            # above already put qpos back, so recompute it)
+                            q_after = np.clip(q + dq, lo, hi)
+                            print(f"[ikguard] {side} {self.last_stop[side]} it{_it} "
+                                  f"pos {pos_n * 100:.2f}->{float(np.linalg.norm(new_pos_err)) * 100:.2f}cm "
+                                  f"ori {math.degrees(ori_n):.1f}->{math.degrees(float(np.linalg.norm(new_ori_err))):.1f}deg "
+                                  f"dqp {np.round(np.degrees(dq_p), 2).tolist()} "
+                                  f"moved {np.round(np.degrees(q_after - q), 2).tolist()} "
+                                  f"w {np.round(weights, 3).tolist()} "
+                                  f"room_lo {np.round(np.degrees(q - lo), 1).tolist()} "
+                                  f"room_hi {np.round(np.degrees(hi - q), 1).tolist()}", flush=True)
                         break
 
         # Rate-limit the tick as a whole, then settle the model on the result.

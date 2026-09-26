@@ -361,7 +361,19 @@ class VRMocap(Teleoperator):
             # no-twist guard (see IKSolver.solve_ik best-effort step).
             model_lo, model_hi = self._limits_model[side]
             rot_active = getattr(self._source, "rotation_active", None)
-            if True:
+            # KEY DRIVERS ONLY. Everything below is the j/l turn-ordering
+            # machinery: the artificial wrist_limit_deg / shoulder_roll_limit_deg
+            # stops, the wrist-first pin and the home detent. A 6-DoF pose
+            # driver (the headset) gets the model's own ranges -- the hand is
+            # already telling both rolls where to be. This gate was `if True`,
+            # so the pins ran in VR while the startup line said they were off:
+            # the pin froze the shoulder roll at lo3 == hi3 == q3, and
+            # shoulder_roll_limit_deg (a RIGHT-arm range, not mirrored) capped
+            # the left shoulder roll at the wrong end of its travel. With the
+            # roll pinned the solver cannot serve a turn, every step is rejected
+            # and the arm freezes solid -- 631 of 633 guard hits in a logged
+            # headset session had left J3 on its stop at weight 0.003.
+            if self._roll_ordering:
                 qj = ik.joint_positions(side)
                 q3, q5 = float(qj[2]), float(qj[4])
                 d3, d5 = float(self._default_q[side][2]), float(self._default_q[side][4])
@@ -456,6 +468,10 @@ class VRMocap(Teleoperator):
                 elif sgn < 0:    # started on the L side: may not rise above default
                     ik.limits_high[side][2] = min(ik.limits_high[side][2], max(d3, q3) + eps)
                     ik.limits_high[side][4] = min(ik.limits_high[side][4], max(d5, q5) + eps)
+            else:
+                # The model's own ranges, restored every tick so no pin
+                # set before this driver took over can survive.
+                ik.limits_low[side][:], ik.limits_high[side][:] = model_lo, model_hi
             take = getattr(self._source, "take_rotation_request", None)
             req = take(side) if callable(take) else None
             if req is not None:
