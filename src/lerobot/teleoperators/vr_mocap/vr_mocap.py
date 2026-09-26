@@ -484,7 +484,13 @@ class VRMocap(Teleoperator):
         joints reported by the robot (no-op until the first feedback)."""
         a = self._actual_q.get(side)
         leash = math.radians(self.config.actual_leash_deg)
-        if a is None or leash <= 0:
+        if a is None or leash <= 0 or not self._roll_ordering:
+            # Only the key driver is clamped to the actual arm (it stops a held
+            # key winding the command 200 deg away while the table blocks the
+            # arm). With a controller this clamp is what froze the arms: when
+            # the real arm could not follow, the command could not lead it, so
+            # moving your hand did nothing -- and toggling X revived it only
+            # because that re-anchors the target next to the arm again.
             return
         q = self._ik.joint_positions(side)
         qc = np.clip(q, a - leash, a + leash)
@@ -496,7 +502,11 @@ class VRMocap(Teleoperator):
         commanded tip (see config). Only the source's stored target moves; a
         rotation gesture's tip anchor is untouched."""
         resync = getattr(self._source, "resync_target", None)
-        if not callable(resync):
+        if not callable(resync) or not self._roll_ordering:
+            # 6-DoF pose driver: the target is wherever the HAND says, full
+            # stop. Pulling it back onto the arm destroys the absolute
+            # hand-to-gripper mapping -- the markers must show what the
+            # controller commanded, and the arm's job is to chase them.
             return
         mujoco = self._ik._mujoco
         p_tip, q_tip = self._ik.get_ee_pose(side)
