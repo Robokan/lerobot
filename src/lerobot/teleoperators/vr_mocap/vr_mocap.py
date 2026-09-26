@@ -491,6 +491,9 @@ class VRMocap(Teleoperator):
                 tg += f"  ori_err_deg = {math.degrees(float(np.linalg.norm(_v))):.2f}"
             tg += f"  quat = {np.round(_qa, 4).tolist()}"
             print(f"[teleop] tick {self._tick}  right J1..J7 = {np.round(j, 1).tolist()}  tip cm = {np.round(tip, 1).tolist()}{tg}", flush=True)
+            jl = np.degrees(self._ik.joint_positions("left"))
+            tl = np.asarray(self._ik.get_ee_pose("left")[0], float) * 100
+            print(f"[teleop] tick {self._tick}  left  J1..J7 = {np.round(jl, 1).tolist()}  tip cm = {np.round(tl, 1).tolist()}", flush=True)
         self._tick += 1
         return self._joint_action()
 
