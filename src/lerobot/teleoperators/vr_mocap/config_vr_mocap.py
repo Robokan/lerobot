@@ -138,10 +138,13 @@ class VRMocapConfig(TeleoperatorConfig):
     # arm boots with the elbow straight (as the real robot does) and is never
     # commanded here. The springs bend it toward this pose as soon as commanded
     # motion brings the hand somewhere the elbow has room to fold.
-    # The elbow bend the springs pull toward. 0 spends the arm's spare freedom
-    # on staying extended, which is what a straight human arm should look like:
-    # measured on a straight-arm raise, the elbow ends at 8 deg instead of 21.
-    rest_elbow_bend_deg: float = 0.0
+    # The elbow bend the SPRINGS pull toward -- not where the arm starts (that
+    # is the robot's start_pose_deg / start_elbow_bend_deg). 90 makes the elbow
+    # want to bend as the arm is drawn back in, the way an arm does, while the
+    # arm still starts straight and still reaches straight out. That only
+    # became safe once the progress guard stopped letting the springs veto a
+    # step that reaches the target (see IKSolver.solve_ik).
+    rest_elbow_bend_deg: float = 90.0
     # The pose the IK springs pull toward, all seven joints (J1..J7, degrees),
     # left mirrored. None = elbow-only, from rest_elbow_bend_deg above.
     rest_pose_deg: list[float] | None = None

@@ -567,16 +567,17 @@ class IKSolver:
             else:
                 # Soft no-twist: allow motion, but undo a step that makes the
                 # wrist attitude clearly worse than before.
-                # Pose first; springs only break a tie. The tolerance is what
-                # "the pose did not really change" means: a nullspace spring
-                # step moves the tip by a few tens of microns, so at 1e-6 m the
-                # arm could never relax toward its rest pose at all. 1e-4 m is
-                # a tenth of a millimetre -- far below anything visible, and
-                # still far below the progress a real reaching step makes.
-                _tol = 1e-4
-                _worse = (new_score > score + _tol
-                          or (abs(new_score - score) <= _tol and new_spring > spring_score))
-                if float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0) or _worse:
+                # A step that gets NEARER the target is always kept, whatever
+                # it costs the springs -- that is the whole bug: the springs
+                # were vetoing real progress and the arm froze solid. When the
+                # step does NOT get nearer, the old combined test still
+                # applies, so the springs are free to relax the arm toward its
+                # rest pose at a small cost in pose, which is what makes the
+                # arm settle back to its twist and its elbow bend.
+                _pose_better = new_score < score
+                _combined_worse = (new_score + new_spring) > (score + spring_score)
+                if (float(np.linalg.norm(new_ori_err)) > ori_n + math.radians(2.0)
+                        or (not _pose_better and _combined_worse)):
                     for k, qi in enumerate(idx):
                         self.data.qpos[qi] = q[k]
                     # Best effort instead of a freeze. With wrist joints on
