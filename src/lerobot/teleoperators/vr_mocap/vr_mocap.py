@@ -81,7 +81,13 @@ def _with_hud(frames: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     except Exception:  # noqa: BLE001
         return frames
     prompt, status = get_hud_text()
-    if not prompt and not status:
+    try:
+        from lerobot.robots.mujoco_bi_openarm.viewer_keys import get_arm_forces
+
+        forces = get_arm_forces()
+    except Exception:  # noqa: BLE001
+        forces = {}
+    if not prompt and not status and not forces:
         return frames
     from PIL import Image, ImageDraw
 
@@ -112,6 +118,23 @@ def _with_hud(frames: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
                 draw.text((pad, yy), line, font=big, fill=(255, 255, 255, 255))
                 yy = draw.textbbox((pad, yy), line, font=big)[3] + pad // 2
             y = bottom + pad // 2
+        # Force each arm is pressing with: LEFT arm bottom-left, RIGHT arm
+        # bottom-right, so they sit on the side of the view they belong to.
+        # ~0 in free space (gravity and the arm's own motion are subtracted),
+        # rising as you push into something.
+        if forces:
+            fb = _hud_font(max(22, w // 18))
+            for side, corner in (("left", "left"), ("right", "right")):
+                val = float(forces.get(side, 0.0))
+                txt = f"{side[0].upper()}  {val:.0f} N"
+                tb = draw.textbbox((0, 0), txt, font=fb)
+                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+                x = pad if corner == "left" else w - tw - pad * 2
+                yb = h - th - pad * 3
+                # green when free, amber pushing, red when leaning on it hard
+                col = (90, 220, 120, 255) if val < 5 else (255, 200, 60, 255) if val < 30 else (255, 90, 70, 255)
+                draw.rectangle((x - pad // 2, yb - pad // 2, x + tw + pad, yb + th + pad), fill=(0, 0, 0, 160))
+                draw.text((x, yb), txt, font=fb, fill=col)
         if status:
             box = draw.textbbox((pad, y + pad // 2), status, font=small)
             rec = status.startswith("●")

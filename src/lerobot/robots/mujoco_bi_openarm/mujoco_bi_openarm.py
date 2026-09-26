@@ -125,6 +125,8 @@ class MujocoBiOpenArm(Robot):
         self._model = None
         self._data = None
         self._substeps = 1
+        self._arm_force: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self._tcp_body_id: dict[str, int] = {}
         self._viewer = None
         # Set when a viewer has been opened; used to skip the broken MuJoCo 3.9
         # aarch64 GL teardown that SIGSEGVs at interpreter exit (see disconnect).
@@ -289,6 +291,65 @@ class MujocoBiOpenArm(Robot):
     # Fixed cameras in the OpenArm scene, matching the VR headset toggles
     # (ego / right / left) plus the default free orbit view.
     _VIEWER_CAM_CYCLE = ("free", "ego_camera", "right_wrist_camera", "left_wrist_camera")
+
+    def _update_contact_force(self, mujoco, arm_targets) -> None:
+        """Estimate the force each arm is pressing with, in newtons at the gripper.
+
+        There is no force sensor, so this is what a real arm would give you:
+        how far each joint has been pushed off its commanded angle, times that
+        joint's stiffness.
+
+            tau_applied = kp * (target - q)          deflection x stiffness
+            tau_needed  = M(q) qacc + C(q,qd) + g(q) what it takes to move the
+                                                     arm through free space
+            tau_ext     = tau_applied - tau_needed   what the world is pushing
+                                                     back with
+
+        Subtracting tau_needed is the gravity/motion compensation: hold the arm
+        out in still air and the deflection is entirely the weight of the arm,
+        which must read zero. Whatever is left is external. That joint-space
+        residual is then resolved through the gripper Jacobian into a force at
+        the tip, so the number is newtons of push and not a pile of torques.
+        Low-passed because contact in a stiff sim is noisy tick to tick.
+        """
+        m, d = self._model, self._data
+        if not self._arm_ctrl:
+            return
+        from .viewer_keys import set_arm_force
+
+        # what it would take to be doing exactly this motion with no contact
+        bias = np.zeros(m.nv)
+        mujoco.mj_rne(m, d, 1, bias)          # 1 = include qacc, so this covers
+        bias += d.qfrc_passive * -1.0         # damping/friction the model applies
+        for side in ("left", "right"):
+            dofs, tau_ext = [], []
+            for motor in ARM_JOINT_NAMES:
+                key = (side, motor)
+                if key not in self._arm_ctrl or key not in arm_targets:
+                    return
+                info = self._arm_ctrl[key]
+                applied = info["kp"] * (arm_targets[key] - d.qpos[info["qadr"]])
+                applied = float(np.clip(applied, -info["frange"], info["frange"]))
+                dofs.append(info["dadr"])
+                tau_ext.append(applied - float(bias[info["dadr"]]))
+            tau_ext = np.asarray(tau_ext, float)
+            if side not in self._tcp_body_id:
+                bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"openarm_{side}_hand_tcp")
+                self._tcp_body_id[side] = int(bid)
+            body = self._tcp_body_id[side]
+            if body < 0:
+                continue
+            jacp = np.zeros((3, m.nv))
+            mujoco.mj_jacBody(m, d, jacp, None, body)
+            J = jacp[:, dofs]                  # 3 x 7, gripper tip
+            # tau = J^T F  ->  F = (J J^T + lam I)^-1 J tau
+            A = J @ J.T + (0.05 ** 2) * np.eye(3)
+            f = np.linalg.solve(A, J @ tau_ext)
+            mag = float(np.linalg.norm(f))
+            prev = self._arm_force.get(side, 0.0)
+            sm = prev + 0.25 * (mag - prev)     # ~4 tick time constant
+            self._arm_force[side] = sm
+            set_arm_force(side, sm)
 
     def _draw_target_markers(self, mujoco) -> None:
         """x (red) / y (green) / z (blue) triad at each commanded gripper pose."""
@@ -462,6 +523,8 @@ class MujocoBiOpenArm(Robot):
                         tau = self.config.finger_kp * (tgt_m - q) - self.config.finger_kd * qd
                         d.ctrl[f["aid"]] = float(np.clip(tau, -f["frange"], f["frange"]))
             mujoco.mj_step(self._model, d)
+
+        self._update_contact_force(mujoco, arm_targets)
 
         if self._viewer is not None:
             self._apply_viewer_camera_cycles()

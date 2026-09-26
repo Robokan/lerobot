@@ -142,6 +142,7 @@ def take_teleport() -> bool:
 # Commanded-pose markers (teleop -> viewer): the IK target pose per hand, drawn
 # as an x/y/z triad by the robot when the viewer syncs. m toggles them.
 _markers: dict = {"enabled": False, "targets": {}}
+_arm_force: dict = {"left": 0.0, "right": 0.0}
 
 
 def set_target_marker(side: str, pos, quat) -> None:
@@ -184,6 +185,17 @@ def draw_markers_into(scn, mujoco, np) -> int:
             scn.ngeom += 1
             added += 1
     return added
+
+
+def set_arm_force(side: str, newtons: float) -> None:
+    """Publish the contact force estimate for one arm (N)."""
+    with _lock:
+        _arm_force[side] = float(newtons)
+
+
+def get_arm_forces() -> dict:
+    with _lock:
+        return dict(_arm_force)
 
 
 def set_markers(on: bool) -> None:
