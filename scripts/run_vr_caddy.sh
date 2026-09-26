@@ -87,6 +87,11 @@ RESUME="${RESUME:-0}"                   # 1 = append to the exact REPO_ID given 
 IK_JOINT_WEIGHTS="${IK_JOINT_WEIGHTS:-}"
 IK_SPRING_WEIGHTS="${IK_SPRING_WEIGHTS:-}"
 IK_SPRING_GAIN="${IK_SPRING_GAIN:-}"
+#   REST_ELBOW_DEG    the elbow bend the springs pull toward (default 90). The
+#                     springs hold this bend even when a straight arm would
+#                     reach the target, so a straight human arm gives a bent
+#                     robot arm. 0 = the springs prefer a straight elbow.
+REST_ELBOW_DEG="${REST_ELBOW_DEG:-}"
 #   IK_LIMIT_MARGIN_DEG  how far before a joint's limit its willingness starts
 #                     fading so the next joint out takes over (default 15).
 #                     Widen it to bring the shoulder in EARLIER in a wrist turn:
@@ -184,6 +189,7 @@ TELEOP_ARGS=(
 [[ -n "${IK_JOINT_WEIGHTS}" ]]  && TELEOP_ARGS+=(--teleop.joint_weights="[${IK_JOINT_WEIGHTS}]")
 [[ -n "${IK_SPRING_WEIGHTS}" ]] && TELEOP_ARGS+=(--teleop.spring_weights="[${IK_SPRING_WEIGHTS}]")
 [[ -n "${IK_SPRING_GAIN}" ]]    && TELEOP_ARGS+=(--teleop.spring_gain="${IK_SPRING_GAIN}")
+[[ -n "${REST_ELBOW_DEG}" ]]   && TELEOP_ARGS+=(--teleop.rest_elbow_bend_deg="${REST_ELBOW_DEG}")
 [[ -n "${IK_LIMIT_MARGIN_DEG}" ]] && TELEOP_ARGS+=(--teleop.limit_margin_deg="${IK_LIMIT_MARGIN_DEG}")
 [[ -n "${IK_HANDOVER_DEG}" ]]     && TELEOP_ARGS+=(--teleop.handover_deg="[${IK_HANDOVER_DEG}]")
 [[ -n "${IK_WRIST_LIMIT_DEG}" ]]  && TELEOP_ARGS+=(--teleop.wrist_limit_deg="[${IK_WRIST_LIMIT_DEG}]")
