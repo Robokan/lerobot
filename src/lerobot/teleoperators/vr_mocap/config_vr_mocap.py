@@ -122,12 +122,12 @@ class VRMocapConfig(TeleoperatorConfig):
     # 1.0 = your hand and the gripper move the same distance. Lower it when
     # your arm is longer than the robot's ~61 cm reach, so a full sweep of
     # yours maps inside the robot's workspace. Orientation is never scaled.
-    # Measured: the robot reaches 61.9 cm from shoulder J1 to the gripper tip
-    # with the arm hanging straight; a 29 in (73.7 cm) human arm is longer, so
-    # at 1.0 raising a straight arm asked for 74.7 cm and the arm stretched out
-    # straight but 14 cm short. 61.9/73.7 = 0.84 puts a full sweep of that arm
-    # exactly on the robot's reach sphere. Set it to YOUR arm length ratio.
-    hand_scale: float = 0.84
+    # How far the gripper travels per unit of hand travel (headset only). One
+    # scalar on the whole displacement, so x, y and z scale equally.
+    # 1.4 -- verified in the headset on a 29 in arm. My arithmetic from the two
+    # arm lengths said 0.84 and was wrong in practice; do not re-derive it.
+    # HAND_SCALE on the launcher overrides.
+    hand_scale: float = 1.4
     show_markers: bool = False
     yaw_about_vertical: bool = False
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
