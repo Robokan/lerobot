@@ -149,6 +149,13 @@ def set_target_marker(side: str, pos, quat) -> None:
         _markers["targets"][side] = (np.asarray(pos, dtype=float).copy(), np.asarray(quat, dtype=float).copy())
 
 
+def set_markers(on: bool) -> None:
+    """Turn the commanded-pose markers on or off explicitly (the 'm' key
+    toggles them, but there is no keyboard in the headset)."""
+    with _lock:
+        _markers["enabled"] = bool(on)
+
+
 def toggle_markers() -> bool:
     with _lock:
         _markers["enabled"] = not _markers["enabled"]

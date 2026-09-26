@@ -221,6 +221,26 @@ class OpenXRPoseSource(PoseSource):
             self._cam_frames.update(converted)
             self._cam_seq += 1
 
+    def resync_target(self, side, pos, quat):
+        """Re-anchor the controller->arm mapping so the CURRENT controller pose
+        maps to ``(pos, quat)``.
+
+        The target here is ``ref_ee + (controller - ref_controller)``. Every
+        time the arm cannot follow -- contact, a joint limit, the command-vs-
+        actual leash -- the arm falls behind but the target does not, and the
+        gap is permanent. Once the target sits outside the arm's reach the arm
+        stops responding to the hand altogether, and only toggling tracking
+        (which recaptures the reference) revives it. VRMocap leashes the target
+        to the arm and calls this; without it that leash was a no-op here.
+        """
+        with self._lock:
+            cp = self._ctrl_pos[side].copy()
+            cq = self._ctrl_quat[side].copy()
+        self._ref_ctrl_pos[side] = cp
+        self._ref_ctrl_quat[side] = cq
+        self._ref_ee_pos[side] = np.asarray(pos, dtype=float).copy()
+        self._ref_ee_quat[side] = np.asarray(quat, dtype=float).copy()
+
     # ------------------------------------------------------------------ targets
     def get_targets(self, current_ee):
         with self._lock:

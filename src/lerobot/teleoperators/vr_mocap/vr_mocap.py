@@ -235,6 +235,10 @@ class VRMocap(Teleoperator):
         self._roll_ordering = callable(getattr(self._source, "rotation_active", None))
         logger.info("roll ordering pins %s",
                     "ON (key driver)" if self._roll_ordering else "off (6-DoF pose driver)")
+        if self.config.show_markers:
+            from lerobot.robots.mujoco_bi_openarm.viewer_keys import set_markers
+            set_markers(True)
+            logger.info("commanded-pose markers ON (x red / y green / z blue at each target)")
         self._source.reset({s: self._ik.get_ee_pose(s) for s in SIDES})
         self._source.start()
 
@@ -520,11 +524,17 @@ class VRMocap(Teleoperator):
         # the arm caught up), so nothing accumulates behind a stop.
         prev = self._prev_err.get(side, (d, a))
         st = self._stall.setdefault(side, [0, 0, False, False])
-        if self.config.stall_pos_m > 0:
+        if not self._roll_ordering:
+            # A controller is an absolute pose: cap how far the target may lead
+            # (below) but do not latch it onto the arm, which would turn the
+            # hand-to-gripper mapping into a velocity and feel like lag.
+            st[0] = st[1] = 0
+            st[2] = st[3] = False
+        elif self.config.stall_pos_m > 0:
             st[0] = st[0] + 1 if d > prev[0] + 1e-6 and d > self.config.stall_pos_m * 4 else 0
             if st[0] >= self.config.stall_ticks: st[2] = True
             if d < prev[0] - 1e-6 or d < self.config.stall_pos_m: st[2] = False
-        if self.config.stall_deg > 0:
+        if self._roll_ordering and self.config.stall_deg > 0:
             st[1] = st[1] + 1 if a > prev[1] + 1e-6 and a > math.radians(self.config.stall_deg * 4) else 0
             if st[1] >= self.config.stall_ticks: st[3] = True
             if a < prev[1] - 1e-6 or a < math.radians(self.config.stall_deg): st[3] = False

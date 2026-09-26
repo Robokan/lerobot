@@ -116,6 +116,9 @@ class VRMocapConfig(TeleoperatorConfig):
     # hanging. With the elbow bent the gripper-axis turn under the shoulder-
     # first pins is the case that does not yet return (measured: 37 deg short
     # of the target, J6 on its limit); the vertical turn only avoids it.
+    # draw the commanded gripper pose (x/y/z triad) in the MuJoCo viewer from
+    # the start -- the 'm' key does the same, but there is no keyboard in VR
+    show_markers: bool = False
     yaw_about_vertical: bool = False
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
     # Unused by the sequential rule; kept so older command lines still parse.
