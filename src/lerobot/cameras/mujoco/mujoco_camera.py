@@ -152,6 +152,16 @@ class MujocoCamera(Camera):
         if not self._connected or self._renderer is None:
             raise RuntimeError(f"{self} is not connected.")
         self._renderer.update_scene(self._data, camera=self._camera_id)
+        # Commanded-pose markers, if enabled. The desktop viewer draws these
+        # into its own user_scn, which never reaches a camera render -- and the
+        # camera renders are what the headset shows.
+        try:
+            from lerobot.robots.mujoco_bi_openarm.viewer_keys import draw_markers_into
+            import mujoco as _mj
+
+            draw_markers_into(self._renderer.scene, _mj, np)
+        except Exception:  # noqa: BLE001
+            pass
         frame = self._renderer.render()
         # mujoco.Renderer already returns a contiguous uint8 RGB array; copy so
         # downstream async writers don't alias the renderer's internal buffer.

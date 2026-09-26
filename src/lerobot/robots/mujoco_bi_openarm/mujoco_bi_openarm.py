@@ -292,27 +292,11 @@ class MujocoBiOpenArm(Robot):
 
     def _draw_target_markers(self, mujoco) -> None:
         """x (red) / y (green) / z (blue) triad at each commanded gripper pose."""
-        from .viewer_keys import get_markers
+        from .viewer_keys import draw_markers_into
 
-        enabled, targets = get_markers()
         scn = self._viewer.user_scn
         scn.ngeom = 0
-        if not enabled:
-            return
-        for side, (pos, quat) in targets.items():
-            R = np.zeros(9); mujoco.mju_quat2Mat(R, quat); R = R.reshape(3, 3)
-            for axis, rgba in ((0, (0.95, 0.2, 0.15, 0.95)), (1, (0.2, 0.85, 0.2, 0.95)), (2, (0.2, 0.4, 0.95, 0.95))):
-                if scn.ngeom >= scn.maxgeom:
-                    return
-                g = scn.geoms[scn.ngeom]
-                mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3), np.eye(3).flatten(), np.array(rgba))
-                mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, 0.003, pos, pos + 0.05 * R[:, axis])
-                scn.ngeom += 1
-            if scn.ngeom < scn.maxgeom:
-                g = scn.geoms[scn.ngeom]
-                mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_SPHERE, np.full(3, 0.008), np.asarray(pos, dtype=float),
-                                    np.eye(3).flatten(), np.array([1.0, 1.0, 1.0, 0.9]))
-                scn.ngeom += 1
+        draw_markers_into(scn, mujoco, np)
 
     def _apply_viewer_camera_cycles(self) -> None:
         """Honor pending `c` key presses: cycle the passive viewer camera."""
