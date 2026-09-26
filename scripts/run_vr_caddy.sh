@@ -130,6 +130,8 @@ ARM_KD="${ARM_KD:-}"
 ARM_ARMATURE="${ARM_ARMATURE:-}"        # reflected motor inertia per joint, 7 values (sim only)
 COLLISIONS="${COLLISIONS:-1}"           # 0 = no contacts at all (table, bars, self) -- for isolating IK feel from contact
 TABLE="${TABLE:-1}"                     # 0 = arm passes through the TABLE only; bars/gripper contacts still work
+HAND_SCALE="${HAND_SCALE:-}"            # headset: gripper travel per unit of HAND travel. The robot reaches
+                                        # ~61 cm from its shoulder; if your arm is longer use < 1 (try 0.85).
 MARKERS="${MARKERS:-auto}"              # auto = on for the headset (no m key there), off for keyboard; 1/0 to force
 CAMERAS="${CAMERAS:-1}"                 # 0 = no robot cameras (no MuJoCo offscreen GL contexts)
 SPEAK="${SPEAK:-0}"                     # 1 = say each prompt aloud (spd-say); off by default, the prompt is on screen in the headset
@@ -202,6 +204,7 @@ TELEOP_ARGS=(
 [[ "${YAW_AXIS}" == "vertical" ]]  && TELEOP_ARGS+=(--teleop.yaw_about_vertical=true)
 [[ -n "${TARGET_LEASH_M}" ]]      && TELEOP_ARGS+=(--teleop.target_leash_m="${TARGET_LEASH_M}")
 [[ "${MARKERS}" == "1" || ( "${MARKERS}" == "auto" && "${DRIVER}" == "openxr" ) ]] && TELEOP_ARGS+=(--teleop.show_markers=true)
+[[ -n "${HAND_SCALE}" ]]          && TELEOP_ARGS+=(--teleop.hand_scale="${HAND_SCALE}")
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"

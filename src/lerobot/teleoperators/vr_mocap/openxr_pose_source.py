@@ -141,6 +141,7 @@ class OpenXRPoseSource(PoseSource):
         self._ctrl_valid = {s: False for s in SIDES}
         self._trigger = {s: 0.0 for s in SIDES}
         self._tracking = False
+        self.hand_scale = 1.0     # set by VRMocap from config.hand_scale
         self._activation_id = 0  # increments on each rising edge of tracking
 
         # Per-hand delta-teleop references (captured in get_targets).
@@ -276,7 +277,13 @@ class OpenXRPoseSource(PoseSource):
                 self._ref_ee_pos[side] = np.asarray(ee_pos).copy()
                 self._ref_ee_quat[side] = np.asarray(ee_quat).copy()
 
-            delta_pos = ctrl_pos[side] - self._ref_ctrl_pos[side]
+            # Your arm and the robot's are not the same length (the robot
+            # reaches ~61 cm from its shoulder). The reference captured on X
+            # takes care of where the two shoulders are; hand_scale takes care
+            # of how far a given hand movement should carry the gripper. Below
+            # 1 the gripper moves less than your hand, so a full sweep of your
+            # arm maps inside the robot's reach instead of running past it.
+            delta_pos = (ctrl_pos[side] - self._ref_ctrl_pos[side]) * self.hand_scale
             target_pos = self._ref_ee_pos[side] + delta_pos
             delta_quat = quat_mul(ctrl_quat[side], quat_inv(self._ref_ctrl_quat[side]))
             target_quat = quat_mul(delta_quat, self._ref_ee_quat[side])

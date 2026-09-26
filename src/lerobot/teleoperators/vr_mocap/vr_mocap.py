@@ -226,6 +226,11 @@ class VRMocap(Teleoperator):
             self._source.chain_rotation = bool(self.config.chain_rotation)
         if hasattr(self._source, "rotate_about_tip"):
             self._source.rotate_about_tip = bool(self.config.rotate_about_tip)
+        if hasattr(self._source, "hand_scale"):
+            self._source.hand_scale = float(self.config.hand_scale)
+            if abs(self.config.hand_scale - 1.0) > 1e-9:
+                logger.info("hand scale %.2f (the gripper moves %.0f%% as far as your hand)",
+                            self.config.hand_scale, 100.0 * self.config.hand_scale)
         if hasattr(self._source, "yaw_about_vertical"):
             self._source.yaw_about_vertical = bool(self.config.yaw_about_vertical)
         # The roll ordering (shoulder/wrist hand-over, the home detent) is a KEY
