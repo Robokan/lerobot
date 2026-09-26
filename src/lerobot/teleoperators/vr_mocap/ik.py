@@ -454,6 +454,20 @@ class IKSolver:
                 )
             )
 
+            # How far the pose ACTUALLY is from the target. The progress
+            # guards below must compare against this, not against the clamped
+            # step: the clamp is only there to keep one correction inside the
+            # range where the Jacobian linearization holds. Comparing a true
+            # error against a clamped one made every step toward a target more
+            # than max_pos_err_m away look like a regression, so the solver
+            # reverted and gave up on the first iteration. Measured: a target
+            # reachable by rotating the shoulder 90 deg left the arm completely
+            # still, 87 cm short. That is the "locks up" -- and why it bit in
+            # the headset (a hand moves far in one tick) and not on the
+            # keyboard (a key moves the target 0.09 cm and 1.3 deg a tick).
+            pos_true = float(np.linalg.norm(pos_err))
+            ori_true = float(np.linalg.norm(ori_err))
+
             # Keep each correction inside the range where the Jacobian
             # linearization still holds. A big raw error makes the step invalid,
             # not merely large, which is what produced the lurching.
@@ -480,8 +494,8 @@ class IKSolver:
             # (pure wrist keys after the pose source rewrote the tip on a sphere
             # about the hand), put orientation in null(Jp) so we don't shove XYZ
             # to chase a twist.
-            pos_n = float(np.linalg.norm(pos_err))
-            ori_n = float(np.linalg.norm(ori_err))
+            pos_n = pos_true          # progress is judged on the TRUE error
+            ori_n = ori_true
             hold_pos = pos_n < 0.008 and ori_n > 1e-4
             if _IK_DEBUG:
                 print(f"[ik] {side} pos_cm {pos_n * 100:.3f} ori_deg {math.degrees(ori_n):.3f} hold {int(hold_pos)}", flush=True)
