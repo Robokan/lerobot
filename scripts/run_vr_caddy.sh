@@ -124,9 +124,21 @@ DLS_LAMBDA="${DLS_LAMBDA:-}"            # solver: damping (raise near singularit
 STALL="${STALL:-1}"                     # 0 = no stall rule (pure accumulating target; tests)
 TARGET_LEASH_DEG="${TARGET_LEASH_DEG:-}"   # how far the pose target may lead the commanded tip
 TARGET_LEASH_M="${TARGET_LEASH_M:-}"
-START_POSE="${START_POSE:-}"            # where both arms START, 7 joint angles J1..J7 in degrees,
-                                        # comma separated, e.g. "0,20,0,60,0,0,0". Left arm mirrored.
-                                        # Also the pose h returns to. Overrides ELBOW_DEG.
+ELBOW_HEIGHT="${ELBOW_HEIGHT:-35}"      # how far the ELBOWS sit out from the body at the start
+                                        # pose, in degrees. Rolls the upper arm in by this much
+                                        # (J3 -H) and the forearm straight back out by the same
+                                        # amount (J5 +H), so the hand keeps its attitude and only
+                                        # the elbow swings: 0 = elbows tucked down at the sides,
+                                        # larger = elbows further out and up. The one number worth
+                                        # reaching for; START_POSE below is the long form.
+_EH_NEG="$(awk -v v="${ELBOW_HEIGHT}" 'BEGIN{printf "%g", -v}')"   # float- and sign-safe
+START_POSE="${START_POSE:-0,0,${_EH_NEG},0,${ELBOW_HEIGHT},0,0}"   # where both arms START, 7 joint
+                                        # angles J1..J7 in degrees, comma separated. Left arm
+                                        # mirrored. Also the pose h returns to, and (via REST_POSE)
+                                        # the one the springs pull toward. Overrides ELBOW_DEG.
+                                        # Set this to place joints ELBOW_HEIGHT cannot reach; it
+                                        # wins outright, and then ELBOW_HEIGHT does nothing.
+                                        # START_POSE= (empty) for the bare hanging pose.
 REST_POSE="${REST_POSE:-}"              # the pose the IK springs pull toward, same 7-value form.
                                         # Defaults to START_POSE when that is set.
 ELBOW_DEG="${ELBOW_DEG:-}"              # starting elbow bend (deg). The launch pose is also the h pose and the springs' rest.
@@ -183,8 +195,16 @@ ROBOT_ARGS=(
 [[ "${COLLISIONS}" == "0" ]] && ROBOT_ARGS+=(--robot.disable_collisions=true)
 [[ "${TABLE}" == "0" ]] && ROBOT_ARGS+=(--robot.table_collisions=false)
 [[ -n "${START_POSE}" ]] && ROBOT_ARGS+=(--robot.start_pose_deg="[${START_POSE}]")
-[[ -z "${REST_POSE}" && -n "${START_POSE}" ]] && REST_POSE="${START_POSE}"
-[[ -n "${REST_POSE}" ]] && TELEOP_ARGS+=(--teleop.rest_pose_deg="[${REST_POSE}]")
+# REST_POSE defaults to START_POSE -- but with the ELBOW kept bent. The arms
+# start straight (J4 0) and the springs are what make the elbow WANT to bend,
+# so copying START_POSE verbatim would throw that away and leave the springs
+# pulling the elbow back into its singularity. Everything else (the shoulder
+# twist) is taken from START_POSE so the arm springs back to where it began.
+if [[ -z "${REST_POSE}" && -n "${START_POSE}" ]]; then
+  IFS=, read -r -a _SP <<< "${START_POSE}"
+  _SP[3]="${REST_ELBOW_DEG:-90}"
+  REST_POSE="$(IFS=,; echo "${_SP[*]}")"
+fi
 [[ -n "${ELBOW_DEG}" ]] && ROBOT_ARGS+=(--robot.start_elbow_bend_deg="${ELBOW_DEG}")
 [[ -n "${ARM_KP}" ]] && ROBOT_ARGS+=(--robot.arm_kp="[${ARM_KP}]")
 [[ -n "${ARM_KD}" ]] && ROBOT_ARGS+=(--robot.arm_kd="[${ARM_KD}]")
@@ -213,6 +233,9 @@ TELEOP_ARGS=(
 [[ -n "${TARGET_LEASH_M}" ]]      && TELEOP_ARGS+=(--teleop.target_leash_m="${TARGET_LEASH_M}")
 [[ "${MARKERS}" == "1" || ( "${MARKERS}" == "auto" && "${DRIVER}" == "openxr" ) ]] && TELEOP_ARGS+=(--teleop.show_markers=true)
 [[ -n "${HAND_SCALE}" ]]          && TELEOP_ARGS+=(--teleop.hand_scale="${HAND_SCALE}")
+# Must stay BELOW the TELEOP_ARGS=() assignment above: appended before it, the
+# array assignment wiped it and REST_POSE silently did nothing at all.
+[[ -n "${REST_POSE}" ]]           && TELEOP_ARGS+=(--teleop.rest_pose_deg="[${REST_POSE}]")
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_caddy] RECORD -> ${REPO_ID}  episodes=${NUM_EPISODES}  stacks=${STACKS}  seed=${SEED}  fps=${FPS}  driver=${DRIVER}"

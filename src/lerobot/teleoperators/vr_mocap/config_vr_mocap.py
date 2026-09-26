@@ -118,16 +118,16 @@ class VRMocapConfig(TeleoperatorConfig):
     # of the target, J6 on its limit); the vertical turn only avoids it.
     # draw the commanded gripper pose (x/y/z triad) in the MuJoCo viewer from
     # the start -- the 'm' key does the same, but there is no keyboard in VR
-    # How far the gripper travels per unit of hand travel (headset only).
-    # 1.0 = your hand and the gripper move the same distance. Lower it when
-    # your arm is longer than the robot's ~61 cm reach, so a full sweep of
-    # yours maps inside the robot's workspace. Orientation is never scaled.
     # How far the gripper travels per unit of hand travel (headset only). One
     # scalar on the whole displacement, so x, y and z scale equally.
-    # 1.4 -- verified in the headset on a 29 in arm. My arithmetic from the two
-    # arm lengths said 0.84 and was wrong in practice; do not re-derive it.
-    # HAND_SCALE on the launcher overrides.
-    hand_scale: float = 1.4
+    # 1.0 -- hand and gripper move the same distance. Chosen in the headset on
+    # a 29 in arm, with the default START_POSE and the roll pins off. It
+    # replaces the 1.4 that felt right BEFORE those two landed -- back then the
+    # shoulder roll was pinned and the arm could not reach the way it does now.
+    # Both numbers came from flying the thing, not from the arm lengths --
+    # my arithmetic there said 0.84 and was wrong in practice, so do not
+    # re-derive this. HAND_SCALE on the launcher overrides.
+    hand_scale: float = 1.0
     show_markers: bool = False
     yaw_about_vertical: bool = False
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen
