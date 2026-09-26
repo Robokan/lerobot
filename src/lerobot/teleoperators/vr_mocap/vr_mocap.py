@@ -216,6 +216,8 @@ class VRMocap(Teleoperator):
             handover_deg=self.config.handover_deg,
             homing_boost=self.config.homing_boost,
             rest_elbow_bend_rad=math.radians(self.config.rest_elbow_bend_deg),
+            rest_pose_rad=(None if self.config.rest_pose_deg is None
+                           else [math.radians(v) for v in self.config.rest_pose_deg]),
         )
 
         # the DEFAULT pose for the rotation keys: where the arm is at launch

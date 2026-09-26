@@ -71,6 +71,12 @@ class MujocoBiOpenArmConfig(RobotConfig):
     # springs are what bend it (see VRMocapConfig.rest_elbow_bend_deg); starting
     # bent here would hide whether that actually works.
     start_elbow_bend_deg: float = 0.0
+    # Where both arms START, all seven joints (J1..J7, degrees). The left arm
+    # is mirrored so the same numbers mean the same posture on both. This is
+    # also the pose 'h' teleports back to, and the one the VR reference is
+    # captured against. None = the old behaviour (zeros, elbow from
+    # start_elbow_bend_deg).
+    start_pose_deg: list[float] | None = None
 
     # Open an interactive on-screen MuJoCo viewer (mujoco.viewer.launch_passive)
     # so the sim can be watched while teleoperating. Off by default: recording

@@ -142,6 +142,9 @@ class VRMocapConfig(TeleoperatorConfig):
     # on staying extended, which is what a straight human arm should look like:
     # measured on a straight-arm raise, the elbow ends at 8 deg instead of 21.
     rest_elbow_bend_deg: float = 0.0
+    # The pose the IK springs pull toward, all seven joints (J1..J7, degrees),
+    # left mirrored. None = elbow-only, from rest_elbow_bend_deg above.
+    rest_pose_deg: list[float] | None = None
 
 
     # Pose driver: "scripted" (headless deterministic motion, default),

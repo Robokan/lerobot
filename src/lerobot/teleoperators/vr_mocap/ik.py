@@ -292,6 +292,7 @@ class IKSolver:
         handover_deg=DEFAULT_HANDOVER_DEG,
         homing_scale_rad: float = DEFAULT_HOMING_SCALE_RAD,
         rest_elbow_bend_rad: float = DEFAULT_REST_ELBOW_BEND_RAD,
+        rest_pose_rad=None,
         ori_pos_tradeoff: float = _ORI_TO_POS_M_PER_RAD,
         max_delta_per_call_rad: float = DEFAULT_MAX_DELTA_PER_CALL_RAD,
     ):
@@ -328,6 +329,8 @@ class IKSolver:
         self.ori_pos_tradeoff = float(ori_pos_tradeoff)
         self.max_delta_per_call_rad = float(max_delta_per_call_rad)
         self.rest_elbow_bend_rad = float(rest_elbow_bend_rad)
+        # full 7-joint rest pose for the springs; None = elbow-only, as before
+        self.rest_pose_rad = None if rest_pose_rad is None else np.asarray(rest_pose_rad, dtype=float)
 
         self.left_tcp_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, LEFT_TCP_BODY)
         self.right_tcp_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, RIGHT_TCP_BODY)
@@ -362,8 +365,20 @@ class IKSolver:
         self.ori_joint_mask: dict[str, np.ndarray | None] = {}
         self._rest_q: dict[str, np.ndarray] = {}
         for side in self.joint_ids:
-            r = np.zeros(7)
-            r[_ELBOW_IDX] = self.rest_elbow_bend_rad
+            if self.rest_pose_rad is not None:
+                # mirror the left arm only where the model's ranges are mirrored
+                # (see apply_base_pose): the elbow is 0..140 on both arms.
+                r = np.asarray(self.rest_pose_rad, dtype=float).copy()
+                if side == "left":
+                    lo_l, hi_l = self.limits_low["left"], self.limits_high["left"]
+                    lo_r, hi_r = self.limits_low["right"], self.limits_high["right"]
+                    for k in range(7):
+                        if abs(lo_l[k] + hi_r[k]) < 1e-6 and abs(hi_l[k] + lo_r[k]) < 1e-6 \
+                                and abs(lo_r[k] + hi_r[k]) > 1e-6:
+                            r[k] = -r[k]
+            else:
+                r = np.zeros(7)
+                r[_ELBOW_IDX] = self.rest_elbow_bend_rad
             self._rest_q[side] = np.clip(r, self.limits_low[side], self.limits_high[side])
         self.finger_qpos_idx = {
             "left": [

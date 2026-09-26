@@ -124,6 +124,11 @@ DLS_LAMBDA="${DLS_LAMBDA:-}"            # solver: damping (raise near singularit
 STALL="${STALL:-1}"                     # 0 = no stall rule (pure accumulating target; tests)
 TARGET_LEASH_DEG="${TARGET_LEASH_DEG:-}"   # how far the pose target may lead the commanded tip
 TARGET_LEASH_M="${TARGET_LEASH_M:-}"
+START_POSE="${START_POSE:-}"            # where both arms START, 7 joint angles J1..J7 in degrees,
+                                        # comma separated, e.g. "0,20,0,60,0,0,0". Left arm mirrored.
+                                        # Also the pose h returns to. Overrides ELBOW_DEG.
+REST_POSE="${REST_POSE:-}"              # the pose the IK springs pull toward, same 7-value form.
+                                        # Defaults to START_POSE when that is set.
 ELBOW_DEG="${ELBOW_DEG:-}"              # starting elbow bend (deg). The launch pose is also the h pose and the springs' rest.
 ARM_KP="${ARM_KP:-}"                    # sim PD gains, 7 values J1..J7 (see config_mujoco_bi_openarm.py)
 ARM_KD="${ARM_KD:-}"
@@ -177,6 +182,9 @@ ROBOT_ARGS=(
 [[ "${FAST}" == "1" || "${CAMERAS}" == "0" ]] && ROBOT_ARGS+=(--robot.cameras={})
 [[ "${COLLISIONS}" == "0" ]] && ROBOT_ARGS+=(--robot.disable_collisions=true)
 [[ "${TABLE}" == "0" ]] && ROBOT_ARGS+=(--robot.table_collisions=false)
+[[ -n "${START_POSE}" ]] && ROBOT_ARGS+=(--robot.start_pose_deg="[${START_POSE}]")
+[[ -z "${REST_POSE}" && -n "${START_POSE}" ]] && REST_POSE="${START_POSE}"
+[[ -n "${REST_POSE}" ]] && TELEOP_ARGS+=(--teleop.rest_pose_deg="[${REST_POSE}]")
 [[ -n "${ELBOW_DEG}" ]] && ROBOT_ARGS+=(--robot.start_elbow_bend_deg="${ELBOW_DEG}")
 [[ -n "${ARM_KP}" ]] && ROBOT_ARGS+=(--robot.arm_kp="[${ARM_KP}]")
 [[ -n "${ARM_KD}" ]] && ROBOT_ARGS+=(--robot.arm_kd="[${ARM_KD}]")

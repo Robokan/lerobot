@@ -85,12 +85,41 @@ GRIPPER_OPEN_DEG = -165.0
 FINGER_OPEN_M = 0.044
 
 
-def apply_base_pose(mujoco, model, data, elbow_bend_deg: float = BASE_ELBOW_BEND_DEG) -> None:
-    """Put both arms in the base pose: zeros, with the elbow bent off the stop.
+def apply_base_pose(mujoco, model, data, elbow_bend_deg: float = BASE_ELBOW_BEND_DEG,
+                    pose_deg=None) -> None:
+    """Put both arms in the base pose.
+
+    ``pose_deg`` sets all seven joints (J1..J7, degrees) and wins outright. The
+    left arm is mirrored, because its joint ranges are the mirror of the right's
+    (J1 is -80..200 on the right and -200..80 on the left), so the same numbers
+    describe the same physical posture on both arms. Out-of-range values are
+    clipped to the joint's own limits. Without it only the elbow is set, as
+    before, and the rest stay at zero.
 
     Called by the sim robot and by the VR teleoperator's IK model so the two stay
     in the same configuration and neither starts at the straight-arm singularity.
     """
+    if pose_deg is not None:
+        vals = [float(v) for v in pose_deg]
+        if len(vals) != 7:
+            raise ValueError(f"pose_deg needs 7 joint angles (J1..J7), got {len(vals)}")
+        for i, v in enumerate(vals):
+            ids = {sd: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{sd}_joint{i + 1}")
+                   for sd in SIDES}
+            if any(j < 0 for j in ids.values()):
+                continue
+            # Mirror the left arm ONLY on the joints the model itself mirrors
+            # (J1 is -80..200 right and -200..80 left, so the same posture is
+            # the negated angle). The elbow runs 0..140 on both, so negating it
+            # would just clip to 0 and flatten the arm.
+            rl, ll = model.jnt_range[ids["right"]], model.jnt_range[ids["left"]]
+            mirrored = abs(ll[0] + rl[1]) < 1e-6 and abs(ll[1] + rl[0]) < 1e-6 and abs(rl[0] + rl[1]) > 1e-6
+            for sd in SIDES:
+                sign = -1.0 if (sd == "left" and mirrored) else 1.0
+                lo, hi = model.jnt_range[ids[sd]]
+                data.qpos[model.jnt_qposadr[ids[sd]]] = float(np.clip(math.radians(sign * v), lo, hi))
+        mujoco.mj_forward(model, data)
+        return
     bend = math.radians(elbow_bend_deg)
     for side in SIDES:
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint4")
@@ -235,7 +264,10 @@ class MujocoBiOpenArm(Robot):
                         self._model.dof_armature[self._model.jnt_dofadr[jid]] = float(arm)
             logger.info("arm joint armature set to %s", self.config.arm_armature)
         mujoco.mj_forward(self._model, self._data)
-        if self.config.start_elbow_bend_deg:
+        if self.config.start_pose_deg is not None:
+            apply_base_pose(mujoco, self._model, self._data, pose_deg=self.config.start_pose_deg)
+            logger.info("start pose (J1..J7, deg, left mirrored): %s", list(self.config.start_pose_deg))
+        elif self.config.start_elbow_bend_deg:
             apply_base_pose(mujoco, self._model, self._data, self.config.start_elbow_bend_deg)
 
         # Substeps so one send_action advances ~ 1/fps of sim time.
