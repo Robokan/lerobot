@@ -84,6 +84,13 @@ class MujocoBiOpenArmConfig(RobotConfig):
     # kinematic debugging that need contacts off.
     disable_collisions: bool = False
 
+    # Collide with the table (its top and legs). False leaves every OTHER
+    # contact alone -- bars, the cube, the grippers, self-collision -- so you
+    # can still pick things up while the arm passes through the table. Use it
+    # to test arm motion without the table stopping the arm and holding the
+    # command back. `disable_collisions` above kills ALL contacts instead.
+    table_collisions: bool = True
+
     # PD gains for the 7 arm joints (J1..J7), applied as torque on the model's
     # direct-drive `motor` actuators (tau = kp*(target-q) - kd*qdot, clamped to
     # the model forcerange). Mirrors the real follower's MIT-control gains.

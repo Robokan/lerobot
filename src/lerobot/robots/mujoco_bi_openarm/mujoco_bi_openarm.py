@@ -199,6 +199,32 @@ class MujocoBiOpenArm(Robot):
         if self.config.disable_collisions:
             self._model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
             logger.info("MuJoCo contacts disabled (disable_collisions=True).")
+        if not self.config.table_collisions:
+            # The ARM passes through the table; everything else still rests on
+            # it. Simply clearing the table's contact bits drops every bar on
+            # the floor (measured: 39 cm in 0.6 s), which makes the scene
+            # useless. Instead move the table to contact group 2 and add that
+            # group to the free bodies (the bars and the cube), so table<->bar
+            # still collides while table<->arm does not.
+            tables, movers = [], 0
+            for g in range(self._model.ngeom):
+                name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+                body = self._model.geom_bodyid[g]
+                if name.startswith("table"):
+                    self._model.geom_contype[g] = 2
+                    self._model.geom_conaffinity[g] = 2
+                    tables.append(name)
+                    continue
+                free = any(
+                    self._model.jnt_type[self._model.body_jntadr[body] + j] == mujoco.mjtJoint.mjJNT_FREE
+                    for j in range(self._model.body_jntnum[body])
+                )
+                if free:
+                    self._model.geom_contype[g] |= 2
+                    self._model.geom_conaffinity[g] |= 2
+                    movers += 1
+            logger.info("arm passes through the table (%d table geoms, %d free-body geoms still collide with it)",
+                        len(tables), movers)
         if self.config.arm_armature is not None:
             for side in ("left", "right"):
                 for i, arm in enumerate(self.config.arm_armature[:7]):

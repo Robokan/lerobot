@@ -124,6 +124,7 @@ ARM_KP="${ARM_KP:-}"                    # sim PD gains, 7 values J1..J7 (see con
 ARM_KD="${ARM_KD:-}"
 ARM_ARMATURE="${ARM_ARMATURE:-}"        # reflected motor inertia per joint, 7 values (sim only)
 COLLISIONS="${COLLISIONS:-1}"           # 0 = no contacts at all (table, bars, self) -- for isolating IK feel from contact
+TABLE="${TABLE:-1}"                     # 0 = arm passes through the TABLE only; bars/gripper contacts still work
 MARKERS="${MARKERS:-auto}"              # auto = on for the headset (no m key there), off for keyboard; 1/0 to force
 CAMERAS="${CAMERAS:-1}"                 # 0 = no robot cameras (no MuJoCo offscreen GL contexts)
 SPEAK="${SPEAK:-0}"                     # 1 = say each prompt aloud (spd-say); off by default, the prompt is on screen in the headset
@@ -168,6 +169,7 @@ ROBOT_ARGS=(
 [[ "${VIEWER}" == "1" ]] && ROBOT_ARGS+=(--robot.viewer=true)
 [[ "${FAST}" == "1" || "${CAMERAS}" == "0" ]] && ROBOT_ARGS+=(--robot.cameras={})
 [[ "${COLLISIONS}" == "0" ]] && ROBOT_ARGS+=(--robot.disable_collisions=true)
+[[ "${TABLE}" == "0" ]] && ROBOT_ARGS+=(--robot.table_collisions=false)
 [[ -n "${ELBOW_DEG}" ]] && ROBOT_ARGS+=(--robot.start_elbow_bend_deg="${ELBOW_DEG}")
 [[ -n "${ARM_KP}" ]] && ROBOT_ARGS+=(--robot.arm_kp="[${ARM_KP}]")
 [[ -n "${ARM_KD}" ]] && ROBOT_ARGS+=(--robot.arm_kd="[${ARM_KD}]")
