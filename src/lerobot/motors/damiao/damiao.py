@@ -678,6 +678,16 @@ class DamiaoMotorsBus(MotorsBusBase):
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
+        # Drain replies that arrived after an earlier collection window closed
+        # (the MIT batch waits only SHORT_TIMEOUT_SEC for 8 replies). Left in the
+        # queue, each would be taken below as the answer to THIS refresh, and the
+        # position read one tick stale: measured on an OpenArm at 30 Hz, readings
+        # repeated or went backwards on 15-46% of ticks, and the arm shook.
+        recv_to_motor = {self._get_motor_recv_id(m): m for m in self.motors}
+        while (pending := self.canbus.recv(timeout=0)) is not None:
+            if (late := recv_to_motor.get(pending.arbitration_id)) is not None:
+                self._process_response(late, pending)
+
         # Send refresh commands
         for motor in motors:
             motor_id = self._get_motor_id(motor)
