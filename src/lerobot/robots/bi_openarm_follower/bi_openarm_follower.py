@@ -69,6 +69,12 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             position_kd=config.left_arm_config.position_kd,
             position_kp=config.left_arm_config.position_kp,
             joint_limits=config.left_arm_config.joint_limits,
+            zero_offsets=config.left_arm_config.zero_offsets,
+            joint_limits_override=config.left_arm_config.joint_limits_override,
+            dry_run=config.left_arm_config.dry_run,
+            trace_path=config.left_arm_config.trace_path,
+            velocity_feedforward=config.left_arm_config.velocity_feedforward,
+            velocity_feedforward_max=config.left_arm_config.velocity_feedforward_max,
         )
 
         right_arm_config = OpenArmFollowerConfig(
@@ -88,6 +94,12 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             position_kd=config.right_arm_config.position_kd,
             position_kp=config.right_arm_config.position_kp,
             joint_limits=config.right_arm_config.joint_limits,
+            zero_offsets=config.right_arm_config.zero_offsets,
+            joint_limits_override=config.right_arm_config.joint_limits_override,
+            dry_run=config.right_arm_config.dry_run,
+            trace_path=config.right_arm_config.trace_path,
+            velocity_feedforward=config.right_arm_config.velocity_feedforward,
+            velocity_feedforward_max=config.right_arm_config.velocity_feedforward_max,
         )
 
         self.left_arm = OpenArmFollower(left_arm_config)

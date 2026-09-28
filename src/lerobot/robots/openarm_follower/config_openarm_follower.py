@@ -77,6 +77,33 @@ class OpenArmFollowerConfigBase:
     # Camera configurations
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
+    # Per-joint zero error of this arm, in degrees: what the motor reads when the
+    # joint is truly at 0 (arm hanging straight down). Observations report
+    # `reading - offset` and actions send `target + offset`, so joint limits,
+    # datasets and the MuJoCo model all share the true joint frame. The motors'
+    # own stored zero is never touched. Measure with scripts/openarm_shadow.py.
+    zero_offsets: dict[str, float] = field(default_factory=dict)
+
+    # Limits that replace the `side` defaults for these joints only, e.g. a wider
+    # gripper range: {"gripper": (-157.0, 5.0)}.
+    joint_limits_override: dict[str, tuple[float, float]] = field(default_factory=dict)
+
+    # Never enable or command the motors. connect() opens the bus read-only (no
+    # handshake, no calibration, no torque), get_observation() works as usual,
+    # and send_action() returns what it would have sent without transmitting it.
+    # For checking a teleop pipeline against the real arm before powering it.
+    dry_run: bool = False
+
+    # Write one CSV row per control tick (requested / sent / actual, degrees, true
+    # frame) to this file, for tuning gains and caps. None = off.
+    trace_path: str | None = None
+
+    # Send each motor the velocity its target is moving at (deg/s, from the last
+    # two commands) instead of 0, so the MIT damping smooths motion rather than
+    # braking it every tick. Capped at velocity_feedforward_max.
+    velocity_feedforward: bool = False
+    velocity_feedforward_max: float = 360.0
+
     # Motor configuration for OpenArms (7 DOF per arm)
     # Maps motor names to (send_can_id, recv_can_id, motor_type)
     # Based on: https://docs.openarm.dev/software/setup/configure-test

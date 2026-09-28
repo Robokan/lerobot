@@ -23,10 +23,10 @@ from lerobot.cameras import make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
+from lerobot.motors.damiao.tables import CAN_CMD_REFRESH, CAN_PARAM_ID
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
-from ..utils import ensure_safe_goal_position
 from .config_openarm_follower import (
     LEFT_DEFAULT_JOINTS_LIMITS,
     RIGHT_DEFAULT_JOINTS_LIMITS,
@@ -34,6 +34,22 @@ from .config_openarm_follower import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _allow_only_refresh(bus: DamiaoMotorsBus) -> None:
+    """Make the bus raise instead of sending anything but a status refresh (dry run)."""
+    send = bus.canbus.send
+
+    def guarded(msg, *args, **kwargs):
+        data = bytes(msg.data)
+        if not (msg.arbitration_id == CAN_PARAM_ID and len(data) >= 3 and data[2] == CAN_CMD_REFRESH):
+            raise RuntimeError(
+                f"dry_run: blocked CAN frame id=0x{msg.arbitration_id:X} data={data.hex()} "
+                "(only status refresh requests are allowed)"
+            )
+        return send(msg, *args, **kwargs)
+
+    bus.canbus.send = guarded
 
 
 class OpenArmFollower(Robot):
@@ -82,7 +98,14 @@ class OpenArmFollower(Robot):
             logger.info(
                 "Set config.side to either 'left' or 'right' to use pre-configured values for joint limits."
             )
+        if config.joint_limits_override:
+            config.joint_limits = {
+                **config.joint_limits,
+                **{k: tuple(v) for k, v in config.joint_limits_override.items()},
+            }
         logger.info(f"Values used for joint limits: {config.joint_limits}.")
+        if config.zero_offsets:
+            logger.info(f"Zero offsets (deg, subtracted from readings): {config.zero_offsets}.")
 
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -133,6 +156,17 @@ class OpenArmFollower(Robot):
         We assume that at connection time, the arms are in a safe rest position,
         and torque can be safely disabled to run calibration if needed.
         """
+
+        if self.config.dry_run:
+            # The handshake sends ENABLE, calibrate() can re-zero the motors and
+            # configure()/enable_torque() write to them, so none of them run.
+            logger.info(f"Connecting arm on {self.config.port} (DRY RUN: read-only, motors stay off)...")
+            self.bus.connect(handshake=False)
+            _allow_only_refresh(self.bus)
+            for cam in self.cameras.values():
+                cam.connect()
+            logger.info(f"{self} connected (dry run).")
+            return
 
         # Connect to CAN bus
         logger.info(f"Connecting arm on {self.config.port}...")
@@ -234,10 +268,14 @@ class OpenArmFollower(Robot):
         obs_dict: dict[str, Any] = {}
 
         states = self.bus.sync_read_all_states()
+        # Raw readings of this tick, reused by send_action's step cap instead of
+        # a second full CAN read (which added latency to every command).
+        self._obs_raw = {m: s.get("position", 0.0) for m, s in states.items()}
+        self._obs_raw_t = time.perf_counter()
 
         for motor in self.bus.motors:
             state = states.get(motor, {})
-            obs_dict[f"{motor}.pos"] = state.get("position", 0.0)
+            obs_dict[f"{motor}.pos"] = state.get("position", 0.0) - self.config.zero_offsets.get(motor, 0.0)
             if self.config.use_velocity_and_torque:
                 obs_dict[f"{motor}.vel"] = state.get("velocity", 0.0)
                 obs_dict[f"{motor}.torque"] = state.get("torque", 0.0)
@@ -293,12 +331,26 @@ class OpenArmFollower(Robot):
                     logger.debug(f"Clipped {motor_name} from {position:.2f}° to {clipped_position:.2f}°")
                 goal_pos[motor_name] = clipped_position
 
+        if self.config.dry_run:
+            self._report_dry_run(goal_pos)
+
+        # Limits above are in the true joint frame; the motors take raw readings.
+        offsets = self.config.zero_offsets
+        goal_pos = {m: p + offsets.get(m, 0.0) for m, p in goal_pos.items()}
+
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
-        if self.config.max_relative_target is not None:
-            present_pos = self.bus.sync_read("Present_Position")
-            goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
-            goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+        # (Not in a dry run: the arm never moves there, so the cap would clamp and
+        # warn on every tick; _report_dry_run already showed the uncapped command.)
+        requested = goal_pos
+        if self.config.max_relative_target is not None and not self.config.dry_run:
+            goal_pos = self._cap_step(goal_pos, self._present_raw())
+
+        sent = {f"{m}.pos": p - offsets.get(m, 0.0) for m, p in goal_pos.items()}
+        if self.config.trace_path:
+            self._trace(requested, goal_pos)
+        if self.config.dry_run:
+            return sent
 
         # TODO(Steven, Pepijn): Refactor writing
         # Motor name to index mapping for gains
@@ -312,6 +364,22 @@ class OpenArmFollower(Robot):
             "joint_7": 6,
             "gripper": 7,
         }
+
+        # Velocity feedforward: the MIT law is kp*(q_target - q) + kd*(v_target - v).
+        # With v_target = 0 the damping brakes against every move, so a target that
+        # steps each tick gives stop-go motion (the arm buzzed at the loop rate).
+        # Feeding the target's own velocity lets kd smooth the motion instead.
+        velocity_ff: dict[str, float] = {}
+        now = time.perf_counter()
+        prev = getattr(self, "_prev_goal_raw", None)
+        if self.config.velocity_feedforward and prev is not None:
+            dt = now - self._prev_goal_t
+            if 0.0 < dt < 0.2:  # skip after a pause: a stale previous target is no guide
+                vmax = self.config.velocity_feedforward_max
+                velocity_ff = {
+                    m: max(-vmax, min(vmax, (g - prev[m]) / dt)) for m, g in goal_pos.items() if m in prev
+                }
+        self._prev_goal_raw, self._prev_goal_t = dict(goal_pos), now
 
         # Use batch MIT control for arm (sends all commands, then collects responses)
         commands = {}
@@ -334,18 +402,80 @@ class OpenArmFollower(Robot):
                     if isinstance(self.config.position_kd, list)
                     else self.config.position_kd
                 )
-            commands[motor_name] = (kp, kd, position_degrees, 0.0, 0.0)
+            commands[motor_name] = (kp, kd, position_degrees, velocity_ff.get(motor_name, 0.0), 0.0)
 
         self.bus._mit_control_batch(commands)
 
-        return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+        return sent
+
+    def _present_raw(self) -> dict[str, float]:
+        """Raw motor positions: this tick's observation if fresh, else a new read."""
+        if getattr(self, "_obs_raw", None) is not None and time.perf_counter() - self._obs_raw_t < 0.05:
+            return self._obs_raw
+        return self.bus.sync_read("Present_Position")
+
+    def _cap_step(self, goal_raw: dict[str, float], present_raw: dict[str, float]) -> dict[str, float]:
+        """max_relative_target per motor (deg per tick). Logs one summary a second, not every tick."""
+        cap = self.config.max_relative_target
+        if isinstance(cap, dict) and set(goal_raw) - set(cap):
+            raise ValueError(f"max_relative_target has no cap for {sorted(set(goal_raw) - set(cap))}")
+        out, hit = {}, {}
+        for m, g in goal_raw.items():
+            c = float(cap[m] if isinstance(cap, dict) else cap)
+            p = present_raw[m]
+            out[m] = min(max(g, p - c), p + c)
+            if abs(out[m] - g) > 1e-4:
+                hit[m] = g - out[m]
+        self._cap_hits = getattr(self, "_cap_hits", 0) + (1 if hit else 0)
+        now = time.perf_counter()
+        if hit and now - getattr(self, "_cap_log_t", 0.0) >= 1.0:
+            self._cap_log_t = now
+            cells = " ".join(f"{m.replace('joint_', 'j')}{d:+.0f}" for m, d in hit.items())
+            logger.warning(
+                f"[{self.id}] step cap active on {self._cap_hits} ticks this second; "
+                f"command beyond cap (deg): {cells}"
+            )
+            self._cap_hits = 0
+        return out
+
+    def _trace(self, requested_raw: dict[str, float], sent_raw: dict[str, float]) -> None:
+        """One CSV row per tick, true frame: requested, sent (after the cap), actual."""
+        offsets = self.config.zero_offsets
+        if getattr(self, "_trace_fh", None) is None:
+            self._trace_fh = open(self.config.trace_path, "w")  # noqa: SIM115 - held open across ticks, closed in disconnect()
+            motors = list(self.bus.motors)
+            self._trace_fh.write(
+                ",".join(["t"] + [f"{k}_{m}" for k in ("req", "sent", "act") for m in motors]) + "\n"
+            )
+            self._trace_t0 = time.perf_counter()
+        actual = {m: s["position"] for m, s in self.bus._last_known_states.items()}
+        row = [f"{time.perf_counter() - self._trace_t0:.4f}"]
+        for src in (requested_raw, sent_raw, actual):
+            row += [f"{src[m] - offsets.get(m, 0.0):.3f}" if m in src else "" for m in self.bus.motors]
+        self._trace_fh.write(",".join(row) + "\n")
+
+    def _report_dry_run(self, goal_true: dict[str, float]) -> None:
+        """Once a second, log how far the requested command is from the arm (true frame)."""
+        now = time.perf_counter()
+        if now - getattr(self, "_dry_report_t", 0.0) < 1.0:
+            return
+        self._dry_report_t = now
+        offsets = self.config.zero_offsets
+        actual = {m: s["position"] - offsets.get(m, 0.0) for m, s in self.bus._last_known_states.items()}
+        diff = {m: goal_true[m] - actual[m] for m in goal_true if m in actual}
+        worst = max(diff, key=lambda m: abs(diff[m]))
+        cells = " ".join(f"{m.replace('joint_', 'j')}{d:+6.1f}" for m, d in diff.items())
+        logger.info(f"[dry run {self.id}] command - actual (deg): {cells} | max {worst} {diff[worst]:+.1f}")
 
     @check_if_not_connected
     def disconnect(self):
         """Disconnect from robot."""
 
         # Disconnect CAN bus
-        self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        self.bus.disconnect(self.config.disable_torque_on_disconnect and not self.config.dry_run)
+        if getattr(self, "_trace_fh", None) is not None:
+            self._trace_fh.close()
+            self._trace_fh = None
 
         # Disconnect cameras
         for cam in self.cameras.values():
