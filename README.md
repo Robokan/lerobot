@@ -105,6 +105,35 @@ by-path mapping above. Finding a plug-and-play camera identity (cameras with
 real serials, flashed UVC serials, or a startup fingerprint) is an open TODO
 tracked in both scripts.
 
+### 3. Data capture and pi0.5 training
+
+Environment: `uv sync --extra pi --extra openarms` (creates `.venv` with the
+pi0/pi0.5 and Damiao-CAN dependencies from `uv.lock`).
+
+Rig roles on this machine: **UMPA is the leader** (moved by hand, torque off),
+**LUMPA is the follower** (mirrors the leader and gets recorded).
+
+Record teleop episodes (resolves CAN + cameras via the scripts above, records
+the LUMPA follower driven by the UMPA leader with ego/left_wrist/right_wrist
+cameras; first connect per arm runs interactive calibration once):
+
+```bash
+sudo bash scripts/bring_up_can.sh    # after every reboot
+REPO_ID=eric/openarm_pick_cube TASK="Pick up the cube and place it in the bin" \
+    bash scripts/record_openarm.sh
+```
+
+Finetune pi0.5 on the recorded dataset (defaults sized for a 24 GB RTX 4090:
+frozen VLM / action-expert-only, bfloat16, gradient checkpointing):
+
+```bash
+REPO_ID=eric/openarm_pick_cube bash scripts/train_pi05_openarm.sh
+```
+
+Both scripts take env-var overrides for episode count, batch size, steps,
+etc. — see the headers of `scripts/record_openarm.sh` and
+`scripts/train_pi05_openarm.sh`.
+
 ## Quick Start
 
 LeRobot can be installed directly from PyPI.
