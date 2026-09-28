@@ -159,7 +159,9 @@ cd "$(dirname "$0")/.."
 # for THIS process only (no change to your system config).
 if [[ "${DRIVER}" == "openxr" ]]; then
   if [[ -z "${XR_RUNTIME_JSON:-}" && ! -f "$HOME/.config/openxr/1/active_runtime.json" ]]; then
-    XR_RUNTIME_JSON="$(ls /var/lib/flatpak/app/io.github.wivrn.wivrn/*/*/*/files/share/openxr/1/openxr_wivrn.json 2>/dev/null | head -1 || true)"
+    # System-wide (flatpak install) or per-user (flatpak install --user) flatpak.
+    XR_RUNTIME_JSON="$(ls /var/lib/flatpak/app/io.github.wivrn.wivrn/*/*/active/files/share/openxr/1/openxr_wivrn.json \
+      "$HOME"/.local/share/flatpak/app/io.github.wivrn.wivrn/*/*/active/files/share/openxr/1/openxr_wivrn.json 2>/dev/null | head -1 || true)"
     if [[ -z "${XR_RUNTIME_JSON}" ]]; then
       echo "ERROR: WiVRn runtime manifest not found — is the flatpak installed? (flatpak install flathub io.github.wivrn.wivrn)" >&2
       exit 1
