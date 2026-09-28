@@ -705,10 +705,19 @@ class DamiaoMotorsBus(MotorsBusBase):
         for motor in motors:
             recv_id = self._get_motor_recv_id(motor)
             msg = responses.get(recv_id)
+            # Consecutive refreshes without a reply, per motor: a silent motor
+            # (e.g. a loose plug) otherwise reads as frozen at its last position.
+            missed = self.__dict__.setdefault("missed_replies", {})
             if msg:
                 self._process_response(motor, msg)
+                missed[motor] = 0
             else:
-                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+                missed[motor] = missed.get(motor, 0) + 1
+                if missed[motor] == 1 or missed[motor] % 30 == 0:
+                    logger.warning(
+                        f"Packet drop: {motor} (ID: 0x{recv_id:02X}), {missed[motor]} in a row. "
+                        "Using last known state."
+                    )
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:

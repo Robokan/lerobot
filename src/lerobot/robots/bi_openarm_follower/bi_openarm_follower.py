@@ -75,6 +75,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             trace_path=config.left_arm_config.trace_path,
             velocity_feedforward=config.left_arm_config.velocity_feedforward,
             velocity_feedforward_max=config.left_arm_config.velocity_feedforward_max,
+            max_missed_replies=config.left_arm_config.max_missed_replies,
         )
 
         right_arm_config = OpenArmFollowerConfig(
@@ -100,6 +101,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             trace_path=config.right_arm_config.trace_path,
             velocity_feedforward=config.right_arm_config.velocity_feedforward,
             velocity_feedforward_max=config.right_arm_config.velocity_feedforward_max,
+            max_missed_replies=config.right_arm_config.max_missed_replies,
         )
 
         self.left_arm = OpenArmFollower(left_arm_config)

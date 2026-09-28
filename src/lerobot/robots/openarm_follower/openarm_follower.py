@@ -268,6 +268,14 @@ class OpenArmFollower(Robot):
         obs_dict: dict[str, Any] = {}
 
         states = self.bus.sync_read_all_states()
+        limit = self.config.max_missed_replies
+        if limit and not self.config.dry_run:
+            silent = {m: n for m, n in getattr(self.bus, "missed_replies", {}).items() if n >= limit}
+            if silent:
+                raise ConnectionError(
+                    f"{self}: {', '.join(silent)} stopped answering ({max(silent.values())} reads in a row). "
+                    "Stopping so the arm is not driven from a frozen reading -- check that motor's cable."
+                )
         # Raw readings of this tick, reused by send_action's step cap instead of
         # a second full CAN read (which added latency to every command).
         self._obs_raw = {m: s.get("position", 0.0) for m, s in states.items()}

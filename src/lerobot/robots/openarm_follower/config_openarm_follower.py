@@ -104,6 +104,12 @@ class OpenArmFollowerConfigBase:
     velocity_feedforward: bool = False
     velocity_feedforward_max: float = 360.0
 
+    # Stop (raise, so the caller disconnects and disables torque) when a motor has
+    # not answered this many reads in a row: its position would otherwise freeze
+    # at the last reply and the arm be commanded from a stale reading. 15 reads is
+    # half a second at 30 Hz. 0 = never. Not applied in dry_run.
+    max_missed_replies: int = 15
+
     # Motor configuration for OpenArms (7 DOF per arm)
     # Maps motor names to (send_can_id, recv_can_id, motor_type)
     # Based on: https://docs.openarm.dev/software/setup/configure-test

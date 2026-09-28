@@ -162,3 +162,15 @@ def test_velocity_feedforward_sends_the_targets_own_speed(tmp_path):
     assert vel0 == 0.0  # no previous target yet
     assert 2.0 / 0.07 < vel1 < 2.0 / 0.045  # ~2 deg over ~50 ms -> ~40 deg/s
     robot.bus.disconnect(False)
+
+
+def test_a_silent_motor_stops_the_live_arm(tmp_path):
+    robot = make(tmp_path, "silent", max_missed_replies=3)
+    robot.bus.connect(handshake=False)
+    robot.bus._is_connected = True
+    robot.bus._recv_all_responses = lambda ids, timeout=0: {}  # nothing answers (e.g. a loose plug)
+    for _ in range(2):
+        robot.get_observation()  # tolerated
+    with pytest.raises(ConnectionError, match="stopped answering"):
+        robot.get_observation()
+    robot.bus.disconnect(False)
