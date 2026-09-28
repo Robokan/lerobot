@@ -135,6 +135,10 @@ class OpenXRPoseSource(PoseSource):
         # One-euro filters on the controller poses (None = raw). VRMocap sets
         # this from its config; see smoothing.py.
         self.smoothing: dict[str, OneEuroPose] | None = None
+        # Camera view: True = head-locked and sized to cover each eye's whole
+        # field of view (it moves with the head); False = the original panel
+        # fixed in the room, 2.5 m wide at 2 m.
+        self.camera_head_locked = True
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -370,6 +374,11 @@ class OpenXRPoseSource(PoseSource):
         ref_space = xr.create_reference_space(session, xr.ReferenceSpaceCreateInfo(
             reference_space_type=xr.ReferenceSpaceType.STAGE,
             pose_in_reference_space=xr.Posef()))
+        # The headset's own frame: a layer placed here stays fixed in the view.
+        view_space = xr.create_reference_space(session, xr.ReferenceSpaceCreateInfo(
+            reference_space_type=xr.ReferenceSpaceType.VIEW,
+            pose_in_reference_space=xr.Posef()))
+        head_quad = {}  # cached pose/size of the full-view camera quad
 
         # -- Actions ---------------------------------------------------------
         action_set = xr.create_action_set(instance, xr.ActionSetCreateInfo(
@@ -574,6 +583,36 @@ class OpenXRPoseSource(PoseSource):
                 environment_blend_mode=pt_blend_mode,
                 layers=[ctypes.byref(quad_layer)]))
 
+        def _head_quad(frame_state, aspect, dist=1.0):
+            """Pose and size of a view-space quad that covers BOTH eyes' fields
+            of view at ``dist`` metres, keeping the image aspect (the overflow is
+            cropped, never letterboxed). The FOV is the runtime's own, per eye,
+            including each eye's offset from the head centre; cached per aspect."""
+            if aspect in head_quad:
+                return head_quad[aspect]
+            try:
+                _, views = xr.locate_views(session, xr.ViewLocateInfo(
+                    view_config_type, frame_state.predicted_display_time, view_space))
+                xs, ys = [], []
+                for v in views:
+                    ex, ey, f = v.pose.position.x, v.pose.position.y, v.fov
+                    xs += [ex + dist * math.tan(f.angle_left), ex + dist * math.tan(f.angle_right)]
+                    ys += [ey + dist * math.tan(f.angle_down), ey + dist * math.tan(f.angle_up)]
+                need_w, need_h = max(xs) - min(xs), max(ys) - min(ys)
+                cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+                logger.info("Head-locked camera view: FOV %.0f x %.0f deg per eye",
+                            math.degrees(views[0].fov.angle_right - views[0].fov.angle_left),
+                            math.degrees(views[0].fov.angle_up - views[0].fov.angle_down))
+            except Exception:  # noqa: BLE001
+                logger.warning("Could not read the headset FOV; using a 110 deg default", exc_info=True)
+                need_w = need_h = 2 * dist * math.tan(math.radians(55))
+                cx = cy = 0.0
+            w = max(need_w, need_h * aspect) * 1.02  # a hair over, so no edge shows
+            h = w / aspect
+            head_quad[aspect] = (xr.Posef(orientation=xr.Quaternionf(0, 0, 0, 1),
+                                          position=xr.Vector3f(cx, cy, -dist)), (w, h))
+            return head_quad[aspect]
+
         def _submit_camera_quad(frame_state):
             img_idx = xr.acquire_swapchain_image(cam_sc, xr.SwapchainImageAcquireInfo())
             xr.wait_swapchain_image(cam_sc, xr.SwapchainImageWaitInfo(timeout=xr.INFINITE_DURATION))
@@ -595,11 +634,18 @@ class OpenXRPoseSource(PoseSource):
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
             xr.release_swapchain_image(cam_sc, xr.SwapchainImageReleaseInfo())
             aspect = cam_w / max(cam_h, 1)
-            panel_w = 2.5
-            panel_h = panel_w / aspect
+            if self.camera_head_locked:
+                space = view_space
+                pose, (panel_w, panel_h) = _head_quad(frame_state, aspect)
+            else:
+                space = ref_space
+                panel_w = 2.5
+                panel_h = panel_w / aspect
+                pose = xr.Posef(orientation=xr.Quaternionf(0, 0, 0, 1),
+                                position=xr.Vector3f(0, 1.2, -2.0))
             quad_layer = xr.CompositionLayerQuad(
                 layer_flags=xr.CompositionLayerFlags.BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-                space=ref_space,
+                space=space,
                 eye_visibility=xr.EyeVisibility.BOTH,
                 sub_image=xr.SwapchainSubImage(
                     swapchain=cam_sc,
@@ -608,10 +654,7 @@ class OpenXRPoseSource(PoseSource):
                     ),
                     image_array_index=0,
                 ),
-                pose=xr.Posef(
-                    orientation=xr.Quaternionf(0, 0, 0, 1),
-                    position=xr.Vector3f(0, 1.2, -2.0),
-                ),
+                pose=pose,
                 size=xr.Extent2Df(panel_w, panel_h),
             )
             xr.end_frame(session, xr.FrameEndInfo(

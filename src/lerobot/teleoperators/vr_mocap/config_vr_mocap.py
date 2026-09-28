@@ -165,6 +165,9 @@ class VRMocapConfig(TeleoperatorConfig):
     smooth_min_cutoff_hz: float = 1.0
     smooth_beta_pos: float = 5.0   # per m/s of hand speed
     smooth_beta_rot: float = 0.5   # per rad/s of hand rotation
+    # Headset camera view: True = head-locked, filling the whole field of view
+    # (the default); False = a panel fixed in the room, as before.
+    camera_head_locked: bool = True
 
 
     # Pose driver: "scripted" (headless deterministic motion, default),

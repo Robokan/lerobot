@@ -265,6 +265,8 @@ class VRMocap(Teleoperator):
             self._source.smoothing = {s: OneEuroPose(c.smooth_min_cutoff_hz, c.smooth_beta_pos, c.smooth_beta_rot)
                                       for s in SIDES}
             logger.info("controller smoothing on (one-euro, min cutoff %.1f Hz)", c.smooth_min_cutoff_hz)
+        if hasattr(self._source, "camera_head_locked"):
+            self._source.camera_head_locked = bool(self.config.camera_head_locked)
         if hasattr(self._source, "yaw_about_vertical"):
             self._source.yaw_about_vertical = bool(self.config.yaw_about_vertical)
         # The roll ordering (shoulder/wrist hand-over, the home detent) is a KEY
