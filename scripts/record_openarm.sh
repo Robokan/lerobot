@@ -60,9 +60,9 @@ exec lerobot-record \
     --robot.right_arm_config.side=right \
     --robot.right_arm_config.use_can_fd=false \
     --robot.cameras="{
-        ego:         {type: opencv, index_or_path: $EGO_CAM,         width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $FPS},
-        left_wrist:  {type: opencv, index_or_path: $LEFT_WRIST_CAM,  width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $FPS},
-        right_wrist: {type: opencv, index_or_path: $RIGHT_WRIST_CAM, width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $FPS}}" \
+        ego:         {type: opencv, index_or_path: $EGO_CAM,         width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $FPS, fourcc: MJPG},
+        left_wrist:  {type: opencv, index_or_path: $LEFT_WRIST_CAM,  width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $FPS, fourcc: MJPG},
+        right_wrist: {type: opencv, index_or_path: $RIGHT_WRIST_CAM, width: $CAM_WIDTH, height: $CAM_HEIGHT, fps: $FPS, fourcc: MJPG}}" \
     --teleop.type=bi_openarm_leader \
     --teleop.id=umpa_leader \
     --teleop.left_arm_config.port="$UMPA_LEFT_CAN" \

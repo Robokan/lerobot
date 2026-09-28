@@ -51,10 +51,15 @@ set -euo pipefail
 #
 # TODO: fill these in from `bash scripts/identify_cameras.sh --list` with all
 # three cameras plugged into their usual ports.
+# Identified 2026-09-28 on deep-thought: all three cameras report the same
+# serial (01.00.00), so these are USB port chains (by-path). Moving a camera
+# to another port means updating its line here (re-run --list).
+#   ego         = chest camera, looks ahead at the table
+#   right_wrist = went dark when the right wrist camera was covered
 declare -A EXPECTED_DEVICE=(
-  [ego]=""
-  [left_wrist]=""
-  [right_wrist]=""
+  [ego]="usb-0:3.3:1.0"
+  [left_wrist]="usb-0:3.4.2:1.0"
+  [right_wrist]="usb-0:3.4.3:1.0"
 )
 
 # Role -> environment variable emitted by --export.
