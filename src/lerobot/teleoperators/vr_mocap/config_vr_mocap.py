@@ -148,6 +148,23 @@ class VRMocapConfig(TeleoperatorConfig):
     # The pose the IK springs pull toward, all seven joints (J1..J7, degrees),
     # left mirrored. None = elbow-only, from rest_elbow_bend_deg above.
     rest_pose_deg: list[float] | None = None
+    # Real robot: on first contact, glide each arm from wherever it is to this
+    # pose (J1..J7, degrees, left mirrored like rest_pose_deg) before anything
+    # else, instead of adopting the launch pose where it stands. The glide
+    # ignores the headset; X pressed during it takes effect from the home pose.
+    # It also becomes the h pose. None = adopt the launch pose (the sim, whose
+    # robot already starts in its start_pose_deg).
+    home_pose_deg: list[float] | None = None
+    # Speed of that glide: the joint with the farthest to go moves at this rate
+    # (deg/s), eased in and out, and the others finish with it. Never under 2 s.
+    home_speed_deg_s: float = 15.0
+    # One-euro smoothing of the headset controller poses (smoothing.py): strong
+    # when the hand is nearly still (tracking jitter), little when it moves fast.
+    # Off = raw poses, as before.
+    smooth_controllers: bool = False
+    smooth_min_cutoff_hz: float = 1.0
+    smooth_beta_pos: float = 5.0   # per m/s of hand speed
+    smooth_beta_rot: float = 0.5   # per rad/s of hand rotation
 
 
     # Pose driver: "scripted" (headless deterministic motion, default),

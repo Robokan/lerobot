@@ -58,6 +58,7 @@ import numpy as np
 
 from .ik import FINGER_OPEN_M, quat_inv, quat_mul, xr_pos_to_robot, xr_quat_to_robot
 from .pose_source import SIDES, HandTarget, PoseSource
+from .smoothing import OneEuroPose
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,9 @@ class OpenXRPoseSource(PoseSource):
 
     def __init__(self, vr_hz: int = 50):
         self.vr_hz = vr_hz
+        # One-euro filters on the controller poses (None = raw). VRMocap sets
+        # this from its config; see smoothing.py.
+        self.smoothing: dict[str, OneEuroPose] | None = None
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -628,6 +632,9 @@ class OpenXRPoseSource(PoseSource):
         session_running = False
         body_rotation = None
         body_quat_s2b = None
+        # X pressed to turn tracking ON: held here until the next frame has been
+        # calibrated and every controller pose re-expressed in the new body frame.
+        activate_pending = False
 
         try:
             while self._running:
@@ -668,9 +675,18 @@ class OpenXRPoseSource(PoseSource):
                         pt = frame_state.predicted_display_time
 
                         # Head-based body-frame calibration (once per activation).
-                        if self._tracking and body_rotation is None:
+                        if (self._tracking or activate_pending) and body_rotation is None:
                             body_rotation, body_quat_s2b = self._calibrate_body(
                                 xr, session, view_config_type, pt, ref_space)
+                            # New body frame: filtered history in the old one would
+                            # glide across the change -- a slow version of the X jump.
+                            for f in (self.smoothing or {}).values():
+                                f.reset()
+                            if body_rotation is None and activate_pending:
+                                # No head pose this frame: go live uncalibrated, as before,
+                                # rather than leaving X unanswered.
+                                logger.warning("Body frame calibration failed; tracking in the raw play-space frame")
+                                body_rotation = np.eye(3)
 
                         for hand_idx, side in enumerate(["left", "right"]):
                             grip_loc = xr.locate_space(grip_spaces[hand_idx], ref_space, pt)
@@ -690,6 +706,9 @@ class OpenXRPoseSource(PoseSource):
                                     bq = np.array([q_body[1], q_body[2], q_body[3], q_body[0]])
                                 robot_pos = xr_pos_to_robot(bp)
                                 robot_quat = xr_quat_to_robot(bq)
+                                if self.smoothing:
+                                    robot_pos, robot_quat = self.smoothing[side](
+                                        robot_pos, robot_quat, time.monotonic())
                                 with self._lock:
                                     self._ctrl_pos[side][:] = robot_pos
                                     self._ctrl_quat[side][:] = robot_quat
@@ -705,21 +724,31 @@ class OpenXRPoseSource(PoseSource):
                             except xr.exception.XrException:
                                 pass
 
+                        # A pending activation goes live only now: this frame was
+                        # calibrated and both controller poses above are already in
+                        # the new body frame. Going live in the frame X was seen
+                        # let the teleop capture its reference in the OLD frame and
+                        # every later pose in the new one -- the difference, your
+                        # whole position swung about the play-space origin, jerked
+                        # the arm 20-40 cm sideways on X.
+                        if activate_pending and body_rotation is not None:
+                            with self._lock:
+                                self._tracking = True
+                                self._activation_id += 1
+                            activate_pending = False
+                            logger.info("Tracking ACTIVATED (X button)")
+
                         # X toggles tracking.
                         if _edge(x_button_action, left_path[0]):
-                            with self._lock:
-                                self._tracking = not self._tracking
-                                if self._tracking:
-                                    self._activation_id += 1
-                                    body_rotation = None
-                                    body_quat_s2b = None
-                                    tracking_now = True
-                                else:
-                                    tracking_now = False
-                            logger.info(
-                                "Tracking %s (X button)",
-                                "ACTIVATED" if tracking_now else "PAUSED",
-                            )
+                            if self._tracking or activate_pending:
+                                with self._lock:
+                                    self._tracking = False
+                                activate_pending = False
+                                logger.info("Tracking PAUSED (X button)")
+                            else:
+                                activate_pending = True  # recalibrate, then go live next frame
+                                body_rotation = None
+                                body_quat_s2b = None
 
                         # Right grip squeeze cancels the current take
                         # (re-record). 0.7/0.3 hysteresis so an analog grip

@@ -33,6 +33,7 @@ does (arms just track joint targets).
 import logging
 import math
 import os
+import time
 
 import numpy as np
 
@@ -227,6 +228,7 @@ class VRMocap(Teleoperator):
                            for s in SIDES}
         self._tick = 0
         self._actual_q: dict = {}
+        self._homing: dict = {}  # side -> glide to home_pose_deg in progress
         self._last_tgt: dict = {}
         self._prev_tip: dict = {}
         self._stall: dict = {}
@@ -256,6 +258,13 @@ class VRMocap(Teleoperator):
             if abs(self.config.hand_scale - 1.0) > 1e-9:
                 logger.info("hand scale %.2f (the gripper moves %.0f%% as far as your hand)",
                             self.config.hand_scale, 100.0 * self.config.hand_scale)
+        if hasattr(self._source, "smoothing") and self.config.smooth_controllers:
+            from .smoothing import OneEuroPose
+
+            c = self.config
+            self._source.smoothing = {s: OneEuroPose(c.smooth_min_cutoff_hz, c.smooth_beta_pos, c.smooth_beta_rot)
+                                      for s in SIDES}
+            logger.info("controller smoothing on (one-euro, min cutoff %.1f Hz)", c.smooth_min_cutoff_hz)
         if hasattr(self._source, "yaw_about_vertical"):
             self._source.yaw_about_vertical = bool(self.config.yaw_about_vertical)
         # The roll ordering (shoulder/wrist hand-over, the home detent) is a KEY
@@ -322,10 +331,11 @@ class VRMocap(Teleoperator):
                 self._last_tgt[side] = np.asarray(tgt.pos, float).copy()
                 self._last_tgt_quat[side] = np.asarray(tgt.quat, float).copy()
 
+        homing = self._advance_homing()
         for side in SIDES:
             tgt = targets.get(side)
-            if tgt is None or not tgt.active:
-                continue  # hold: leave IK qpos (and thus joint output) unchanged
+            if side in homing or tgt is None or not tgt.active:
+                continue  # hold (or gliding home): leave IK qpos unchanged
             take_home = getattr(self._source, "take_home_request", None)
             if callable(take_home) and take_home(side):
                 # h: TELEPORT to the default pose -- the IK copy jumps, the
@@ -613,6 +623,48 @@ class VRMocap(Teleoperator):
         if changed:
             resync(side, new_p, new_q)
 
+    def _home_q(self, side) -> np.ndarray:
+        """home_pose_deg for this arm: left mirrored where the model's ranges are."""
+        q = np.radians(np.asarray(self.config.home_pose_deg, dtype=float))
+        if len(q) != 7:
+            raise ValueError(f"home_pose_deg needs 7 joint angles, got {len(q)}")
+        if side == "left":
+            lo_l, hi_l = self._limits_model["left"]
+            lo_r, hi_r = self._limits_model["right"]
+            mirrored = (np.abs(lo_l + hi_r) < 1e-6) & (np.abs(hi_l + lo_r) < 1e-6)
+            q = np.where(mirrored, -q, q)
+        lo, hi = self._limits_model[side]
+        return np.clip(q, lo, hi)
+
+    def _start_homing(self, side) -> None:
+        start = self._ik.joint_positions(side).copy()
+        goal = self._home_q(side)
+        span = float(np.max(np.abs(goal - start)))
+        dur = max(2.0, math.degrees(span) / max(self.config.home_speed_deg_s, 1e-3))
+        self._homing[side] = {"start": start, "goal": goal, "t0": time.monotonic(), "dur": dur}
+        self._default_q[side] = goal.copy()
+        logger.info("%s arm: gliding to the home pose over %.1f s (largest move %.0f deg)",
+                    side, dur, math.degrees(span))
+
+    def _advance_homing(self) -> set:
+        """Step every arm that is gliding home; return the ones still gliding."""
+        still = set()
+        for side, h in list(self._homing.items()):
+            s = min(1.0, (time.monotonic() - h["t0"]) / h["dur"])
+            s = s * s * (3.0 - 2.0 * s)  # ease in and out
+            self._ik.set_joint_positions(side, h["start"] + (h["goal"] - h["start"]) * s)
+            if s >= 1.0:
+                del self._homing[side]
+                resync = getattr(self._source, "resync_target", None)
+                if callable(resync):
+                    # X may have been pressed mid-glide: anchor the hand to HOME
+                    p, q = self._ik.get_ee_pose(side)
+                    resync(side, p, q)
+                logger.info("%s arm: at the home pose, teleop live", side)
+            else:
+                still.add(side)
+        return still
+
     def send_feedback(self, feedback: dict) -> None:
         """Forward robot observation images to the OpenXR headset view."""
         if self._debug_every and (self._tick % self._debug_every == 0):
@@ -638,6 +690,8 @@ class VRMocap(Teleoperator):
                         self._ik.limits_low[side][:], self._ik.limits_high[side][:] = self._limits_model[side]
                         self._ik.set_joint_positions(side, self._actual_q[side])
                         self._default_q[side] = self._ik.joint_positions(side).copy()
+                        if self.config.home_pose_deg is not None:
+                            self._start_homing(side)
                         resync = getattr(self._source, "resync_target", None)
                         if callable(resync):
                             p0, q0 = self._ik.get_ee_pose(side)
