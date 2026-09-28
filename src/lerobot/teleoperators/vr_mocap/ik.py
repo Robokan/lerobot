@@ -272,6 +272,17 @@ def xr_quat_to_robot(q_xyzw):
 # --------------------------------------------------------------------------- #
 # IK solver
 # --------------------------------------------------------------------------- #
+def _kinematics(mujoco, model, data) -> None:
+    """Positions and the Jacobian inputs only (what mj_jacBody and xpos/xquat read).
+
+    mj_forward also runs collision detection, constraints and dynamics, none of
+    which the IK reads; on the full scene that tripled the cost of a solve and
+    kept the real-robot teleop loop from reaching 60 Hz.
+    """
+    mujoco.mj_kinematics(model, data)
+    mujoco.mj_comPos(model, data)
+
+
 class IKSolver:
     """Per-arm damped-least-squares IK on the OpenArm hand TCP bodies."""
 
@@ -441,7 +452,7 @@ class IKSolver:
             fired on every frozen sample, 49 times on the left arm and 6 on
             the right, with the target 6-28 cm away and the joints stock still.
             """
-            mujoco.mj_forward(self.model, self.data)
+            _kinematics(mujoco, self.model, self.data)
             p = target_pos - self.data.xpos[body_id]
             o = mat_to_axis_angle(tgt_mat @ self.data.xmat[body_id].reshape(3, 3).T)
             disp = np.array([self.data.qpos[qi] for qi in idx]) - q_rest
@@ -628,7 +639,7 @@ class IKSolver:
         lim = self.max_delta_per_call_rad
         for k, qi in enumerate(idx):
             self.data.qpos[qi] = np.clip(self.data.qpos[qi], q_start[k] - lim, q_start[k] + lim)
-        mujoco.mj_forward(self.model, self.data)
+        _kinematics(mujoco, self.model, self.data)
         return np.array([self.data.qpos[i] for i in idx])
 
     def _weighted_dls(self, J, dx, weights, lam):
@@ -767,7 +778,7 @@ class IKSolver:
         q_new = np.clip(q + dq, lo, hi)
         for kk, qi in enumerate(idx):
             self.data.qpos[qi] = float(q_new[kk])
-        self._mujoco.mj_forward(self.model, self.data)
+        _kinematics(self._mujoco, self.model, self.data)
         return q_new - q
 
     def _limit_taper(self, q, lo, hi, dq):
@@ -818,7 +829,7 @@ class IKSolver:
         q = np.clip(q, self.limits_low[side], self.limits_high[side])
         for k, qi in enumerate(self.qpos_idx[side]):
             self.data.qpos[qi] = float(q[k])
-        self._mujoco.mj_forward(self.model, self.data)
+        _kinematics(self._mujoco, self.model, self.data)
 
     def joint_positions(self, side):
         """Read the 7 arm joint angles (rad) for ``side`` in J1..J7 order."""
