@@ -192,6 +192,7 @@ TELEOP_EXTRA=(
   --teleop.rest_pose_deg="[${REST_POSE}]"
 )
 [[ "${SMOOTH:-0}" == "1" ]] && TELEOP_EXTRA+=(--teleop.smooth_controllers=true)
+[[ -n "${VIEW_SCALE:-}" ]] && TELEOP_EXTRA+=(--teleop.camera_view_scale="${VIEW_SCALE}")   # 1.0 = whole image fits
 echo "[run_vr_real] home pose [${HOME_POSE}] at ${HOME_SPEED} deg/s, springs toward [${REST_POSE}]"
 if [[ "${DRY_RUN}" == "1" ]]; then
   # The arms never move in a dry run, so the leash toward the actual arm would

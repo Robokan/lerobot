@@ -139,6 +139,7 @@ class OpenXRPoseSource(PoseSource):
         # field of view (it moves with the head); False = the original panel
         # fixed in the room, 2.5 m wide at 2 m.
         self.camera_head_locked = True
+        self.camera_view_scale = 1.0  # head-locked view size: 1.0 = the whole image just fits
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -584,10 +585,13 @@ class OpenXRPoseSource(PoseSource):
                 layers=[ctypes.byref(quad_layer)]))
 
         def _head_quad(frame_state, aspect, dist=1.0):
-            """Pose and size of a view-space quad that covers BOTH eyes' fields
-            of view at ``dist`` metres, keeping the image aspect (the overflow is
-            cropped, never letterboxed). The FOV is the runtime's own, per eye,
-            including each eye's offset from the head centre; cached per aspect."""
+            """Pose and size of a view-space quad spanning BOTH eyes' fields of
+            view at ``dist`` metres, keeping the image aspect. The whole image is
+            shown (fit, bands where the aspects differ): filling the view instead
+            cropped a quarter of a 4:3 camera on the square 96 x 95 deg XR Elite
+            and lost the periphery. camera_view_scale (1.0 = fit) grows or shrinks
+            it. The FOV is the runtime's own, per eye, including each eye's offset
+            from the head centre; cached per aspect."""
             if aspect in head_quad:
                 return head_quad[aspect]
             try:
@@ -607,7 +611,7 @@ class OpenXRPoseSource(PoseSource):
                 logger.warning("Could not read the headset FOV; using a 110 deg default", exc_info=True)
                 need_w = need_h = 2 * dist * math.tan(math.radians(55))
                 cx = cy = 0.0
-            w = max(need_w, need_h * aspect) * 1.02  # a hair over, so no edge shows
+            w = min(need_w, need_h * aspect) * self.camera_view_scale
             h = w / aspect
             head_quad[aspect] = (xr.Posef(orientation=xr.Quaternionf(0, 0, 0, 1),
                                           position=xr.Vector3f(cx, cy, -dist)), (w, h))
