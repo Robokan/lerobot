@@ -517,6 +517,122 @@ def run_caddy_trial(robot, iks, rng, policy, fps: int, time_limit_s: float,
     }
 
 
+def run_caddy_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: float,
+                        stacks: int = 6) -> dict:
+    """Caddy picking under async RTC.
+
+    Same scene, same prompt, same scoring as run_caddy_trial — including the
+    separate wrong-pad and knocked counters — but the actions come from the
+    background inference engine instead of blocking on a chunk every
+    n_action_steps ticks. Slewing matches run_rtc_trial, gripper unslewed.
+    """
+    from lerobot.utils.feature_utils import build_dataset_frame
+
+    import random_caddy_pick as rc
+
+    rc.hide_legacy_pads(robot)
+    rcp.set_cube_xy(robot, -0.90, -0.90)
+    trial = None
+    for _ in range(8):
+        cand = rc.Trial(robot, rng, stacks)
+        if rc.grasp_plannable(robot, iks[cand.side], cand, rng):
+            trial = cand
+            break
+    if trial is None:
+        return {"reset": True, "success": None}
+    if not rc.safe_start_pose(robot, iks, trial, rng, fps):
+        return {"reset": True, "success": None}
+    for a in rcp.ARMS:
+        rcp._RETREAT_TARGET[a.side] = rcp.tuck_q(iks[a.side])
+
+    # The prompt is per-trial here. pol.task feeds the sync pipeline's
+    # preprocessing; the engine holds its own copy for the chunks it builds on
+    # the inference thread, and without this every episode after the first is
+    # grounded on the previous prompt.
+    pol.task = trial.prompt
+    engine.set_task(trial.prompt)
+    pol.reset()
+    engine.reset()
+    engine.notify_observation(robot.get_observation())
+    engine.resume()  # the RTC background thread starts paused
+
+    target = trial.top_bar()
+    watch = trial.arranged_bars()
+    start = {i: rc.bar_pos(robot, i).copy() for i in watch}
+    travel = {"left": 0.0, "right": 0.0}
+    prev_q = {s_: rcp._arm_q_real(robot, iks[s_]) for s_ in ("left", "right")}
+    lifted = False
+    success = False
+    t_success = None
+    reset = False
+    held_since = None
+    cmd = None  # slew-limited command state
+    slew = 2.5  # deg per tick — spreads chunk-seam jumps
+    grip_idx = np.array([i for i, k in enumerate(pol.action_keys) if "gripper" in k])
+
+    def on_pile(i: int) -> bool:
+        p = rc.bar_pos(robot, i)
+        return (float(np.linalg.norm(p[:2] - trial.place_xy)) < rc.PLACE_TOL
+                and abs(float(p[2]) - rc.bar_centre_z(trial.pile_n)) < 0.012)
+
+    t_start = time.perf_counter()
+    t_end = t_start + time_limit_s
+    while time.perf_counter() < t_end:
+        t0 = time.perf_counter()
+        if reset_requested():
+            reset = True
+            break
+        obs = robot.get_observation()
+        engine.notify_observation(obs)
+        frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
+        a = engine.get_action(frame)
+        if a is not None:
+            tgt = a.detach().cpu().numpy().reshape(-1)
+            if cmd is None:
+                cmd = tgt.copy()
+            else:
+                cmd = cmd + np.clip(tgt - cmd, -slew, slew)
+                cmd[grip_idx] = tgt[grip_idx]
+        if cmd is not None:
+            # queue priming/gap: resending the last command keeps the sim stepping
+            robot.send_action({k: float(v) for k, v in zip(pol.action_keys, cmd, strict=True)})
+        precise_sleep(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+        for s_ in ("left", "right"):
+            q = rcp._arm_q_real(robot, iks[s_])
+            travel[s_] += float(np.abs(q - prev_q[s_]).sum())
+            prev_q[s_] = q
+        if float(rc.bar_pos(robot, target)[2] - start[target][2]) > 0.04:
+            lifted = True
+        if on_pile(target):
+            held_since = held_since or time.perf_counter()
+            if time.perf_counter() - held_since > 0.5:
+                success = True
+                t_success = time.perf_counter() - t_start
+                break
+        else:
+            held_since = None
+
+    moved = [i for i in watch
+             if float(np.linalg.norm(rc.bar_pos(robot, i)[:2] - start[i][:2])) > 0.03]
+    delivered = [i for i in watch if i not in trial.pile_bars and on_pile(i)]
+    wrong_pad = bool(delivered) and target not in delivered
+    disturbed = [i for i in moved if i != target and i not in delivered]
+    return {
+        "reset": reset,
+        "success": bool(success and not disturbed),
+        "lifted_demo": lifted,
+        "t_success": t_success,
+        "cube_y": float(trial.stack_xy[trial.target][1]),
+        "colour": trial.colour,
+        "intended_arm": trial.side,
+        "committed_arm": max(travel, key=travel.get) if max(travel.values()) > 0.5 else "none",
+        "wrong_pad": wrong_pad,
+        "knocked": bool(disturbed),
+        "pile_n": trial.pile_n,
+        "final_cube_z": float(rc.bar_pos(robot, target)[2]),
+    }
+
+
 def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str,
                      device: str = "cuda"):
     """Construct lerobot's real RTC engine around our policy + processors."""
@@ -934,6 +1050,9 @@ def main() -> None:
                           f"jit t={t_used:.1f}s cube_z={cz:.3f}")
                 rcp.park_both_arms(robot, iks)
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
+            elif engine is not None and args.task_mode == "caddy":
+                r = run_caddy_rtc_trial(robot, iks, rng, engine, policy, args.fps,
+                                        args.time_limit, args.stacks)
             elif engine is not None and args.task_mode == "color":
                 r = run_color_rtc_trial(robot, iks, rng, engine, policy, args.fps, args.time_limit)
             elif engine is not None:
@@ -953,6 +1072,8 @@ def main() -> None:
                 rcp.settle_pose(robot, iks[arm.side], 0.0, args.fps, hold_s=0.15)
             elif args.task_mode == "caddy":
                 r = run_caddy_trial(robot, iks, rng, policy, args.fps, args.time_limit, args.stacks)
+                if os.environ.get("EVAL_DEBUG_DICT"):
+                    print("  [dbg] " + ", ".join(f"{k}={v}" for k, v in r.items()), flush=True)
             elif args.task_mode == "color":
                 r = run_color_trial(robot, iks, rng, policy, args.fps, args.time_limit)
             else:

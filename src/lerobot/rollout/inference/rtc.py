@@ -369,6 +369,17 @@ class RTCInferenceEngine(InferenceEngine):
         self._set_dispatched_task(task)
         return action
 
+    def set_task(self, task: str) -> None:
+        """Change the language prompt used for subsequent chunks.
+
+        The task is fixed at construction, which suits a benchmark where every
+        episode carries the same instruction. Tasks that draw a fresh prompt per
+        episode (pick the bar from the *named* pad) must update it between
+        episodes or the policy is grounded on the wrong instruction for every
+        episode after the first. Call it while the thread is paused.
+        """
+        self._task = task
+
     def notify_observation(self, obs: dict) -> None:
         """Publish the latest observation for the RTC thread to consume."""
         with self._obs_lock:
