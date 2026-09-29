@@ -110,6 +110,14 @@ class OpenArmFollowerConfigBase:
     # half a second at 30 Hz. 0 = never. Not applied in dry_run.
     max_missed_replies: int = 15
 
+    # > 0: a background thread sends every motor its MIT command at this rate,
+    # gliding (position + velocity reference) from the current command to each
+    # new action, instead of one step per send_action call. Damiao MIT has no
+    # trajectory generation of its own, so 30 Hz steps made the arm wobble on
+    # fast moves (Enactic's controller runs its follower at 1 kHz). 0 = off.
+    # Not used in dry_run.
+    control_hz: float = 0.0
+
     # Motor configuration for OpenArms (7 DOF per arm)
     # Maps motor names to (send_can_id, recv_can_id, motor_type)
     # Based on: https://docs.openarm.dev/software/setup/configure-test

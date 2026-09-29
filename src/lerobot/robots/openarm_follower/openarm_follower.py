@@ -32,6 +32,7 @@ from .config_openarm_follower import (
     RIGHT_DEFAULT_JOINTS_LIMITS,
     OpenArmFollowerConfig,
 )
+from .control_loop import MitControlLoop
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +187,21 @@ class OpenArmFollower(Robot):
 
         self.bus.enable_torque()
 
+        self._loop = None
+        if self.config.control_hz > 0:
+            # Hold where the motors are until the first action arrives.
+            self.bus.sync_read_all_states()
+            kp, kd = self.config.position_kp, self.config.position_kd
+            gains = {
+                m: (kp[i] if isinstance(kp, list) else kp, kd[i] if isinstance(kd, list) else kd)
+                for i, m in enumerate(self.bus.motors)
+            }
+            stale_s = (
+                max(0.2, self.config.max_missed_replies / 30.0) if self.config.max_missed_replies else 1e9
+            )
+            self._loop = MitControlLoop(self.bus, gains, self.config.control_hz, stale_s, name=str(self))
+            self._loop.start({m: s["position"] for m, s in self.bus._last_known_states.items()})
+
         logger.info(f"{self} connected.")
 
     @property
@@ -267,9 +283,16 @@ class OpenArmFollower(Robot):
 
         obs_dict: dict[str, Any] = {}
 
-        states = self.bus.sync_read_all_states()
+        loop = getattr(self, "_loop", None)
+        if loop is not None:
+            # The control loop owns the bus; its command replies are the state.
+            if loop.error is not None:
+                raise loop.error
+            states = loop.states()
+        else:
+            states = self.bus.sync_read_all_states()
         limit = self.config.max_missed_replies
-        if limit and not self.config.dry_run:
+        if limit and not self.config.dry_run and loop is None:
             silent = {m: n for m, n in getattr(self.bus, "missed_replies", {}).items() if n >= limit}
             if silent:
                 raise ConnectionError(
@@ -358,6 +381,11 @@ class OpenArmFollower(Robot):
         if self.config.trace_path:
             self._trace(requested, goal_pos)
         if self.config.dry_run:
+            return sent
+        if getattr(self, "_loop", None) is not None:
+            if self._loop.error is not None:
+                raise self._loop.error
+            self._loop.set_target(goal_pos)  # the loop glides there at control_hz
             return sent
 
         # TODO(Steven, Pepijn): Refactor writing
@@ -478,6 +506,10 @@ class OpenArmFollower(Robot):
     @check_if_not_connected
     def disconnect(self):
         """Disconnect from robot."""
+
+        if getattr(self, "_loop", None) is not None:
+            self._loop.stop()  # before the bus closes and torque is disabled
+            self._loop = None
 
         # Disconnect CAN bus
         self.bus.disconnect(self.config.disable_torque_on_disconnect and not self.config.dry_run)

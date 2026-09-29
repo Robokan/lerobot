@@ -76,6 +76,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             velocity_feedforward=config.left_arm_config.velocity_feedforward,
             velocity_feedforward_max=config.left_arm_config.velocity_feedforward_max,
             max_missed_replies=config.left_arm_config.max_missed_replies,
+            control_hz=config.left_arm_config.control_hz,
         )
 
         right_arm_config = OpenArmFollowerConfig(
@@ -102,6 +103,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             velocity_feedforward=config.right_arm_config.velocity_feedforward,
             velocity_feedforward_max=config.right_arm_config.velocity_feedforward_max,
             max_missed_replies=config.right_arm_config.max_missed_replies,
+            control_hz=config.right_arm_config.control_hz,
         )
 
         self.left_arm = OpenArmFollower(left_arm_config)
