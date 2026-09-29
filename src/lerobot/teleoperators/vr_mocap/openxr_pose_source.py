@@ -139,7 +139,12 @@ class OpenXRPoseSource(PoseSource):
         # field of view (it moves with the head); False = the original panel
         # fixed in the room, 2.5 m wide at 2 m.
         self.camera_head_locked = True
-        self.camera_view_scale = 1.0  # head-locked view size: 1.0 = the whole image just fits
+        self.camera_view_scale = 0.4  # head-locked view size: 1.0 = the whole image just fits the FOV
+        # Body frame (which way is "forward"): False = calibrated from the head on
+        # the FIRST X of the session and kept, so hand moves map the same way
+        # wherever you stand; True = re-aimed at the head on every X (SparkJAX),
+        # which swung the mapping 40 deg between two standing spots.
+        self.recalibrate_each_activation = False
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -793,9 +798,12 @@ class OpenXRPoseSource(PoseSource):
                                 activate_pending = False
                                 logger.info("Tracking PAUSED (X button)")
                             else:
-                                activate_pending = True  # recalibrate, then go live next frame
-                                body_rotation = None
-                                body_quat_s2b = None
+                                activate_pending = True  # go live next frame
+                                if self.recalibrate_each_activation or body_rotation is None:
+                                    body_rotation = None  # recalibrate from the head first
+                                    body_quat_s2b = None
+                                else:
+                                    logger.info("Reusing the body frame from the first X of the session")
 
                         # Right grip squeeze cancels the current take
                         # (re-record). 0.7/0.3 hysteresis so an analog grip

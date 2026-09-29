@@ -268,6 +268,7 @@ class VRMocap(Teleoperator):
         if hasattr(self._source, "camera_head_locked"):
             self._source.camera_head_locked = bool(self.config.camera_head_locked)
             self._source.camera_view_scale = float(self.config.camera_view_scale)
+            self._source.recalibrate_each_activation = bool(self.config.recalibrate_each_x)
         if hasattr(self._source, "yaw_about_vertical"):
             self._source.yaw_about_vertical = bool(self.config.yaw_about_vertical)
         # The roll ordering (shoulder/wrist hand-over, the home detent) is a KEY

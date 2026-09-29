@@ -169,8 +169,13 @@ class VRMocapConfig(TeleoperatorConfig):
     # (the default); False = a panel fixed in the room, as before.
     camera_head_locked: bool = True
     # Size of the head-locked view: 1.0 = the whole camera image just fits the
-    # field of view; above 1 fills more of it and crops the edges.
-    camera_view_scale: float = 1.0
+    # runtime's field of view -- but the outer part of that is at the lens edge
+    # and the force readout at the image corners was out of sight. 0.4 (chosen in
+    # the headset) keeps the whole picture comfortably in view. Above 1 crops.
+    camera_view_scale: float = 0.4
+    # False: "forward" is calibrated from the head on the first X and kept, so
+    # the mapping is the same wherever you stand. True: re-aimed on every X.
+    recalibrate_each_x: bool = False
 
 
     # Pose driver: "scripted" (headless deterministic motion, default),
