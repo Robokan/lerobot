@@ -59,17 +59,31 @@ CAM_FPS="${CAM_FPS:-30}"
 # Speed caps (deg/s), turned into the per-tick max_relative_target. The 90 deg/s
 # (3 deg/tick at 30 Hz) that also applied to the gripper made both feel slow.
 MAX_SPEED="${MAX_SPEED:-150}"        # arm joints
-GRIPPER_SPEED="${GRIPPER_SPEED:-400}"
+GRIPPER_SPEED="${GRIPPER_SPEED:-800}"   # 800 deg/s: closed to open in ~0.2 s
 KP_SCALE="${KP_SCALE:-1.0}"          # scales the follower's MIT position gains
-# Damping of the wrist motors J5..J7 (MIT kd). lerobot's default 0.3 (vs 3-5 on
+# Damping of the wrist motors J6..J7 (MIT kd; J5 1.5, J3 5). lerobot's default 0.3 (vs 3-5 on
 # J1..J4) let them ring around the VR target: in the trace they reversed 61-81
 # times while their commands kept going one way. KD="k1,...,k8" sets all eight.
-WRIST_KD="${WRIST_KD:-0.8}"
+WRIST_KD="${WRIST_KD:-1.2}"
 KD="${KD:-}"
+# KP="k1,...,k8" sets the stiffness of all eight (overrides KP_SCALE). Enactic's
+# openarm_driver (their 500 Hz VR stack) uses 70,70,70,60,10,10,10,10 with KD
+# 2.75,2.5,2.0,2.0,0.7,0.6,0.5,0.2; lerobot's default is 240,...,24,31,25,25.
+KP="${KP:-}"
+# Motor command rate. The arm used to get one command per 30 Hz tick -- a step
+# every 33 ms that wobbled on fast moves. A background thread now glides between
+# the 30 Hz targets at this rate with position + velocity refs (like Enactic's
+# 1 kHz controller). 0 = the old one-command-per-tick behaviour.
+CONTROL_HZ="${CONTROL_HZ:-250}"
 MODEL_PATH="${MODEL_PATH:-$HOME/sparkpack/openarm_mujoco/v1/scene.xml}"
 OFFSETS="${OFFSETS:-$HOME/.cache/huggingface/lerobot/calibration/robots/openarm_follower/lumpa_zero_offsets.json}"
 ROBOT_ID="${ROBOT_ID:-lumpa_follower}"
 GRIPPER_LIMITS="${GRIPPER_LIMITS:-[-157, 5]}"
+# Joint limits J1..J7: "enactic" = Enactic's openarm_driver (openarm_cell.yaml),
+# which lets the shoulder swing forward / lift to 114.6 deg; "lerobot" = lerobot's
+# defaults, whose J1 75 / J2 90 deg stops kept the arm bent when you reached
+# straight out in front (the IK made up the rest with the elbow).
+LIMITS="${LIMITS:-enactic}"
 # Where the arms go when the motors come on, J1..J7 degrees, left mirrored: the
 # start pose tested in the headset in the sim (run_vr_caddy.sh START_POSE with
 # ELBOW_HEIGHT=35). They GLIDE there at HOME_SPEED deg/s, then teleop starts.
@@ -123,7 +137,7 @@ fi
 # connect() never lands in lerobot's interactive calibration: that prompt
 # re-zeroes the motors on ENTER, which would destroy the zero SparkJAX and the
 # offsets are measured against.
-mapfile -t ARM_ARGS < <(WRIST_KD="${WRIST_KD}" KD="${KD}" VEL_FF="${VEL_FF:-0}" LOG="${LOG}" DRY_RUN="${DRY_RUN}" ARMS="${ARMS}" OFFSETS="${OFFSETS}" ROBOT_ID="${ROBOT_ID}" \
+mapfile -t ARM_ARGS < <(LIMITS="${LIMITS}" KP="${KP}" CONTROL_HZ="${CONTROL_HZ}" WRIST_KD="${WRIST_KD}" KD="${KD}" VEL_FF="${VEL_FF:-0}" LOG="${LOG}" DRY_RUN="${DRY_RUN}" ARMS="${ARMS}" OFFSETS="${OFFSETS}" ROBOT_ID="${ROBOT_ID}" \
   KP_SCALE="${KP_SCALE}" GRIPPER_LIMITS="${GRIPPER_LIMITS}" .venv/bin/python - <<'EOF'
 import json, os, sys
 from pathlib import Path
@@ -139,24 +153,39 @@ if os.path.isfile(os.environ["OFFSETS"]):
 elif not dry:
     sys.exit(f"ERROR: no zero offsets at {os.environ['OFFSETS']} -- run openarm_shadow.py --save-offsets first")
 defaults = OpenArmFollowerConfig(port="x")
-kp = [round(k * float(os.environ["KP_SCALE"]), 3) for k in defaults.position_kp]
+if os.environ["KP"]:
+    kp = [float(v) for v in os.environ["KP"].split(",")]
+    assert len(kp) == 8, "KP needs 8 values, J1..J7 and the gripper"
+else:
+    kp = [round(k * float(os.environ["KP_SCALE"]), 3) for k in defaults.position_kp]
 grip = json.loads(os.environ["GRIPPER_LIMITS"])
+ENACTIC_RIGHT = [(-80.0, 114.6), (-10.0, 114.6), (-90.0, 90.0), (0.0, 140.0), (-90.0, 90.0), (-45.0, 45.0), (-90.0, 90.0)]
+def arm_limits(side):
+    if os.environ["LIMITS"] != "enactic":
+        return {}
+    lim = ENACTIC_RIGHT if side == "right" else [(-hi, -lo) if k in (0, 1) else (lo, hi) for k, (lo, hi) in enumerate(ENACTIC_RIGHT)]
+    return {f"joint_{k + 1}": list(v) for k, v in enumerate(lim)}
 if os.environ["KD"]:
     kd = [float(v) for v in os.environ["KD"].split(",")]
     assert len(kd) == 8, "KD needs 8 values, J1..J7 and the gripper"
 else:
+    # Tuned on the arms 2026-09-28: J3 up to 5 like J1/J2/J4 (it wobbled at
+    # lerobot's 3), wrist J5 1.5 and J6/J7 WRIST_KD (lerobot's 0.3 rang).
     kd = list(defaults.position_kd)
-    kd[4:7] = [float(os.environ["WRIST_KD"])] * 3
+    kd[2] = 5.0
+    kd[4:7] = [1.5, float(os.environ["WRIST_KD"]), float(os.environ["WRIST_KD"])]
+print(f"[run_vr_real] kp {kp}", file=sys.stderr)
 print(f"[run_vr_real] kd {kd}", file=sys.stderr)
 for side in ("right", "left"):
     live = not dry and arms in (side, "both")
     p = f"--robot.{side}_arm_config"
     print(f"{p}.dry_run={'false' if live else 'true'}")
     print(f"{p}.zero_offsets={json.dumps(offsets.get(side, {}))}")
-    print(f'{p}.joint_limits_override={json.dumps({"gripper": grip})}')
+    print(f'{p}.joint_limits_override={json.dumps({**arm_limits(side), "gripper": grip})}')
     print(f"{p}.position_kp={json.dumps(kp)}")
     print(f"{p}.position_kd={json.dumps(kd)}")
     print(f"{p}.velocity_feedforward={'true' if os.environ.get('VEL_FF', '0') == '1' else 'false'}")
+    print(f"{p}.control_hz={os.environ['CONTROL_HZ']}")
     print(f"{p}.trace_path={os.environ['LOG'].removesuffix('.log')}_{side}.csv")
     if live:
         cal = HF_LEROBOT_CALIBRATION / "robots" / "openarm_follower" / f"{os.environ['ROBOT_ID']}_{side}.json"
@@ -191,9 +220,14 @@ TELEOP_EXTRA=(
   --teleop.home_speed_deg_s="${HOME_SPEED}"
   --teleop.rest_pose_deg="[${REST_POSE}]"
 )
-[[ "${SMOOTH:-0}" == "1" ]] && TELEOP_EXTRA+=(--teleop.smooth_controllers=true)
-[[ -n "${VIEW_SCALE:-}" ]] && TELEOP_EXTRA+=(--teleop.camera_view_scale="${VIEW_SCALE}")   # 1.0 = whole image fits
+[[ "${SMOOTH:-1}" == "1" ]] && TELEOP_EXTRA+=(--teleop.smooth_controllers=true)   # SMOOTH=0 = raw controller poses
+[[ -n "${VIEW_SCALE:-}" ]] && TELEOP_EXTRA+=(--teleop.camera_view_scale="${VIEW_SCALE}")   # default 0.4; 1.0 = fits the FOV
+[[ "${RECAL_EACH_X:-0}" == "1" ]] && TELEOP_EXTRA+=(--teleop.recalibrate_each_x=true)
+# Gripper travel per unit of hand travel. 1.0 (default) = the gripper moves as far as your hand.
+HAND_SCALE="${HAND_SCALE:-1.0}"
+TELEOP_EXTRA+=(--teleop.hand_scale="${HAND_SCALE}")
 echo "[run_vr_real] home pose [${HOME_POSE}] at ${HOME_SPEED} deg/s, springs toward [${REST_POSE}]"
+echo "[run_vr_real] hand scale ${HAND_SCALE:-1.0} (gripper travel per unit of hand travel)"
 if [[ "${DRY_RUN}" == "1" ]]; then
   # The arms never move in a dry run, so the leash toward the actual arm would
   # pin the command to it. Let it run free to show what WOULD be commanded.
