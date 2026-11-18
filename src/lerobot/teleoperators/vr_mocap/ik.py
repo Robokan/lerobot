@@ -192,10 +192,11 @@ def quat_rotate(q, v):
 
 
 # TCP body pose relative to ``openarm_<side>_hand`` in the MuJoCo model
-# (``pos="0 0 0.08"``). Wrist/keyboard rotations pivot about the hand origin,
-# not the TCP tip 8 cm out — holding the tip fixed made the wrist orbit it and
-# the apparent center change with each rotation axis.
-TCP_OFFSET_IN_HAND_M = np.array([0.0, 0.0, 0.08])
+# (Enactic's V1 model: ``pos="0 0 0.09"``, 8 cm before their 2026-10 TCP fix).
+# Wrist/keyboard rotations pivot about the hand origin, not the TCP tip —
+# holding the tip fixed made the wrist orbit it and the apparent center change
+# with each rotation axis. IKSolver overwrites this with the loaded model's value.
+TCP_OFFSET_IN_HAND_M = np.array([0.0, 0.0, 0.09])
 
 
 def hand_pos_from_tcp(tcp_pos, tcp_quat):
@@ -348,6 +349,9 @@ class IKSolver:
 
         self.left_tcp_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, LEFT_TCP_BODY)
         self.right_tcp_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, RIGHT_TCP_BODY)
+        # Follow the model's hand->TCP offset (in place, so the module helpers see it).
+        if self.left_tcp_id >= 0:
+            TCP_OFFSET_IN_HAND_M[:] = model.body_pos[self.left_tcp_id]
 
         self.joint_ids = {
             "left": [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in LEFT_JOINT_NAMES],

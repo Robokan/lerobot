@@ -122,6 +122,7 @@ from lerobot.robots import (  # noqa: F401
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
+    bi_yam_follower,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -131,9 +132,12 @@ from lerobot.robots import (  # noqa: F401
     openarm_follower,
     reachy2,
     rebot_b601_follower,
+    sim_robot,
     so_follower,
     unitree_g1 as unitree_g1_robot,
+    yam_follower,
 )
+from lerobot.robots.utils import check_control_rate, episode_ended, start_episode
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -246,7 +250,7 @@ class RecordConfig:
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
-    events: dict,
+    events: dict[str, bool],
     fps: int,
     teleop_action_processor: RobotProcessorPipeline[
         tuple[RobotAction, RobotObservation], RobotAction
@@ -259,12 +263,12 @@ def record_loop(
     ],  # runs after robot
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
-    control_time_s: int | None = None,
+    control_time_s: float | None = None,
     single_task: str | None = None,
     display_data: bool = False,
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
-):
+) -> None:
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
@@ -309,6 +313,7 @@ def record_loop(
     last_slow_warn_t = 0.0
     slow_warn_interval_s = 2.0
     has_episode_time_limit = control_time_s != float("inf")
+    feedback_supported = True
 
     while True:
         start_loop_t = time.perf_counter()
@@ -326,8 +331,13 @@ def record_loop(
         # viewer recording keys inside get_action/send_feedback.
         if isinstance(teleop, Teleoperator):
             act = teleop.get_action()
-            # Most teleops no-op; OpenXR vr_mocap uses this for the headset camera feed.
-            teleop.send_feedback(obs)
+            # OpenXR vr_mocap uses feedback for the headset camera feed; several
+            # leaders raise NotImplementedError, so stop asking after the first refusal.
+            if feedback_supported:
+                try:
+                    teleop.send_feedback(obs)
+                except NotImplementedError:
+                    feedback_supported = False
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
@@ -338,7 +348,7 @@ def record_loop(
             arm_action = teleop_arm.get_action()
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
             keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
+            base_action = robot._from_keyboard_to_base_action(keyboard_action)  # type: ignore[attr-defined]
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
             action_values = act_processed_teleop
@@ -433,6 +443,11 @@ def record_loop(
                 compress_images=display_compressed_images,
             )
 
+        # End the recorded episode when a sim robot's episode ends (success, failure or step limit).
+        if dataset is not None and events.get("recording_active") and episode_ended(robot):
+            events["recording_active"] = False
+            break
+
         dt_s = time.perf_counter() - start_loop_t
 
         sleep_time_s: float = control_interval - dt_s
@@ -473,6 +488,7 @@ def record(
     )
 
     robot = make_robot_from_config(cfg.robot)
+    check_control_rate(robot, cfg.dataset.fps, "--dataset.fps")
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # Fall back to identity pipelines when the caller doesn't supply processors.
@@ -531,15 +547,16 @@ def record(
                     "lerobot-record is for data collection only. Use lerobot-rollout for policy deployment."
                 )
             cfg.dataset.stamp_repo_id()
+            num_cameras = len(robot.cameras)  # type: ignore[attr-defined]
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,
                 root=cfg.dataset.root,
-                robot_type=robot.name,
+                robot_type=robot.robot_type,
                 features=dataset_features,
                 use_videos=cfg.dataset.video,
                 image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * num_cameras,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 rgb_encoder=cfg.dataset.rgb_encoder,
                 depth_encoder=cfg.dataset.depth_encoder,
@@ -583,6 +600,7 @@ def record(
                 if callable(new_episode) and not first_pass:
                     new_episode()          # also after a re-record: the failed attempt disturbed the table
                 first_pass = False
+                start_episode(robot)  # upstream SimRobot envs reset here; a no-op for other robots
                 task_hint = getattr(robot, "current_task", None)
                 log_say(f"Ready for episode {ep_idx}. Press Y to start."
                         + (f"  Task: {task_hint}" if task_hint else ""), cfg.play_sounds)

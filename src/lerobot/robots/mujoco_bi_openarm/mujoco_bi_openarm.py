@@ -134,6 +134,22 @@ def apply_base_pose(mujoco, model, data, elbow_bend_deg: float = BASE_ELBOW_BEND
     mujoco.mj_forward(model, data)
 
 
+def make_torque_actuator(mujoco, model, aid: int) -> None:
+    """Turn a position servo into a plain torque motor (ctrl = torque, model forcerange kept).
+
+    Enactic's V1 model drives the arm with position servos; our PD mirrors the real
+    follower's MIT gains, so it needs direct torque. A no-op on a `motor` actuator.
+    """
+    if int(model.actuator_biastype[aid]) != int(mujoco.mjtBias.mjBIAS_AFFINE):
+        return
+    model.actuator_gaintype[aid] = int(mujoco.mjtGain.mjGAIN_FIXED)
+    model.actuator_gainprm[aid, :] = 0.0
+    model.actuator_gainprm[aid, 0] = 1.0
+    model.actuator_biastype[aid] = int(mujoco.mjtBias.mjBIAS_NONE)
+    model.actuator_biasprm[aid, :] = 0.0
+    model.actuator_ctrllimited[aid] = 0
+
+
 def gripper_deg_to_m(deg: float) -> float:
     """Wire gripper degrees -> MuJoCo finger opening (meters), clamped to travel."""
     m = deg / GRIPPER_OPEN_DEG * FINGER_OPEN_M
@@ -265,8 +281,11 @@ class MujocoBiOpenArm(Robot):
                 for i, arm in enumerate(self.config.arm_armature[:7]):
                     jid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint{i + 1}")
                     if jid >= 0:
-                        self._model.dof_armature[self._model.jnt_dofadr[jid]] = float(arm)
-            logger.info("arm joint armature set to %s", self.config.arm_armature)
+                        # A floor, not an overwrite: Enactic's V1 model now carries its own
+                        # (larger, except the wrist) motor armatures.
+                        dof = self._model.jnt_dofadr[jid]
+                        self._model.dof_armature[dof] = max(float(self._model.dof_armature[dof]), float(arm))
+            logger.info("arm joint armature floor %s", self.config.arm_armature)
         mujoco.mj_forward(self._model, self._data)
         if self.config.start_pose_deg is not None:
             apply_base_pose(mujoco, self._model, self._data, pose_deg=self.config.start_pose_deg)
@@ -443,6 +462,7 @@ class MujocoBiOpenArm(Robot):
             for i, motor in enumerate(ARM_JOINT_NAMES):
                 qadr, dadr, jid = joint_qpos_adr(f"openarm_{side}_joint{i + 1}")
                 aid = act_id(f"{side}_joint{i + 1}_ctrl")
+                make_torque_actuator(mujoco, m, aid)
                 self._arm_ctrl[(side, motor)] = {
                     "qadr": qadr,
                     "dadr": dadr,
@@ -456,6 +476,8 @@ class MujocoBiOpenArm(Robot):
             fingers = []
             for fi in (1, 2):
                 qadr, dadr, _ = joint_qpos_adr(f"openarm_{side}_finger_joint{fi}")
+                if fi == 2 and mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{side}_finger2_ctrl") < 0:
+                    continue  # Enactic's model: one actuator, finger 2 follows by equality
                 aid = act_id(f"{side}_finger{fi}_ctrl")
                 fingers.append({
                     "qadr": qadr,

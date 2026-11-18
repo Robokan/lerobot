@@ -585,7 +585,7 @@ def run_caddy_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: fl
         obs = robot.get_observation()
         engine.notify_observation(obs)
         frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
-        a = engine.get_action(frame)
+        a = _engine_action(engine.get_action(frame))
         if a is not None:
             tgt = a.detach().cpu().numpy().reshape(-1)
             if cmd is None:
@@ -633,11 +633,20 @@ def run_caddy_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: fl
     }
 
 
+def _engine_action(a):
+    """The engine returns a transition (action + prediction) on a chunk's first action."""
+    if isinstance(a, dict):
+        from lerobot.processor import TransitionKey
+
+        return a[TransitionKey.ACTION]
+    return a
+
+
 def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task: str,
                      device: str = "cuda"):
     """Construct lerobot's real RTC engine around our policy + processors."""
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
-    from lerobot.rollout.inference.factory import RTCInferenceConfig, create_inference_engine
+    from lerobot.inference import RTCInferenceConfig, create_inference_engine
     from lerobot.rollout.robot_wrapper import ThreadSafeRobot
     from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
@@ -651,7 +660,6 @@ def build_rtc_engine(pol: CheckpointPolicy, robot, fps: int, horizon: int, task:
         preprocessor=pol.pre,
         postprocessor=pol.post,
         robot_wrapper=ThreadSafeRobot(robot),
-        hw_features=pol.obs_features,
         dataset_features=dataset_features,
         ordered_action_keys=list(robot.action_features.keys()),
         task=task,
@@ -709,7 +717,7 @@ def run_color_rtc_trial(robot, iks, rng, engine, pol, fps: int, time_limit_s: fl
         obs = robot.get_observation()
         engine.notify_observation(obs)
         frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
-        a = engine.get_action(frame)
+        a = _engine_action(engine.get_action(frame))
         if a is not None:
             target = a.detach().cpu().numpy().reshape(-1)
             if cmd is None:
@@ -780,7 +788,7 @@ def run_rtc_trial(robot, engine, pol, fps: int, time_limit_s: float = 30.0):
         obs = robot.get_observation()
         engine.notify_observation(obs)
         frame = build_dataset_frame(pol.obs_features, obs, prefix="observation")
-        a = engine.get_action(frame)
+        a = _engine_action(engine.get_action(frame))
         if a is not None:
             target = a.detach().cpu().numpy().reshape(-1)
             if cmd is None:

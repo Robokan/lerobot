@@ -19,11 +19,12 @@ import time
 from functools import cached_property
 from typing import Any
 
-from lerobot.cameras import make_cameras_from_configs
+from lerobot.cameras import DepthCamera, make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
 from lerobot.motors.damiao.tables import CAN_CMD_REFRESH, CAN_PARAM_ID
+from lerobot.motors.motors_bus import NameOrID
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
@@ -65,6 +66,7 @@ class OpenArmFollower(Robot):
     def __init__(self, config: OpenArmFollowerConfig):
         super().__init__(config)
         self.config = config
+        self.supports_position_hold = not config.use_velocity_and_torque
 
         # Arm motors
         motors: dict[str, Motor] = {}
@@ -175,9 +177,7 @@ class OpenArmFollower(Robot):
 
         # Run calibration if needed
         if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
+            logger.info(f"No calibration file found for {self.id}, running calibration")
             self.calibrate()
 
         for cam in self.cameras.values():
@@ -305,8 +305,10 @@ class OpenArmFollower(Robot):
         self._obs_raw_t = time.perf_counter()
 
         for motor in self.bus.motors:
-            state = states.get(motor, {})
-            obs_dict[f"{motor}.pos"] = state.get("position", 0.0) - self.config.zero_offsets.get(motor, 0.0)
+            # The control loop's state dicts may be partial before its first reply.
+            state = states.get(motor) or {}
+            pos = state.get("position", 0.0)
+            obs_dict[f"{motor}.pos"] = pos - self.config.zero_offsets.get(motor, 0.0)
             if self.config.use_velocity_and_torque:
                 obs_dict[f"{motor}.vel"] = state.get("velocity", 0.0)
                 obs_dict[f"{motor}.torque"] = state.get("torque", 0.0)
@@ -319,7 +321,7 @@ class OpenArmFollower(Robot):
                 dt_ms = (time.perf_counter() - start) * 1e3
                 logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
-            if getattr(cam, "use_depth", False):
+            if isinstance(cam, DepthCamera) and cam.use_depth:
                 start = time.perf_counter()
                 obs_dict[f"{cam_key}_depth"] = cam.read_latest_depth()
                 dt_ms = (time.perf_counter() - start) * 1e3
@@ -418,7 +420,7 @@ class OpenArmFollower(Robot):
         self._prev_goal_raw, self._prev_goal_t = dict(goal_pos), now
 
         # Use batch MIT control for arm (sends all commands, then collects responses)
-        commands = {}
+        commands: dict[NameOrID, tuple[float, float, float, float, float]] = {}
         for motor_name, position_degrees in goal_pos.items():
             idx = motor_index.get(motor_name, 0)
             # Use custom gains if provided, otherwise use config defaults

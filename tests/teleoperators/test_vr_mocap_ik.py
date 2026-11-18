@@ -77,7 +77,7 @@ def _run_closed_loop_teleop(mujoco, *, disable_contacts: bool, n_ticks: int = 25
 
     Returns joint history, EE history, target history, and contact counts.
     """
-    from lerobot.robots.mujoco_bi_openarm.mujoco_bi_openarm import apply_base_pose
+    from lerobot.robots.mujoco_bi_openarm.mujoco_bi_openarm import apply_base_pose, make_torque_actuator
     from lerobot.teleoperators.vr_mocap.ik import IKSolver
 
     path = str(_scene_path())
@@ -103,6 +103,7 @@ def _run_closed_loop_teleop(mujoco, *, disable_contacts: bool, n_ticks: int = 25
     for i in range(7):
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_right_joint{i + 1}")
         aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"right_joint{i + 1}_ctrl")
+        make_torque_actuator(mujoco, model, aid)
         aids.append(aid)
         qadrs.append(model.jnt_qposadr[jid])
         dadrs.append(model.jnt_dofadr[jid])

@@ -46,8 +46,14 @@ t0 = time.time()
 
 
 def presses() -> None:
+    # Time the keys from when the dataset directory appears (just before the record
+    # loop starts), not from launch: imports + scene build can take >6 s.
+    pattern = str(ROOT / "local" / (PREFIX.split("/", 1)[1] + "*"))
+    while not any(os.path.getmtime(d) >= t0 for d in glob.glob(pattern)):
+        time.sleep(0.1)
+    start = time.time() - 4  # first key 2 s after the loop is up
     for t, key in SCHEDULE:
-        while time.time() - t0 < t:
+        while time.time() - start < t:
             time.sleep(0.1)
         vk.request_recording_control(key)
         print(f"[smoke] injected {key!r} at {time.time() - t0:.0f}s", flush=True)
