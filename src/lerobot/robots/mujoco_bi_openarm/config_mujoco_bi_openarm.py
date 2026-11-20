@@ -66,6 +66,16 @@ class MujocoBiOpenArmConfig(RobotConfig):
     fps: int = 50
     sim_substeps: int | None = None
 
+    # Physics timestep (s) that overrides the model's. Enactic's V1 model ships
+    # 1 ms, which doubles the steps per control tick versus the 2 ms this sim
+    # (and its MIT PD gains) was tuned at; at 30 Hz that alone cost ~5 ms a tick
+    # and dropped VR teleop to 25 Hz. None = keep the model's timestep.
+    sim_timestep: float | None = 0.002
+    # MuJoCo island sleeping: free bodies at rest (parked bars, the cube) drop out
+    # of collision and constraint solving until something touches them or their
+    # pose is written. Their ~60 resting contacts were most of each step's cost.
+    sim_sleep: bool = True
+
     # Elbow bend (deg) the sim arms start at. Defaults to 0 -- straight -- to match
     # the real robot, which powers up with the elbow extended. The teleoperator's
     # springs are what bend it (see VRMocapConfig.rest_elbow_bend_deg); starting

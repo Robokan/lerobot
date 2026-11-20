@@ -180,6 +180,11 @@ fi
 if [[ "${VIEWER}" == "1" ]]; then
   export MUJOCO_GL="${MUJOCO_GL:-glx}"
   export MUJOCO_SAFE_EXIT_AFTER_VIEWER="${MUJOCO_SAFE_EXIT_AFTER_VIEWER:-1}"
+elif [[ "${DRIVER}" == "openxr" ]]; then
+  # The headset thread makes a GLX context (glfw + PyOpenGL) first, which pins
+  # PyOpenGL to GLX for the process; EGL camera renders then fail with "Cannot
+  # initialize a EGL device display". Render the cameras through GLX too.
+  export MUJOCO_GL="${MUJOCO_GL:-glx}"
 else
   export MUJOCO_GL="${MUJOCO_GL:-egl}"
 fi
@@ -229,6 +234,23 @@ TELEOP_ARGS=(
 [[ "${CHAIN_ROTATION}" == "1" ]]   && TELEOP_ARGS+=(--teleop.chain_rotation=true)
 [[ -n "${HOMING_BOOST}" ]]        && TELEOP_ARGS+=(--teleop.homing_boost="${HOMING_BOOST}")
 [[ -n "${DLS_LAMBDA}" ]]          && TELEOP_ARGS+=(--teleop.dls_lambda="${DLS_LAMBDA}")
+# HAND_MAPPING=neck (default): Enactic's absolute hand mapping (see run_vr_real.sh); delta: relative to X.
+TELEOP_ARGS+=(--teleop.hand_mapping="${HAND_MAPPING:-neck}")
+[[ -n "${NECK_BLEND_S:-}" ]] && TELEOP_ARGS+=(--teleop.neck_blend_s="${NECK_BLEND_S}")
+[[ "${NECK_FOLLOW:-0}" == "1" ]] && TELEOP_ARGS+=(--teleop.neck_follow=true)   # default: neck held from each X
+[[ "${NECK_ORIENT:-1}" == "0" ]] && TELEOP_ARGS+=(--teleop.neck_orientation=false)   # 0 = wrist angle relative to X
+# IK=enactic (default): Enactic's mink QP IK (lerobot[openarm-enactic-ik]); IK=dls: ours.
+IK="${IK:-enactic}"
+if [[ "${IK}" == "enactic" ]] && ! .venv/bin/python -c "import openarm_control" 2>/dev/null; then
+  echo "WARNING: IK=enactic needs openarm_control (uv pip install --python .venv/bin/python 'openarm-control>=0.4,<0.5'); using IK=dls" >&2
+  IK=dls
+fi
+TELEOP_ARGS+=(--teleop.ik_solver="${IK}")
+[[ -n "${ENACTIC_ITERS:-}" ]] && TELEOP_ARGS+=(--teleop.enactic_max_iters="${ENACTIC_ITERS}")
+# REACH_CLAMP=0: no reach clamp for our IK in neck mode (it stops the shake past reach).
+[[ "${REACH_CLAMP:-1}" == "0" ]] && TELEOP_ARGS+=(--teleop.neck_reach_min_elbow_deg=0)
+[[ -n "${NECK_HAND_POINT:-}" ]] && TELEOP_ARGS+=(--teleop.neck_hand_point_m="${NECK_HAND_POINT}")   # 0 = wrist at your hand, 0.09 = fingertips
+[[ -n "${NECK_OFFSET:-}" ]] && TELEOP_ARGS+=(--teleop.neck_frame_offset_m="[${NECK_OFFSET}]")
 [[ -n "${TARGET_LEASH_DEG}" ]]    && TELEOP_ARGS+=(--teleop.target_leash_deg="${TARGET_LEASH_DEG}")
 [[ "${STALL}" == "0" ]]            && TELEOP_ARGS+=(--teleop.stall_deg=0 --teleop.stall_pos_m=0)
 [[ "${YAW_AXIS}" == "vertical" ]]  && TELEOP_ARGS+=(--teleop.yaw_about_vertical=true)

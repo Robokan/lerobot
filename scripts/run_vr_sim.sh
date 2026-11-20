@@ -80,6 +80,11 @@ VIEWER="${VIEWER:-0}"
 if [[ "${VIEWER}" == "1" ]]; then
   export MUJOCO_GL="${MUJOCO_GL:-glx}"
   export MUJOCO_SAFE_EXIT_AFTER_VIEWER="${MUJOCO_SAFE_EXIT_AFTER_VIEWER:-1}"
+elif [[ "${DRIVER}" == "openxr" ]]; then
+  # The headset thread makes a GLX context (glfw + PyOpenGL) first, which pins
+  # PyOpenGL to GLX for the process; EGL camera renders then fail with "Cannot
+  # initialize a EGL device display". Render the cameras through GLX too.
+  export MUJOCO_GL="${MUJOCO_GL:-glx}"
 else
   export MUJOCO_GL="${MUJOCO_GL:-egl}"
 fi
@@ -111,6 +116,9 @@ EPISODE_TIME_S="${EPISODE_TIME_S:-0}"
 RESET_TIME_S="${RESET_TIME_S:-2}"
 
 ROBOT_ARGS=(
+  # Must match --fps: the sim steps 1/robot.fps of physics per tick, so a 50 Hz
+  # robot under a 30 Hz loop ran at 0.6x real time.
+  --robot.fps="${FPS}"
   --robot.type=mujoco_bi_openarm
   --robot.id=mujoco_bi_openarm
   --robot.model_path="${MODEL_PATH}"
@@ -128,6 +136,23 @@ TELEOP_ARGS=(
   --teleop.driver="${DRIVER}"
   --teleop.vr_hz="${FPS}"
 )
+# HAND_MAPPING=neck (default): Enactic's absolute hand mapping (see run_vr_real.sh); delta: relative to X.
+TELEOP_ARGS+=(--teleop.hand_mapping="${HAND_MAPPING:-neck}")
+[[ -n "${NECK_BLEND_S:-}" ]] && TELEOP_ARGS+=(--teleop.neck_blend_s="${NECK_BLEND_S}")
+[[ "${NECK_FOLLOW:-0}" == "1" ]] && TELEOP_ARGS+=(--teleop.neck_follow=true)   # default: neck held from each X
+[[ "${NECK_ORIENT:-1}" == "0" ]] && TELEOP_ARGS+=(--teleop.neck_orientation=false)   # 0 = wrist angle relative to X
+# IK=enactic (default): Enactic's mink QP IK (lerobot[openarm-enactic-ik]); IK=dls: ours.
+IK="${IK:-enactic}"
+if [[ "${IK}" == "enactic" ]] && ! python -c "import openarm_control" 2>/dev/null; then
+  echo "WARNING: IK=enactic needs openarm_control (uv pip install --python .venv/bin/python 'openarm-control>=0.4,<0.5'); using IK=dls" >&2
+  IK=dls
+fi
+TELEOP_ARGS+=(--teleop.ik_solver="${IK}")
+[[ -n "${ENACTIC_ITERS:-}" ]] && TELEOP_ARGS+=(--teleop.enactic_max_iters="${ENACTIC_ITERS}")
+# REACH_CLAMP=0: no reach clamp for our IK in neck mode (it stops the shake past reach).
+[[ "${REACH_CLAMP:-1}" == "0" ]] && TELEOP_ARGS+=(--teleop.neck_reach_min_elbow_deg=0)
+[[ -n "${NECK_HAND_POINT:-}" ]] && TELEOP_ARGS+=(--teleop.neck_hand_point_m="${NECK_HAND_POINT}")   # 0 = wrist at your hand, 0.09 = fingertips
+[[ -n "${NECK_OFFSET:-}" ]] && TELEOP_ARGS+=(--teleop.neck_frame_offset_m="[${NECK_OFFSET}]")
 
 if [[ "${MODE}" == "record" ]]; then
   echo "[run_vr_sim] RECORD: repo_id=${REPO_ID} episodes=${NUM_EPISODES} fps=${FPS} driver=${DRIVER}"

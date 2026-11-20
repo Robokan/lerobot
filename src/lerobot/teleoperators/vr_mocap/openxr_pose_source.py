@@ -56,7 +56,16 @@ from typing import Any
 
 import numpy as np
 
-from .ik import FINGER_OPEN_M, quat_inv, quat_mul, xr_pos_to_robot, xr_quat_to_robot
+from .ik import (
+    FINGER_OPEN_M,
+    TCP_OFFSET_IN_HAND_M,
+    quat_inv,
+    quat_mul,
+    quat_rotate,
+    quat_to_mat,
+    xr_pos_to_robot,
+    xr_quat_to_robot,
+)
 from .pose_source import SIDES, HandTarget, PoseSource
 from .smoothing import OneEuroPose
 
@@ -113,6 +122,61 @@ def _create_quad_program(GL):
     return prog
 
 
+# Absolute ("neck") orientation. P: OpenXR axes -> robot axes (x fwd, y left,
+# z up), the matrix form of xr_pos_to_robot. _AIM_TO_TCP: the TCP frame in the
+# controller's AIM frame (-Z points where the controller points, +Y up, +X right):
+# TCP z (the gripper's pointing axis) along aim -Z, TCP x (the wrist camera's
+# side) along aim +Y, so a level controller pointing ahead gives a level gripper
+# pointing ahead, camera on top, fingers opening sideways -- Enactic's
+# _CONTROLLER_TO_EE convention carried onto this model's TCP (+z pointing).
+_P_XR_TO_ROBOT = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+_AIM_TO_TCP = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+_RZ90_T = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])  # undoes xr_quat_to_robot's grip turn
+
+
+def _mat_to_quat_wxyz(R) -> np.ndarray:
+    """Rotation matrix -> unit quaternion (w, x, y, z)."""
+    R = np.asarray(R, dtype=float)
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        q = [0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s]
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        q = [(R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s]
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        q = [(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s]
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        q = [(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s]
+    q = np.array(q)
+    return q / np.linalg.norm(q)
+
+
+def _slerp_wxyz(q0, q1, t: float) -> np.ndarray:
+    q0 = np.asarray(q0, float)
+    q1 = np.asarray(q1, float)
+    d = float(np.dot(q0, q1))
+    if d < 0:
+        q1, d = -q1, -d
+    if d > 0.9995:
+        q = q0 + t * (q1 - q0)
+        return q / np.linalg.norm(q)
+    th = math.acos(d)
+    return (math.sin((1 - t) * th) * q0 + math.sin(t * th) * q1) / math.sin(th)
+
+
+def _quat_xyzw_to_mat(q) -> np.ndarray:
+    """Rotation matrix of an OpenXR (x, y, z, w) quaternion."""
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def _rgb_to_rgba(frame: np.ndarray) -> np.ndarray:
     """Convert HxWx3 RGB uint8 to contiguous HxWx4 RGBA uint8."""
     if frame.ndim != 3:
@@ -157,6 +221,40 @@ class OpenXRPoseSource(PoseSource):
         self._tracking = False
         self.hand_scale = 1.0     # set by VRMocap from config.hand_scale
         self._activation_id = 0  # increments on each rising edge of tracking
+
+        # Hand mapping. "delta": the gripper moves by your hand's displacement
+        # from where it was on X (the original). "neck": Enactic's
+        # dora-openarm-webxr mapping -- the gripper goes where your hand is
+        # relative to your neck, placed relative to the robot's arm_origin
+        # site, so your full reach is the robot's full reach (a straight arm
+        # is a straight arm). Orientation stays delta in both. VRMocap sets
+        # these from its config.
+        self.hand_mapping = "delta"
+        self.neck_pivot_offset = np.array([0.0, -0.075, 0.08])  # headset frame (-Z fwd, +Y up), m
+        self.neck_frame_offset = np.array([-0.085, 0.0, 0.15])  # arm_origin frame (x fwd, z up), m
+        self.neck_blend_s = 2.0  # glide from the arm's pose to the absolute target after X
+        # Which point of the robot's hand sits at your controller, measured from
+        # the hand origin (the wrist flange) along the gripper axis, m. 0 = the
+        # wrist; the TCP (the IK target, between the fingertips) is
+        # TCP_OFFSET_IN_HAND_M further out, so the fingers stick out ahead of
+        # your hand and a wrist turn swings them about the robot's wrist.
+        self.neck_hand_point_m = 0.0
+        self.arm_origin: tuple[np.ndarray, np.ndarray] | None = None  # (pos, R) in the IK world
+        self._neck_pos: np.ndarray | None = None  # robot axes, same frame as _ctrl_pos
+        # The neck pivot comes from the headset, so every head bob, look-around
+        # and bit of tracking noise moved BOTH arms (2-3x the command jitter of
+        # the delta mapping on the real arms). False = take it once per X and
+        # hold it (head motion cannot move the arms); True = follow it through
+        # a slow one-euro filter (neck_smooth_hz), so leaning is tracked.
+        self.neck_follow = False
+        self.neck_smooth_hz = 0.3
+        self._neck_filter = None
+        self._neck_frozen: np.ndarray | None = None
+        # Absolute wrist orientation in the neck mapping (False = relative to X,
+        # as in delta). Needs the aim pose: grip->aim rotation per hand, in XR.
+        self.neck_orientation = True
+        self._grip_to_aim: dict[str, np.ndarray | None] = {s: None for s in SIDES}
+        self._blend_t0 = {s: 0.0 for s in SIDES}
 
         # Per-hand delta-teleop references (captured in get_targets).
         self._seen_activation = -1
@@ -255,6 +353,21 @@ class OpenXRPoseSource(PoseSource):
         self._ref_ctrl_quat[side] = cq
         self._ref_ee_pos[side] = np.asarray(pos, dtype=float).copy()
         self._ref_ee_quat[side] = np.asarray(quat, dtype=float).copy()
+        self._blend_t0[side] = time.monotonic()
+
+    def _neck_target(self, side, ctrl_pos, neck_pos, tcp_quat):
+        """Absolute ("neck") TCP position target in the IK world, or None.
+
+        The controller places the hand point (``neck_hand_point_m`` along the
+        gripper axis from the wrist flange); the TCP the IK chases is the rest
+        of the hand->TCP offset beyond it, at the target orientation."""
+        if self.arm_origin is None or neck_pos is None:
+            return None
+        origin_pos, origin_R = self.arm_origin
+        local = (ctrl_pos - neck_pos) * self.hand_scale + self.neck_frame_offset
+        hand_point = origin_pos + origin_R @ local
+        beyond = TCP_OFFSET_IN_HAND_M - np.array([0.0, 0.0, self.neck_hand_point_m])
+        return hand_point + quat_rotate(tcp_quat, beyond)
 
     # ------------------------------------------------------------------ targets
     def get_targets(self, current_ee):
@@ -265,12 +378,27 @@ class OpenXRPoseSource(PoseSource):
             ctrl_quat = {s: self._ctrl_quat[s].copy() for s in SIDES}
             valid = dict(self._ctrl_valid)
             trigger = dict(self._trigger)
+            neck_live = None if self._neck_pos is None else self._neck_pos.copy()
+            grip_to_aim = {s: (None if self._grip_to_aim[s] is None else self._grip_to_aim[s].copy()) for s in SIDES}
 
         # Rising edge of tracking -> drop references so they are recaptured.
         if activation_id != self._seen_activation:
             self._seen_activation = activation_id
             for s in SIDES:
                 self._ref_ctrl_pos[s] = None
+            self._neck_frozen = None
+        if self.neck_follow:
+            neck_pos = neck_live
+            if neck_live is not None and self.neck_smooth_hz > 0:
+                if self._neck_filter is None:
+                    from .smoothing import OneEuroPose
+
+                    self._neck_filter = OneEuroPose(self.neck_smooth_hz, beta_pos=1.0, beta_rot=0.0)
+                neck_pos, _ = self._neck_filter(neck_live, np.array([1.0, 0.0, 0.0, 0.0]), time.monotonic())
+        else:
+            if self._neck_frozen is None and tracking and neck_live is not None:
+                self._neck_frozen = neck_live
+            neck_pos = self._neck_frozen
 
         targets: dict[str, HandTarget] = {}
         for side in SIDES:
@@ -290,6 +418,7 @@ class OpenXRPoseSource(PoseSource):
                 self._ref_ctrl_quat[side] = ctrl_quat[side].copy()
                 self._ref_ee_pos[side] = np.asarray(ee_pos).copy()
                 self._ref_ee_quat[side] = np.asarray(ee_quat).copy()
+                self._blend_t0[side] = time.monotonic()
 
             # Your arm and the robot's are not the same length (the robot
             # reaches ~61 cm from its shoulder). The reference captured on X
@@ -302,6 +431,27 @@ class OpenXRPoseSource(PoseSource):
             delta_quat = quat_mul(ctrl_quat[side], quat_inv(self._ref_ctrl_quat[side]))
             target_quat = quat_mul(delta_quat, self._ref_ee_quat[side])
             target_quat = target_quat / np.linalg.norm(target_quat)
+            if self.hand_mapping == "neck":
+                abs_pos = self._neck_target(side, ctrl_pos[side], neck_pos, target_quat)
+                if abs_pos is not None:
+                    # Glide in: right after X the delta target is where the arm
+                    # already is; jumping straight to the absolute one would
+                    # lunge the arm (the headset path has no leash).
+                    w = 1.0
+                    if self.neck_blend_s > 0:
+                        w = min(1.0, (time.monotonic() - self._blend_t0[side]) / self.neck_blend_s)
+                        w = w * w * (3.0 - 2.0 * w)
+                    if self.neck_orientation and grip_to_aim[side] is not None:
+                        # Absolute wrist angle from the controller's aim pose: the
+                        # same hand angle gives the same gripper angle on both
+                        # arms, however they were posed at X.
+                        R_ctrl = quat_to_mat(ctrl_quat[side])
+                        R_tcp = self.arm_origin[1] @ R_ctrl @ _RZ90_T @ _P_XR_TO_ROBOT @ grip_to_aim[side] @ _AIM_TO_TCP
+                        target_quat = _slerp_wxyz(target_quat, _mat_to_quat_wxyz(R_tcp), w)
+                        # The wrist is at the hand; the TCP beyond it along the
+                        # gripper's final direction.
+                        abs_pos = self._neck_target(side, ctrl_pos[side], neck_pos, target_quat)
+                    target_pos = (1.0 - w) * target_pos + w * abs_pos
             targets[side] = HandTarget(
                 pos=target_pos,
                 quat=target_quat,
@@ -394,6 +544,9 @@ class OpenXRPoseSource(PoseSource):
         grip_action = xr.create_action(action_set, xr.ActionCreateInfo(
             action_name="grip_pose", action_type=xr.ActionType.POSE_INPUT,
             localized_action_name="Grip Pose", subaction_paths=hand_paths))
+        aim_action = xr.create_action(action_set, xr.ActionCreateInfo(
+            action_name="aim_pose", action_type=xr.ActionType.POSE_INPUT,
+            localized_action_name="Aim Pose", subaction_paths=hand_paths))
         trigger_action = xr.create_action(action_set, xr.ActionCreateInfo(
             action_name="trigger", action_type=xr.ActionType.FLOAT_INPUT,
             localized_action_name="Trigger", subaction_paths=hand_paths))
@@ -456,6 +609,9 @@ class OpenXRPoseSource(PoseSource):
                         action=grip_action,
                         binding=xr.string_to_path(instance, f"{hand}/input/grip/pose")))
                     bindings.append(xr.ActionSuggestedBinding(
+                        action=aim_action,
+                        binding=xr.string_to_path(instance, f"{hand}/input/aim/pose")))
+                    bindings.append(xr.ActionSuggestedBinding(
                         action=trigger_action,
                         binding=xr.string_to_path(instance, f"{hand}{extras['trigger']}")))
                     if extras.get("squeeze"):
@@ -492,6 +648,11 @@ class OpenXRPoseSource(PoseSource):
         grip_spaces = [
             xr.create_action_space(session, xr.ActionSpaceCreateInfo(
                 action=grip_action, subaction_path=hp, pose_in_action_space=xr.Posef()))
+            for hp in hand_paths
+        ]
+        aim_spaces = [
+            xr.create_action_space(session, xr.ActionSpaceCreateInfo(
+                action=aim_action, subaction_path=hp, pose_in_action_space=xr.Posef()))
             for hp in hand_paths
         ]
         xr.attach_session_action_sets(session, xr.SessionActionSetsAttachInfo(action_sets=[action_set]))
@@ -748,6 +909,14 @@ class OpenXRPoseSource(PoseSource):
                             if valid:
                                 p = grip_loc.pose.position
                                 q = grip_loc.pose.orientation
+                                if self.hand_mapping == "neck":
+                                    aim_loc = xr.locate_space(aim_spaces[hand_idx], ref_space, pt)
+                                    if aim_loc.location_flags & xr.SpaceLocationFlags.ORIENTATION_VALID_BIT:
+                                        a = aim_loc.pose.orientation
+                                        g2a = _quat_xyzw_to_mat((q.x, q.y, q.z, q.w)).T @ _quat_xyzw_to_mat(
+                                            (a.x, a.y, a.z, a.w))
+                                        with self._lock:
+                                            self._grip_to_aim[side] = g2a
                                 bp = np.array([p.x, p.y, p.z])
                                 bq = np.array([q.x, q.y, q.z, q.w])
                                 if body_rotation is not None:
@@ -775,6 +944,19 @@ class OpenXRPoseSource(PoseSource):
                                     self._trigger[side] = tr.current_state if tr.is_active else 0.0
                             except xr.exception.XrException:
                                 pass
+
+                        # Neck pivot for the "neck" hand mapping, in the same body
+                        # frame + robot axes as the controllers.
+                        if self.hand_mapping == "neck" and body_rotation is not None:
+                            head_loc = xr.locate_space(view_space, ref_space, pt)
+                            if head_loc.location_flags & xr.SpaceLocationFlags.POSITION_VALID_BIT:
+                                hp_ = head_loc.pose.position
+                                ho_ = head_loc.pose.orientation
+                                neck = np.array([hp_.x, hp_.y, hp_.z]) + _quat_xyzw_to_mat(
+                                    (ho_.x, ho_.y, ho_.z, ho_.w)) @ self.neck_pivot_offset
+                                neck = xr_pos_to_robot(body_rotation @ neck)
+                                with self._lock:
+                                    self._neck_pos = neck
 
                         # A pending activation goes live only now: this frame was
                         # calibrated and both controller poses above are already in
@@ -921,7 +1103,7 @@ class OpenXRPoseSource(PoseSource):
                     GL.glDeleteProgram(int(quad_prog))
                 GL.glDeleteFramebuffers([int(pt_fbo)])
                 xr.destroy_swapchain(pt_sc)
-                for sp in grip_spaces:
+                for sp in grip_spaces + aim_spaces:
                     xr.destroy_space(sp)
                 xr.destroy_action_set(action_set)
                 xr.destroy_space(ref_space)

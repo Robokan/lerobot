@@ -166,6 +166,8 @@ class VRMocap(Teleoperator):
         self._model = None
         self._data = None
         self._ik = None
+        self._enactic = None  # EnacticIK when ik_solver="enactic"
+        self._reach = None  # ReachLimiter for the DLS solver in neck mode
         self._source = None
         self._grip_m: dict[str, float] = {s: 0.0 for s in SIDES}
         self._connected = False
@@ -196,7 +198,7 @@ class VRMocap(Teleoperator):
         if "MUJOCO_GL" not in os.environ:
             os.environ["MUJOCO_GL"] = "egl"
 
-        from .ik import IKSolver
+        from .ik import IKSolver, ReachLimiter
 
         model_path = os.path.expanduser(self.config.model_path)
         if not os.path.isfile(model_path):
@@ -220,6 +222,16 @@ class VRMocap(Teleoperator):
             rest_pose_rad=(None if self.config.rest_pose_deg is None
                            else [math.radians(v) for v in self.config.rest_pose_deg]),
         )
+        solver = str(self.config.ik_solver)
+        if solver not in ("dls", "enactic"):
+            raise ValueError(f"ik_solver must be 'dls' or 'enactic', got {solver!r}")
+        if solver == "enactic":
+            from .enactic_ik import EnacticIK
+
+            self._enactic = EnacticIK(self._ik, model_path, fps=float(self.config.vr_hz),
+                                      max_iters=self.config.enactic_max_iters)
+            logger.info("IK solver: enactic (openarm_control mink QP, %d iters/tick at %d Hz) on %s",
+                        self.config.enactic_max_iters, self.config.vr_hz, self._enactic.model_path)
 
         # the DEFAULT pose for the rotation keys: where the arm is at launch
         # clipped to the solver's limits (the elbow is floored at 3 deg), so
@@ -258,6 +270,34 @@ class VRMocap(Teleoperator):
             if abs(self.config.hand_scale - 1.0) > 1e-9:
                 logger.info("hand scale %.2f (the gripper moves %.0f%% as far as your hand)",
                             self.config.hand_scale, 100.0 * self.config.hand_scale)
+        if hasattr(self._source, "hand_mapping"):
+            mapping = str(self.config.hand_mapping)
+            if mapping not in ("delta", "neck"):
+                raise ValueError(f"hand_mapping must be 'delta' or 'neck', got {mapping!r}")
+            if mapping == "neck":
+                origin = self._ik.site_pose("arm_origin")
+                if origin is None:
+                    logger.warning("hand_mapping=neck needs an 'arm_origin' site in the IK model; using delta")
+                    mapping = "delta"
+                else:
+                    self._source.arm_origin = origin
+                    self._source.neck_pivot_offset = np.asarray(self.config.neck_pivot_offset_m, float)
+                    self._source.neck_frame_offset = np.asarray(self.config.neck_frame_offset_m, float)
+                    self._source.neck_blend_s = float(self.config.neck_blend_s)
+                    self._source.neck_hand_point_m = float(self.config.neck_hand_point_m)
+                    self._source.neck_follow = bool(self.config.neck_follow)
+                    self._source.neck_orientation = bool(self.config.neck_orientation)
+                    self._source.neck_smooth_hz = float(self.config.neck_smooth_hz)
+                    logger.info("hand mapping: neck (absolute, Enactic) -- arm_origin %s, frame offset %s m, "
+                                "%.1f s glide-in after X", np.round(origin[0], 3),
+                                list(self.config.neck_frame_offset_m), self.config.neck_blend_s)
+            self._source.hand_mapping = mapping
+            if (mapping == "neck" and self.config.ik_solver == "dls"
+                    and self.config.neck_reach_min_elbow_deg > 0):
+                self._reach = ReachLimiter(self._ik, self.config.neck_reach_min_elbow_deg,
+                                           self.config.neck_reach_knee_deg)
+                r = {s: np.round(self._reach.radii(s), 3).tolist() for s in SIDES}
+                logger.info("neck reach clamp: wrist within %s m of the shoulder (knee, limit)", r)
         if hasattr(self._source, "smoothing") and self.config.smooth_controllers:
             from .smoothing import OneEuroPose
 
@@ -336,6 +376,7 @@ class VRMocap(Teleoperator):
                 self._last_tgt_quat[side] = np.asarray(tgt.quat, float).copy()
 
         homing = self._advance_homing()
+        enactic_targets: dict = {}
         for side in SIDES:
             tgt = targets.get(side)
             if side in homing or tgt is None or not tgt.active:
@@ -497,7 +538,11 @@ class VRMocap(Teleoperator):
                 if callable(resync):
                     p, qt = ik.get_ee_pose(side)
                     resync(side, p, qt)
+            elif self._enactic is not None:
+                enactic_targets[side] = tgt  # solved for both arms at once below
             else:
+                if self._reach is not None:
+                    tgt.pos = self._reach.clamp(side, tgt.pos, tgt.quat)
                 ik.solve_ik(side, tgt.pos, tgt.quat, max_iter=self.config.max_iter)
                 # clip AFTER the solve too, so against an obstacle the command
                 # sits steadily at the leash instead of stepping 3 deg past it
@@ -506,6 +551,9 @@ class VRMocap(Teleoperator):
                 self._leash_target(side, tgt)
             ik.set_finger(side, tgt.gripper_m)
             self._grip_m[side] = float(tgt.gripper_m)
+
+        if enactic_targets and not self._enactic.solve(enactic_targets):
+            logger.warning("enactic IK: no solution this tick, holding")
 
         if self._debug_every and (self._tick % self._debug_every == 0):
             # VR_TELEOP_DEBUG=<n>: print the right arm's joints every n ticks so a

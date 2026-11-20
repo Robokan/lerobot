@@ -46,6 +46,18 @@ class VRMocapConfig(TeleoperatorConfig):
     # much: the solver stops tracking (a 240-tick lift did not move at all).
     dls_lambda: float = 0.15
     max_iter: int = 10
+    # Which IK turns hand targets into joints. "dls": ours (below). "enactic":
+    # Enactic's mink QP from openarm_control (lerobot[openarm-enactic-ik]) with
+    # its singularity-approach limit, velocity limits and null-space posture --
+    # the solver their dora-openarm-webxr stack runs, here on our v1 model.
+    ik_solver: str = "dls"
+    # QP iterations per tick for ik_solver=enactic. Their node runs 5 at 500 Hz
+    # (0.8 ms substeps). At 30 Hz 5 iterations are 6.7 ms substeps, and past the
+    # arm's reach the singularity limit then overshoots into a 2-tick limit
+    # cycle (2 deg rms, measured). 8-30 were still across six out-of-reach
+    # targets with tracking noise; 10 costs ~6 ms a tick (20: ~10 ms, which
+    # pushed the sim loop over its 33 ms budget on 7% of ticks).
+    enactic_max_iters: int = 10
 
     # Redundancy resolution. joint_weights is J1..J7 (shoulder -> wrist): a
     # larger value makes that joint cheaper to move, so wrist-heavy defaults let
@@ -128,6 +140,52 @@ class VRMocapConfig(TeleoperatorConfig):
     # my arithmetic there said 0.84 and was wrong in practice, so do not
     # re-derive this. HAND_SCALE on the launcher overrides.
     hand_scale: float = 1.0
+    # How the hand POSITION maps to the gripper (headset only; orientation is
+    # always relative to X):
+    #   "delta" -- the gripper moves by your hand's displacement since X. Where
+    #              your hands were on X decides the whole mapping, so with your
+    #              hands at your chest and the robot at home, a full reach lands
+    #              short of the robot's and the elbow stays bent.
+    #   "neck"  -- Enactic's dora-openarm-webxr mapping: the gripper goes where
+    #              your hand is relative to your neck, placed off the model's
+    #              arm_origin site (between the shoulders), so a straight arm is a
+    #              straight arm. After X the target glides over neck_blend_s from
+    #              the arm's pose to that absolute one.
+    hand_mapping: str = "delta"
+    # Eyes to the neck's rotation axis, headset frame (-Z forward, +Y up), m.
+    # Enactic's default; their stack can calibrate it per operator.
+    neck_pivot_offset_m: list[float] = field(default_factory=lambda: [0.0, -0.075, 0.08])
+    # Where your neck pivot lands relative to arm_origin (x forward, z up), m.
+    # Enactic's _FRAME_OFFSET_CELL is [-0.085, 0, -0.14]; with our table 33 cm
+    # below the shoulders that needed the hands at chin height to hover over it.
+    # +0.15 up (chosen in the headset, sim) puts them around mid-chest.
+    neck_frame_offset_m: list[float] = field(default_factory=lambda: [-0.085, 0.0, 0.15])
+    neck_blend_s: float = 2.0
+    # Which point of the robot's hand sits at your controller (neck mapping),
+    # m along the gripper axis from the wrist flange: 0 = the robot's wrist, so
+    # its fingers reach out ahead of your hand like your own. The TCP (between
+    # the fingertips) is 0.09 further; 0.09 puts the fingertips at your hand.
+    neck_hand_point_m: float = 0.0
+    # The neck pivot is read from the headset. False (default): taken once on
+    # each X and held, so head motion never moves the arms -- following it live
+    # put every head bob into both arms (2-3x the command jitter on the real
+    # arms). True: followed through a slow one-euro filter (neck_smooth_hz), so
+    # leaning is tracked, at the cost of some head-driven motion.
+    # Neck mapping only: True = the wrist ORIENTATION is absolute too (a level
+    # controller pointing ahead = a level gripper pointing ahead, camera on top,
+    # from the controller's aim pose, Enactic's convention); False = relative to
+    # X as in delta, which kept whatever mismatch your hands had on X.
+    neck_orientation: bool = True
+    neck_follow: bool = False
+    neck_smooth_hz: float = 0.3
+    # DLS solver only (Enactic's has its own singularity limit): keep the
+    # absolute target within the arm's reach. The wrist centre's distance from
+    # the shoulder is rolled off (tanh) from the radius at neck_reach_knee_deg
+    # of elbow bend toward the radius at neck_reach_min_elbow_deg, so reaching
+    # past the arm holds it nearly straight instead of shaking at the
+    # straight-elbow singularity. 0 disables.
+    neck_reach_min_elbow_deg: float = 10.0
+    neck_reach_knee_deg: float = 30.0
     show_markers: bool = False
     yaw_about_vertical: bool = False
     chain_rotation: bool = False   # OFF: back to basic IK (rotation keys pivot the wrist) until that is proven on screen

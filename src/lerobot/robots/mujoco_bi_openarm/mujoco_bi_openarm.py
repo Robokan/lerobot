@@ -246,6 +246,10 @@ class MujocoBiOpenArm(Robot):
             raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
         logger.info("Loading MuJoCo model: %s", model_path)
         self._model = mujoco.MjModel.from_xml_path(model_path)
+        if self.config.sim_timestep is not None:
+            self._model.opt.timestep = float(self.config.sim_timestep)
+        if self.config.sim_sleep:
+            self._model.opt.enableflags |= mujoco.mjtEnableBit.mjENBL_SLEEP
         self._data = mujoco.MjData(self._model)
         if self.config.disable_collisions:
             self._model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)

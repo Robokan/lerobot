@@ -226,8 +226,29 @@ TELEOP_EXTRA=(
 # Gripper travel per unit of hand travel. 1.0 (default) = the gripper moves as far as your hand.
 HAND_SCALE="${HAND_SCALE:-1.0}"
 TELEOP_EXTRA+=(--teleop.hand_scale="${HAND_SCALE}")
+# Hand position mapping: neck (default; Enactic's: your hand relative to your neck =
+# gripper relative to the robot's shoulders, so a straight arm reaches straight; glides
+# in for NECK_BLEND_S after X) or delta (moves from where your hands were on X).
+HAND_MAPPING="${HAND_MAPPING:-neck}"
+TELEOP_EXTRA+=(--teleop.hand_mapping="${HAND_MAPPING}")
+[[ -n "${NECK_BLEND_S:-}" ]] && TELEOP_EXTRA+=(--teleop.neck_blend_s="${NECK_BLEND_S}")
+[[ "${NECK_FOLLOW:-0}" == "1" ]] && TELEOP_EXTRA+=(--teleop.neck_follow=true)   # default: neck held from each X
+[[ "${NECK_ORIENT:-1}" == "0" ]] && TELEOP_EXTRA+=(--teleop.neck_orientation=false)   # 0 = wrist angle relative to X
+# IK=enactic (default): Enactic's mink QP IK (lerobot[openarm-enactic-ik]); IK=dls: ours.
+IK="${IK:-enactic}"
+if [[ "${IK}" == "enactic" ]] && ! .venv/bin/python -c "import openarm_control" 2>/dev/null; then
+  echo "WARNING: IK=enactic needs openarm_control (uv pip install --python .venv/bin/python 'openarm-control>=0.4,<0.5'); using IK=dls" >&2
+  IK=dls
+fi
+TELEOP_EXTRA+=(--teleop.ik_solver="${IK}")
+[[ -n "${ENACTIC_ITERS:-}" ]] && TELEOP_EXTRA+=(--teleop.enactic_max_iters="${ENACTIC_ITERS}")
+# REACH_CLAMP=0: no reach clamp for our IK in neck mode (it stops the shake past reach).
+[[ "${REACH_CLAMP:-1}" == "0" ]] && TELEOP_EXTRA+=(--teleop.neck_reach_min_elbow_deg=0)
+[[ -n "${NECK_HAND_POINT:-}" ]] && TELEOP_EXTRA+=(--teleop.neck_hand_point_m="${NECK_HAND_POINT}")   # 0 = wrist at your hand, 0.09 = fingertips
+[[ -n "${NECK_OFFSET:-}" ]] && TELEOP_EXTRA+=(--teleop.neck_frame_offset_m="[${NECK_OFFSET}]")
 echo "[run_vr_real] home pose [${HOME_POSE}] at ${HOME_SPEED} deg/s, springs toward [${REST_POSE}]"
 echo "[run_vr_real] hand scale ${HAND_SCALE:-1.0} (gripper travel per unit of hand travel)"
+echo "[run_vr_real] hand mapping ${HAND_MAPPING}, IK ${IK}"
 if [[ "${DRY_RUN}" == "1" ]]; then
   # The arms never move in a dry run, so the leash toward the actual arm would
   # pin the command to it. Let it run free to show what WOULD be commanded.

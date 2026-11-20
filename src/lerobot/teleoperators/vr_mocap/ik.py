@@ -184,6 +184,16 @@ def quat_inv(q):
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
+def quat_to_mat(q):
+    """Unit quaternion (w, x, y, z) -> 3x3 rotation matrix."""
+    w, x, y, z = (float(c) for c in q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def quat_rotate(q, v):
     """Rotate vector ``v`` by unit quaternion ``q`` [w, x, y, z]."""
     # q v q^{-1} via the standard sandwich product.
@@ -409,6 +419,15 @@ class IKSolver:
                 for n in RIGHT_FINGER_JOINTS
             ],
         }
+
+    def site_pose(self, name):
+        """World (pos[3], R[3x3]) of a model site, or None if it has none."""
+        mujoco = self._mujoco
+        sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
+        if sid < 0:
+            return None
+        mujoco.mj_kinematics(self.model, self.data)  # site_xpos is only valid after a pass
+        return self.data.site_xpos[sid].copy(), self.data.site_xmat[sid].reshape(3, 3).copy()
 
     def get_ee_pose(self, side):
         """Current TCP pose for ``side`` as (pos[3], quat[4] wxyz)."""
@@ -838,3 +857,94 @@ class IKSolver:
     def joint_positions(self, side):
         """Read the 7 arm joint angles (rad) for ``side`` in J1..J7 order."""
         return np.array([self.data.qpos[i] for i in self.qpos_idx[side]])
+
+
+def _closest_point_on_line(p1, d1, p2, d2) -> np.ndarray:
+    """Point on line (p1, d1) closest to line (p2, d2)."""
+    n = np.cross(d1, d2)
+    nn = float(n @ n)
+    if nn < 1e-12:  # parallel: any point will do
+        return np.asarray(p1, float).copy()
+    t = float(np.cross(p2 - p1, d2) @ n) / nn
+    return p1 + t * d1
+
+
+class ReachLimiter:
+    """Keep an absolute TCP target inside the arm's comfortable reach.
+
+    Near full extension a 7-DoF arm is at the straight-elbow singularity: a
+    millimetre of radial target motion takes degrees of elbow, and a target
+    beyond reach has no solution, so the per-tick solver flips between
+    near-equal answers -- the shaking measured on the real arms with the
+    absolute ("neck") hand mapping, concentrated with the elbow under 10 deg.
+
+    The limit is on the WRIST CENTRE (J6/J7 axes) about the SHOULDER CENTRE
+    (J2/J3 axes): that distance depends on the elbow angle alone, so the limit
+    holds for any wrist attitude. Past ``knee_elbow_deg`` the radius is rolled
+    off smoothly (tanh) toward the radius at ``min_elbow_deg``, so reaching
+    further straightens the arm ever less and never quite to the singularity.
+    Only the target's radial component changes; direction and orientation stay.
+    """
+
+    def __init__(self, ik: IKSolver, min_elbow_deg: float = 10.0, knee_elbow_deg: float = 30.0):
+        mujoco = ik._mujoco
+        self._ik = ik
+        scratch = mujoco.MjData(ik.model)  # never disturb the solver's state
+        self._w_off = {}
+        self._r_min_elbow = {}
+        self._r_knee = {}
+        for side in ("left", "right"):
+            ids = ik.joint_ids[side]
+            lo, hi = ik.limits_low[side][3], ik.limits_high[side][3]
+
+            def radius(elbow, side=side, ids=ids):
+                for k, qi in enumerate(ik.qpos_idx[side]):
+                    scratch.qpos[qi] = float(elbow) if k == 3 else 0.0
+                _kinematics(mujoco, ik.model, scratch)
+                s, w = self._centres(scratch, ids)
+                return s, w, float(np.linalg.norm(w - s))
+
+            _, w, _ = radius(lo)
+            body_id = ik.left_tcp_id if side == "left" else ik.right_tcp_id
+            R = scratch.xmat[body_id].reshape(3, 3)
+            self._w_off[side] = R.T @ (w - scratch.xpos[body_id])
+            e_min = float(np.clip(math.radians(min_elbow_deg), lo, hi))
+            e_knee = float(np.clip(math.radians(max(knee_elbow_deg, min_elbow_deg)), lo, hi))
+            self._r_min_elbow[side] = radius(e_min)[2]
+            self._r_knee[side] = radius(e_knee)[2]
+
+    def _centres(self, data, ids):
+        m = self._ik.model
+
+        def line(k):
+            j = ids[k]
+            a = data.xmat[m.jnt_bodyid[j]].reshape(3, 3) @ m.jnt_axis[j]
+            return data.xanchor[j].copy(), a / max(float(np.linalg.norm(a)), 1e-9)
+
+        shoulder = _closest_point_on_line(*line(1), *line(2))
+        wrist = _closest_point_on_line(*line(6), *line(5))
+        return shoulder, wrist
+
+    def radii(self, side):
+        """(knee, limit) wrist-centre radii in metres for ``side``."""
+        return self._r_knee[side], self._r_min_elbow[side]
+
+    def _wrist_vec(self, side, pos, quat) -> np.ndarray:
+        shoulder, _ = self._centres(self._ik.data, self._ik.joint_ids[side])
+        return np.asarray(pos, float) + quat_to_mat(quat) @ self._w_off[side] - shoulder
+
+    def wrist_radius(self, side, pos, quat) -> float:
+        """Shoulder-centre to wrist-centre distance (m) of a TCP pose."""
+        return float(np.linalg.norm(self._wrist_vec(side, pos, quat)))
+
+    def clamp(self, side, pos, quat) -> np.ndarray:
+        """``pos`` (a TCP target at orientation ``quat``) pulled within reach."""
+        pos = np.asarray(pos, float)
+        v = self._wrist_vec(side, pos, quat)
+        r = float(np.linalg.norm(v))
+        r_knee, r_lim = self._r_knee[side], self._r_min_elbow[side]
+        if r <= r_knee or r < 1e-9:
+            return pos
+        span = max(r_lim - r_knee, 1e-9)
+        r_new = r_knee + span * math.tanh((r - r_knee) / span)
+        return pos + v * (r_new / r - 1.0)
